@@ -20,3 +20,11 @@ venv/
 # local
 *.log
 .env
+
+# throwaway verification harness (not part of the deliverable)
+_verify.py
+_verify_result.txt
+
+# runtime state / lock files
+*.json.lock
+*.lock
