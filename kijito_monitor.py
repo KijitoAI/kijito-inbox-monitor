@@ -177,6 +177,29 @@ def fetch(opener, url, headers):
     return Poll(True, items=items, status=status)
 
 
+def cheap_unread(opener, count_url, headers, persona):
+    """§9 fast-path pre-check: GET /api/notify/pending (read-only, never marks read; River PR#66).
+    Returns (available, unread_count). available=False if the endpoint is absent / non-2xx / bad shape →
+    the caller falls back to the full inbox-list poll. Response: {"result":[{persona,unread,unread_urgent}]};
+    a persona with zero unread is ABSENT from the list → treat absent as 0."""
+    req = urllib.request.Request(count_url, headers=headers, method="GET")
+    try:
+        with opener.open(req, timeout=HTTP_TIMEOUT) as resp:
+            if not (200 <= resp.status < 300):
+                return (False, 0)
+            data = json.loads(resp.read())
+    except Exception:
+        return (False, 0)
+    rows = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return (False, 0)
+    for row in rows:
+        if isinstance(row, dict) and row.get("persona") == persona:
+            u = row.get("unread")
+            return (True, u if isinstance(u, int) else 0)
+    return (True, 0)  # persona absent from the list → zero unread, endpoint IS available
+
+
 # --------------------------------------------------------------------------------------------------------------------
 # §6 Emit
 # --------------------------------------------------------------------------------------------------------------------
@@ -460,70 +483,113 @@ def run(args):
     seam = WakeSeam()
     seam.install()
 
+    # §9 all-unread fast-path (River PR#66): a cheap O(1) /api/notify/pending pre-check. Enabled ON ARM iff the
+    # endpoint is available; the inbox-list poll stays the BASELINE. SAFE by construction — the max-id cursor is
+    # the source of truth for WHAT to emit; `unread` only decides WHETHER to do the full fetch (a stale/absent
+    # hint can at worst cost an extra fetch, never a missed/duplicate message). `unread` only rises on genuinely
+    # new mail (Kijito has no un-read op).
+    cp = urllib.parse.urlsplit(url)
+    count_url = urllib.parse.urlunsplit((cp.scheme, cp.netloc, "/api/notify/pending", "", ""))
+    my_persona = dict(urllib.parse.parse_qsl(cp.query)).get("persona") or args.persona
+    fast_path = False
+    last_unread = None
+    skips = 0  # consecutive fast-path skips; bounded by --resync-every (safety floor against a stale count)
+
     first_poll = True
     proc_start = _monotonic()
     last_heartbeat = proc_start
 
     while not seam.stop:
         seam.drain()  # read-and-clear at START of poll (§10)
-        poll = fetch(opener, url, headers)
 
-        # mid-run vs startup classification of redirect / hive-off-404 (§5/§8)
-        if poll.redirected and is_user_url and first_poll:
-            raise FatalConfig("SSRF guard: --url returned a redirect (refused)")
-        if poll.status == 404 and (first_poll or args.self_test):
-            raise FatalConfig("inbox endpoint 404 (hive disabled?) — fatal at startup")
+        # fast-path pre-check: skip the full fetch when unread has NOT increased — but NEVER skip more than
+        # --resync-every consecutive polls. The floor is a SAFETY net: a stale/wrong/unsupported count (e.g. a
+        # daemon running pre-all-unread code that returns 0 forever) can then at worst add latency, never blind
+        # the watcher. On a correct endpoint, mail is caught immediately on the unread increase.
+        skip_full = False
+        if armed and fast_path and not args.no_fast_path:
+            avail, unread = cheap_unread(opener, count_url, headers, my_persona)
+            if avail:
+                increased = unread > last_unread if last_unread is not None else True
+                last_unread = unread
+                if not increased and skips < args.resync_every:
+                    skip_full = True
+                    skips += 1
+            # unavailable (transient) → fall through to the full inbox-list poll (the baseline)
 
-        if poll.ok:
-            # ---- FSM healthy edge ---------------------------------------------------------------------------------
-            recovered = False
+        if skip_full:
+            # count endpoint reachable + no unread increase = a HEALTHY poll with no new items
             if fsm_state == "DOWN":
                 fsm_state = "UP"
-                recovered = True
-            failures = 0
-
-            items = poll.items
-            diag = None          # ('seed_ahead'|'replay_capped', fields)
-            new_items = []
-            do_arm = not armed
-
-            if do_arm:
-                if cursor is None:
-                    # UNSET baseline: emit nothing, exempt from cap
-                    cursor = max((m["id"] for m in items), default=0)
-                else:
-                    # non-null re-arm (seed-at or non-null state resume)
-                    current_max = max((m["id"] for m in items), default=0)
-                    n = sum(1 for m in items if m["id"] > cursor)
-                    if cursor > current_max:
-                        diag = ("seed_ahead", {"seeded": cursor, "current_max": current_max})
-                    elif n > args.max_replay:
-                        diag = ("replay_capped", {"capped_to": current_max, "dropped": n})
-                        cursor = current_max
-                    else:
-                        new_items = sorted((m for m in items if m["id"] > cursor), key=lambda m: m["id"])
-                armed = True
-            else:
-                new_items = sorted((m for m in items if m["id"] > cursor), key=lambda m: m["id"])
-
-            # ---- emit in canonical within-poll order (§6.1) -------------------------------------------------------
-            if recovered:
                 emitter.lifecycle("recovered", cursor=cursor)
-            if diag:
-                emitter.lifecycle(diag[0], **diag[1])
-            if do_arm:
-                emitter.lifecycle("armed", cursor=cursor)
-            for m in new_items:
-                emitter.new(m)
-            if new_items:
-                cursor = max(cursor if cursor is not None else 0, max(m["id"] for m in new_items))
+            failures = 0
         else:
-            # ---- FSM failure --------------------------------------------------------------------------------------
-            failures += 1
-            if failures == args.alert_after and fsm_state == "UP":
-                fsm_state = "DOWN"
-                emitter.lifecycle("alert", reason=poll.reason or "unreachable",
-                                  consecutive_failures=failures, seconds=failures * args.poll_seconds)
+            skips = 0  # a full fetch resets the skip floor
+            poll = fetch(opener, url, headers)
+
+            # mid-run vs startup classification of redirect / hive-off-404 (§5/§8)
+            if poll.redirected and is_user_url and first_poll:
+                raise FatalConfig("SSRF guard: --url returned a redirect (refused)")
+            if poll.status == 404 and (first_poll or args.self_test):
+                raise FatalConfig("inbox endpoint 404 (hive disabled?) — fatal at startup")
+
+            if poll.ok:
+                # ---- FSM healthy edge -----------------------------------------------------------------------------
+                recovered = False
+                if fsm_state == "DOWN":
+                    fsm_state = "UP"
+                    recovered = True
+                failures = 0
+
+                items = poll.items
+                diag = None          # ('seed_ahead'|'replay_capped', fields)
+                new_items = []
+                do_arm = not armed
+
+                if do_arm:
+                    if cursor is None:
+                        # UNSET baseline: emit nothing, exempt from cap
+                        cursor = max((m["id"] for m in items), default=0)
+                    else:
+                        # non-null re-arm (seed-at or non-null state resume)
+                        current_max = max((m["id"] for m in items), default=0)
+                        n = sum(1 for m in items if m["id"] > cursor)
+                        if cursor > current_max:
+                            diag = ("seed_ahead", {"seeded": cursor, "current_max": current_max})
+                        elif n > args.max_replay:
+                            diag = ("replay_capped", {"capped_to": current_max, "dropped": n})
+                            cursor = current_max
+                        else:
+                            new_items = sorted((m for m in items if m["id"] > cursor), key=lambda m: m["id"])
+                    armed = True
+                else:
+                    new_items = sorted((m for m in items if m["id"] > cursor), key=lambda m: m["id"])
+
+                # ---- emit in canonical within-poll order (§6.1) -----------------------------------------------
+                if recovered:
+                    emitter.lifecycle("recovered", cursor=cursor)
+                if diag:
+                    emitter.lifecycle(diag[0], **diag[1])
+                if do_arm:
+                    emitter.lifecycle("armed", cursor=cursor)
+                for m in new_items:
+                    emitter.new(m)
+                if new_items:
+                    cursor = max(cursor if cursor is not None else 0, max(m["id"] for m in new_items))
+
+                # enable the fast-path once, right after arming (probe the count endpoint — §9)
+                if do_arm and not args.no_fast_path:
+                    avail, unread = cheap_unread(opener, count_url, headers, my_persona)
+                    if avail:
+                        fast_path = True
+                        last_unread = unread
+            else:
+                # ---- FSM failure ----------------------------------------------------------------------------------
+                failures += 1
+                if failures == args.alert_after and fsm_state == "UP":
+                    fsm_state = "DOWN"
+                    emitter.lifecycle("alert", reason=poll.reason or "unreachable",
+                                      consecutive_failures=failures, seconds=failures * args.poll_seconds)
 
         if state_file is not None:
             state_file.save(cursor, fsm_state, failures)
@@ -563,6 +629,11 @@ def build_parser():
     p.add_argument("--heartbeat", type=int, help="Emit a heartbeat event every N seconds (external dead-man's-switch).")
     p.add_argument("--auth-header", help="Header NAME for the token (default Authorization: Bearer).")
     p.add_argument("--token-file", help="File holding the auth token (wins over $KIJITOMON_TOKEN).")
+    p.add_argument("--no-fast-path", action="store_true",
+                   help="Disable the /api/notify/pending unread pre-check; always full-poll the inbox list.")
+    p.add_argument("--resync-every", type=int, default=10,
+                   help="Fast-path safety floor: force a full inbox poll after at most N consecutive cheap "
+                        "skips, so a stale/wrong unread count can never blind the watcher (default 10, min 1).")
     p.add_argument("--self-test", action="store_true", help="Probe + synthetic emit, then exit (run before trusting).")
     return p
 
@@ -570,6 +641,8 @@ def build_parser():
 def validate_args(args):
     if args.alert_after < 1:
         raise FatalConfig("--alert-after must be >= 1")
+    if args.resync_every < 1:
+        raise FatalConfig("--resync-every must be >= 1")
     if args.emit == "exec-per-event" and not args.exec:
         raise FatalConfig("--exec is required when --emit exec-per-event")
     if args.emit != "exec-per-event" and args.exec:

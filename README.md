@@ -67,6 +67,8 @@ external dead-man's-switch (e.g. healthchecks.io / Dead Man's Snitch).
 | `--state-file PATH` | Persist + resume cursor/FSM; single-writer locked. Recommended under a supervisor. |
 | `--heartbeat N` | Emit a `heartbeat` every N seconds (external dead-man's-switch). |
 | `--auth-header NAME` / `--token-file PATH` | Auth header name / token file. Token also via `$KIJITOMON_TOKEN`. The local daemon needs no token. |
+| `--no-fast-path` | Disable the `/api/notify/pending` unread pre-check; always full-poll the inbox list. |
+| `--resync-every N` | Fast-path safety floor: force a full poll after at most N consecutive cheap skips (default 10), so a stale/wrong unread count can never blind the watcher. |
 | `--self-test` | Probe the source + synthetic emit, then exit. Run before trusting a live arm. |
 
 ## Design
