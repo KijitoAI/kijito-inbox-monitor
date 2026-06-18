@@ -177,27 +177,54 @@ def fetch(opener, url, headers):
     return Poll(True, items=items, status=status)
 
 
-def cheap_unread(opener, count_url, headers, persona):
-    """§9 fast-path pre-check: GET /api/notify/pending (read-only, never marks read; River PR#66).
-    Returns (available, unread_count). available=False if the endpoint is absent / non-2xx / bad shape →
-    the caller falls back to the full inbox-list poll. Response: {"result":[{persona,unread,unread_urgent}]};
-    a persona with zero unread is ABSENT from the list → treat absent as 0."""
+def fetch_personas(opener, headers):
+    """Fetch the local account persona directory for default/explicit all-persona mode."""
+    req = urllib.request.Request("http://127.0.0.1:7474/api/personas", headers=headers, method="GET")
+    try:
+        with opener.open(req, timeout=HTTP_TIMEOUT) as resp:
+            if not (200 <= resp.status < 300):
+                raise FatalConfig("/api/personas returned http %d" % resp.status)
+            data = json.loads(resp.read())
+    except FatalConfig:
+        raise
+    except Exception as e:
+        raise FatalConfig("cannot fetch /api/personas for --all-personas: %s" % e)
+    rows = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        raise FatalConfig("/api/personas shape-invalid: result is not a list")
+    personas = []
+    for row in rows:
+        if isinstance(row, dict) and isinstance(row.get("persona"), str) and row["persona"]:
+            personas.append(row["persona"])
+    if not personas:
+        raise FatalConfig("/api/personas returned no personas")
+    return personas
+
+
+def fetch_unread_counts(opener, count_url, headers):
+    """§9 fast-path pre-check: GET /api/notify/pending once and fan out locally.
+
+    Returns (available, {persona: unread_count}). available=False if the endpoint is absent / non-2xx / bad shape →
+    callers fall back to the full inbox-list poll. Response: {"result":[{persona,unread,unread_urgent}]};
+    a persona with zero unread is ABSENT from the list → callers treat absent as 0.
+    """
     req = urllib.request.Request(count_url, headers=headers, method="GET")
     try:
         with opener.open(req, timeout=HTTP_TIMEOUT) as resp:
             if not (200 <= resp.status < 300):
-                return (False, 0)
+                return (False, {})
             data = json.loads(resp.read())
     except Exception:
-        return (False, 0)
+        return (False, {})
     rows = data.get("result") if isinstance(data, dict) else None
     if not isinstance(rows, list):
-        return (False, 0)
+        return (False, {})
+    counts = {}
     for row in rows:
-        if isinstance(row, dict) and row.get("persona") == persona:
+        if isinstance(row, dict) and isinstance(row.get("persona"), str):
             u = row.get("unread")
-            return (True, u if isinstance(u, int) else 0)
-    return (True, 0)  # persona absent from the list → zero unread, endpoint IS available
+            counts[row["persona"]] = u if isinstance(u, int) else 0
+    return (True, counts)
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -233,6 +260,7 @@ class Emitter:
             keymap = {
                 "id": "KIJITOMON_ID", "from": "KIJITOMON_FROM", "content": "KIJITOMON_CONTENT",
                 "created": "KIJITOMON_CREATED", "cursor": "KIJITOMON_CURSOR",
+                "persona": "KIJITOMON_PERSONA",
                 "reason": "KIJITOMON_REASON", "consecutive_failures": "KIJITOMON_FAILURES",
                 "seeded": "KIJITOMON_SEEDED", "current_max": "KIJITOMON_CURRENT_MAX",
                 "capped_to": "KIJITOMON_CAPPED_TO", "dropped": "KIJITOMON_DROPPED",
@@ -251,6 +279,8 @@ class Emitter:
     def new(self, m):
         ev = {"event": "new", "source": SOURCE, "ts": _now_iso(), "id": m.get("id"),
               "from": m.get("from"), "created": m.get("created")}
+        if m.get("_persona"):
+            ev["persona"] = m.get("_persona")
         c = self._clip(m.get("content"))
         if c is not None:
             ev["content"] = c
@@ -274,6 +304,8 @@ class StateFile:
     def lock(self):
         if not IS_POSIX or fcntl is None:
             return  # Windows: no lock (documented; run a single instance)
+        dirn = os.path.dirname(os.path.abspath(self.path)) or "."
+        os.makedirs(dirn, exist_ok=True)
         # Lock a DEDICATED .lock SIDECAR, never the state-file itself: save() replaces the state-file's inode
         # (mkstemp + os.replace) on every poll, which would orphan a flock held on it and let a second watcher
         # lock the new inode freely. The sidecar is never replaced, so the flock persists for the process
@@ -318,6 +350,7 @@ class StateFile:
             return  # best-effort; skip on Windows
         d = {"identity": self.identity, "cursor": cursor, "state": state, "consecutive_failures": failures}
         dirn = os.path.dirname(os.path.abspath(self.path)) or "."
+        os.makedirs(dirn, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=dirn, prefix=".kijmon-", suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as f:
@@ -416,10 +449,11 @@ def effective_url(args):
     if args.url:
         # ensure mark_read=false is present (peek) on a user --url too
         return _ensure_peek(args.url), False
-    if not args.persona:
-        raise FatalConfig("either --persona or --url is required")
-    base = DEFAULT_KIJITO_URL
-    return "%s?persona=%s&mark_read=false" % (base, urllib.parse.quote(args.persona)), True
+    raise FatalConfig("internal error: effective_url() needs --url; use persona_url() for Kijito personas")
+
+
+def persona_url(persona):
+    return "%s?persona=%s&mark_read=false" % (DEFAULT_KIJITO_URL, urllib.parse.quote(persona)), True
 
 
 def _ensure_peek(url):
@@ -439,167 +473,279 @@ def make_opener_for(url, is_reference, args):
     return build_opener(pinned)
 
 
-def run(args):
-    url, is_reference = effective_url(args)
-    identity = canonical_identity(url)
-    headers = build_headers(args)
-    opener = make_opener_for(url, is_reference, args)  # raises FatalConfig on SSRF/destination violation
-    is_user_url = not is_reference
-    emitter = Emitter(args.emit, args.exec, args.content_chars, args.no_content)
+def _state_path_for_persona(base_path, persona):
+    if not base_path or not persona:
+        return base_path
+    root, ext = os.path.splitext(base_path)
+    safe = _state_safe_persona(persona)
+    base = os.path.basename(root)
+    if base == safe or base.endswith("." + safe):
+        return base_path
+    return root + "." + safe + (ext or ".json")
 
-    # ---- self-test (§7.2): run once, exit -------------------------------------------------------------------------
-    if args.self_test:
-        poll = fetch(opener, url, headers)
+
+def _state_safe_persona(persona):
+    return "".join(c if (c.isalnum() or c in "._-") else "_" for c in persona)
+
+
+def requested_personas(args, opener, headers):
+    personas = []
+    for p in (p.strip() for p in args.persona or []):
+        if p and p not in personas:
+            personas.append(p)
+    for group in args.personas or []:
+        for p in (part.strip() for part in group.split(",")):
+            if p and p not in personas:
+                personas.append(p)
+    if args.all_personas or not personas:
+        for p in fetch_personas(opener, headers):
+            if p not in personas:
+                personas.append(p)
+    return personas
+
+
+def watches_all_personas(args):
+    return not args.url and (args.all_personas or not (args.persona or args.personas))
+
+
+def new_personas(existing, discovered):
+    seen = set(existing)
+    return [p for p in discovered if p not in seen]
+
+
+class WatchTarget:
+    def __init__(self, persona, url, is_reference, opener, headers, args, emitter):
+        self.persona = persona
+        self.url = url
+        self.is_reference = is_reference
+        self.is_user_url = not is_reference
+        self.opener = opener
+        self.headers = headers
+        self.args = args
+        self.emitter = emitter
+        self.identity = canonical_identity(url)
+        self.state_file = None
+        self.cursor = None
+        self.fsm_state = "UP"
+        self.failures = 0
+        self.armed = False
+        self.fast_path = False
+        self.last_unread = None
+        self.skips = 0
+        self.first_poll = True
+        self.last_heartbeat = _monotonic()
+
+        cp = urllib.parse.urlsplit(url)
+        self.count_url = urllib.parse.urlunsplit((cp.scheme, cp.netloc, "/api/notify/pending", "", ""))
+        self.unread_persona = dict(urllib.parse.parse_qsl(cp.query)).get("persona") or persona
+
+        state_path = _state_path_for_persona(args.state_file, persona)
+        if state_path:
+            self.state_file = StateFile(state_path, self.identity)
+            if not args.self_test:
+                self.state_file.lock()
+                loaded = self.state_file.load()
+                if loaded is not None:
+                    r_cursor, r_state, r_failures = loaded
+                    self.cursor = r_cursor
+                    self.fsm_state, self.failures = r_state, r_failures
+        if args.seed_at is not None:
+            self.cursor = args.seed_at
+
+    def self_test(self):
+        poll = fetch(self.opener, self.url, self.headers)
         reach_ok = poll.ok
-        sys.stderr.write("self-test: source %s (%s)\n" % ("REACHABLE+healthy" if reach_ok else "UNHEALTHY",
-                                                          poll.reason or "ok"))
+        label = self.persona or self.url
+        sys.stderr.write("self-test[%s]: source %s (%s)\n" % (
+            label, "REACHABLE+healthy" if reach_ok else "UNHEALTHY", poll.reason or "ok"
+        ))
         emit_ok = True
         try:
-            emitter.new({"id": 0, "from": "self-test", "content": "synthetic emit OK", "created": _now_iso()})
+            self.emitter.new({"id": 0, "from": "self-test", "content": "synthetic emit OK",
+                              "created": _now_iso(), "_persona": self.persona})
         except Exception as e:
             emit_ok = False
-            sys.stderr.write("self-test: emit FAILED: %s\n" % e)
-        sys.stderr.write("self-test: emit=%s reachable=%s\n" % ("OK" if emit_ok else "FAIL", reach_ok))
-        return 0 if (reach_ok and emit_ok) else 1
+            sys.stderr.write("self-test[%s]: emit FAILED: %s\n" % (label, e))
+        sys.stderr.write("self-test[%s]: emit=%s reachable=%s\n" % (
+            label, "OK" if emit_ok else "FAIL", reach_ok
+        ))
+        return reach_ok and emit_ok
 
-    # ---- state file: lock + resume --------------------------------------------------------------------------------
-    state_file = None
-    cursor = None          # None == UNSET
-    fsm_state = "UP"
-    failures = 0
-    armed = False
-    if args.state_file:
-        state_file = StateFile(args.state_file, identity)
-        state_file.lock()
-        loaded = state_file.load()
-        if loaded is not None:
-            r_cursor, r_state, r_failures = loaded
-            cursor = r_cursor            # may be overridden by --seed-at below
-            fsm_state, failures = r_state, r_failures  # FSM always resumes on a valid match (§7.0)
-    # --seed-at overrides the cursor only (FSM still resumes from a valid state-file)
-    if args.seed_at is not None:
-        cursor = args.seed_at
+    def lifecycle(self, event, **fields):
+        if self.persona:
+            fields["persona"] = self.persona
+        self.emitter.lifecycle(event, **fields)
 
-    seam = WakeSeam()
-    seam.install()
+    def poll_once(self, counts_available=False, unread_counts=None):
+        args = self.args
+        unread_counts = unread_counts or {}
 
-    # §9 all-unread fast-path (River PR#66): a cheap O(1) /api/notify/pending pre-check. Enabled ON ARM iff the
-    # endpoint is available; the inbox-list poll stays the BASELINE. SAFE by construction — the max-id cursor is
-    # the source of truth for WHAT to emit; `unread` only decides WHETHER to do the full fetch (a stale/absent
-    # hint can at worst cost an extra fetch, never a missed/duplicate message). `unread` only rises on genuinely
-    # new mail (Kijito has no un-read op).
-    cp = urllib.parse.urlsplit(url)
-    count_url = urllib.parse.urlunsplit((cp.scheme, cp.netloc, "/api/notify/pending", "", ""))
-    my_persona = dict(urllib.parse.parse_qsl(cp.query)).get("persona") or args.persona
-    fast_path = False
-    last_unread = None
-    skips = 0  # consecutive fast-path skips; bounded by --resync-every (safety floor against a stale count)
-
-    first_poll = True
-    proc_start = _monotonic()
-    last_heartbeat = proc_start
-
-    while not seam.stop:
-        seam.drain()  # read-and-clear at START of poll (§10)
-
-        # fast-path pre-check: skip the full fetch when unread has NOT increased — but NEVER skip more than
-        # --resync-every consecutive polls. The floor is a SAFETY net: a stale/wrong/unsupported count (e.g. a
-        # daemon running pre-all-unread code that returns 0 forever) can then at worst add latency, never blind
-        # the watcher. On a correct endpoint, mail is caught immediately on the unread increase.
         skip_full = False
-        if armed and fast_path and not args.no_fast_path:
-            avail, unread = cheap_unread(opener, count_url, headers, my_persona)
-            if avail:
-                increased = unread > last_unread if last_unread is not None else True
-                last_unread = unread
-                if not increased and skips < args.resync_every:
+        if self.armed and self.fast_path and not args.no_fast_path and self.unread_persona:
+            if counts_available:
+                unread = unread_counts.get(self.unread_persona, 0)
+                increased = unread > self.last_unread if self.last_unread is not None else True
+                self.last_unread = unread
+                if not increased and self.skips < args.resync_every:
                     skip_full = True
-                    skips += 1
+                    self.skips += 1
             # unavailable (transient) → fall through to the full inbox-list poll (the baseline)
 
         if skip_full:
             # count endpoint reachable + no unread increase = a HEALTHY poll with no new items
-            if fsm_state == "DOWN":
-                fsm_state = "UP"
-                emitter.lifecycle("recovered", cursor=cursor)
-            failures = 0
+            if self.fsm_state == "DOWN":
+                self.fsm_state = "UP"
+                self.lifecycle("recovered", cursor=self.cursor)
+            self.failures = 0
         else:
-            skips = 0  # a full fetch resets the skip floor
-            poll = fetch(opener, url, headers)
+            self.skips = 0
+            poll = fetch(self.opener, self.url, self.headers)
 
-            # mid-run vs startup classification of redirect / hive-off-404 (§5/§8)
-            if poll.redirected and is_user_url and first_poll:
+            if poll.redirected and self.is_user_url and self.first_poll:
                 raise FatalConfig("SSRF guard: --url returned a redirect (refused)")
-            if poll.status == 404 and (first_poll or args.self_test):
+            if poll.status == 404 and (self.first_poll or args.self_test):
                 raise FatalConfig("inbox endpoint 404 (hive disabled?) — fatal at startup")
 
             if poll.ok:
-                # ---- FSM healthy edge -----------------------------------------------------------------------------
                 recovered = False
-                if fsm_state == "DOWN":
-                    fsm_state = "UP"
+                if self.fsm_state == "DOWN":
+                    self.fsm_state = "UP"
                     recovered = True
-                failures = 0
+                self.failures = 0
 
                 items = poll.items
-                diag = None          # ('seed_ahead'|'replay_capped', fields)
+                diag = None
                 new_items = []
-                do_arm = not armed
+                do_arm = not self.armed
 
                 if do_arm:
-                    if cursor is None:
-                        # UNSET baseline: emit nothing, exempt from cap
-                        cursor = max((m["id"] for m in items), default=0)
+                    if self.cursor is None:
+                        self.cursor = max((m["id"] for m in items), default=0)
                     else:
-                        # non-null re-arm (seed-at or non-null state resume)
                         current_max = max((m["id"] for m in items), default=0)
-                        n = sum(1 for m in items if m["id"] > cursor)
-                        if cursor > current_max:
-                            diag = ("seed_ahead", {"seeded": cursor, "current_max": current_max})
+                        n = sum(1 for m in items if m["id"] > self.cursor)
+                        if self.cursor > current_max:
+                            diag = ("seed_ahead", {"seeded": self.cursor, "current_max": current_max})
                         elif n > args.max_replay:
                             diag = ("replay_capped", {"capped_to": current_max, "dropped": n})
-                            cursor = current_max
+                            self.cursor = current_max
                         else:
-                            new_items = sorted((m for m in items if m["id"] > cursor), key=lambda m: m["id"])
-                    armed = True
+                            new_items = sorted((m for m in items if m["id"] > self.cursor), key=lambda m: m["id"])
+                    self.armed = True
                 else:
-                    new_items = sorted((m for m in items if m["id"] > cursor), key=lambda m: m["id"])
+                    new_items = sorted((m for m in items if m["id"] > self.cursor), key=lambda m: m["id"])
 
-                # ---- emit in canonical within-poll order (§6.1) -----------------------------------------------
                 if recovered:
-                    emitter.lifecycle("recovered", cursor=cursor)
+                    self.lifecycle("recovered", cursor=self.cursor)
                 if diag:
-                    emitter.lifecycle(diag[0], **diag[1])
+                    self.lifecycle(diag[0], **diag[1])
                 if do_arm:
-                    emitter.lifecycle("armed", cursor=cursor)
+                    self.lifecycle("armed", cursor=self.cursor)
                 for m in new_items:
-                    emitter.new(m)
+                    m = dict(m)
+                    m["_persona"] = self.persona
+                    self.emitter.new(m)
                 if new_items:
-                    cursor = max(cursor if cursor is not None else 0, max(m["id"] for m in new_items))
+                    self.cursor = max(self.cursor if self.cursor is not None else 0,
+                                      max(m["id"] for m in new_items))
 
-                # enable the fast-path once, right after arming (probe the count endpoint — §9)
-                if do_arm and not args.no_fast_path:
-                    avail, unread = cheap_unread(opener, count_url, headers, my_persona)
-                    if avail:
-                        fast_path = True
-                        last_unread = unread
+                if do_arm and not args.no_fast_path and self.unread_persona and counts_available:
+                    self.fast_path = True
+                    self.last_unread = unread_counts.get(self.unread_persona, 0)
             else:
-                # ---- FSM failure ----------------------------------------------------------------------------------
-                failures += 1
-                if failures == args.alert_after and fsm_state == "UP":
-                    fsm_state = "DOWN"
-                    emitter.lifecycle("alert", reason=poll.reason or "unreachable",
-                                      consecutive_failures=failures, seconds=failures * args.poll_seconds)
+                self.failures += 1
+                if self.failures == args.alert_after and self.fsm_state == "UP":
+                    self.fsm_state = "DOWN"
+                    self.lifecycle("alert", reason=poll.reason or "unreachable",
+                                   consecutive_failures=self.failures,
+                                   seconds=self.failures * args.poll_seconds)
 
-        if state_file is not None:
-            state_file.save(cursor, fsm_state, failures)
+        if self.state_file is not None:
+            self.state_file.save(self.cursor, self.fsm_state, self.failures)
 
-        # ---- heartbeat (proves the WATCHER is alive; HEALTHY or failed) ------------------------------------------
-        if args.heartbeat and (_monotonic() - last_heartbeat) >= args.heartbeat:
-            emitter.lifecycle("heartbeat", cursor=cursor)
-            last_heartbeat = _monotonic()
+        if self.armed and not self.fast_path and not args.no_fast_path and self.unread_persona and counts_available:
+            self.fast_path = True
+            self.last_unread = unread_counts.get(self.unread_persona, 0)
 
-        first_poll = False
+        if args.heartbeat and (_monotonic() - self.last_heartbeat) >= args.heartbeat:
+            self.lifecycle("heartbeat", cursor=self.cursor)
+            self.last_heartbeat = _monotonic()
+
+        self.first_poll = False
+
+
+def build_persona_target(persona, opener_by_origin, headers, args, emitter):
+    url, is_reference = persona_url(persona)
+    origin = urllib.parse.urlsplit(url).netloc
+    opener = opener_by_origin.get(origin)
+    if opener is None:
+        opener = make_opener_for(url, is_reference, args)
+        opener_by_origin[origin] = opener
+    return WatchTarget(persona, url, is_reference, opener, headers, args, emitter)
+
+
+def discover_persona_targets(args, headers, emitter, targets, opener_by_origin, directory_opener):
+    current = [t.persona for t in targets if t.persona]
+    discovered = fetch_personas(directory_opener, headers)
+    added = []
+    for persona in new_personas(current, discovered):
+        try:
+            target = build_persona_target(persona, opener_by_origin, headers, args, emitter)
+        except FatalConfig as e:
+            sys.stderr.write("kijito-monitor: WARNING cannot add persona %r: %s\n" % (persona, e))
+            continue
+        targets.append(target)
+        added.append(persona)
+        target.lifecycle("persona_added")
+    return added
+
+
+def run(args):
+    headers = build_headers(args)
+    emitter = Emitter(args.emit, args.exec, args.content_chars, args.no_content)
+    directory_opener = None
+    opener_by_origin = {}
+
+    if args.url:
+        url, is_reference = effective_url(args)
+        opener = make_opener_for(url, is_reference, args)
+        targets = [WatchTarget(None, url, is_reference, opener, headers, args, emitter)]
+    else:
+        directory_url = "http://127.0.0.1:7474/api/personas"
+        directory_opener = make_opener_for(directory_url, True, args)
+        personas = requested_personas(args, directory_opener, headers)
+        if not personas:
+            raise FatalConfig("at least one persona is required")
+        targets = [build_persona_target(p, opener_by_origin, headers, args, emitter) for p in personas]
+
+    # ---- self-test (§7.2): run once, exit -------------------------------------------------------------------------
+    if args.self_test:
+        ok = True
+        for target in targets:
+            ok = target.self_test() and ok
+        return 0 if ok else 1
+
+    seam = WakeSeam()
+    seam.install()
+    rediscover_at = _monotonic() + args.rediscover_every
+
+    while not seam.stop:
+        seam.drain()  # read-and-clear at START of poll (§10)
+        if watches_all_personas(args) and directory_opener is not None and _monotonic() >= rediscover_at:
+            try:
+                discover_persona_targets(args, headers, emitter, targets, opener_by_origin, directory_opener)
+            except FatalConfig as e:
+                sys.stderr.write("kijito-monitor: WARNING persona rediscovery failed: %s\n" % e)
+            rediscover_at = _monotonic() + args.rediscover_every
+        counts_available = False
+        unread_counts = {}
+        count_target = next((t for t in targets if t.unread_persona), None)
+        if count_target is not None and not args.no_fast_path:
+            counts_available, unread_counts = fetch_unread_counts(
+                count_target.opener, count_target.count_url, headers
+            )
+        for target in targets:
+            target.poll_once(counts_available, unread_counts)
         if seam.stop:
             break
         seam.wait(args.poll_seconds)
@@ -613,7 +759,15 @@ def run(args):
 def build_parser():
     p = argparse.ArgumentParser(prog="kijito-monitor",
                                 description="Client-side liveness watcher for the Kijito inbox (see DESIGN.md).")
-    p.add_argument("--persona", help="Kijito persona whose inbox to watch (required unless --url given).")
+    p.add_argument("--persona", action="append",
+                   help="Kijito persona whose inbox to watch. Repeat for multi-persona mode.")
+    p.add_argument("--personas", action="append",
+                   help="Comma-separated personas to watch, e.g. codex,river,ladybug.")
+    p.add_argument("--all-personas", action="store_true",
+                   help="Watch every persona returned by /api/personas on the local Kijito daemon (default).")
+    p.add_argument("--rediscover-every", type=int, default=600,
+                   help="In all-persona mode, re-scan /api/personas every N seconds and add newly-created personas "
+                        "(default 600, min 1). Explicit persona subsets are not expanded.")
     p.add_argument("--url", help="Destination override (still Kijito-shaped); SSRF-guarded.")
     p.add_argument("--allow-loopback", action="store_true", help="Permit a loopback --url destination.")
     p.add_argument("--allow-private", action="store_true", help="Permit a private/link-local --url destination.")
@@ -625,7 +779,9 @@ def build_parser():
     p.add_argument("--no-content", action="store_true", help="Omit message content entirely (opaque mode).")
     p.add_argument("--seed-at", type=int, help="Cursor seed = last-handled id (overrides a state-file cursor).")
     p.add_argument("--max-replay", type=int, default=50, help="Cap on a re-arm backlog before fast-forwarding.")
-    p.add_argument("--state-file", help="Persist+resume cursor/FSM; single-writer locked. Recommended w/ a supervisor.")
+    p.add_argument("--state-file",
+                   help="Persist+resume cursor/FSM; single-writer locked. Kijito persona targets derive one "
+                        "file per persona from this base path. Recommended w/ a supervisor.")
     p.add_argument("--heartbeat", type=int, help="Emit a heartbeat event every N seconds (external dead-man's-switch).")
     p.add_argument("--auth-header", help="Header NAME for the token (default Authorization: Bearer).")
     p.add_argument("--token-file", help="File holding the auth token (wins over $KIJITOMON_TOKEN).")
@@ -643,12 +799,14 @@ def validate_args(args):
         raise FatalConfig("--alert-after must be >= 1")
     if args.resync_every < 1:
         raise FatalConfig("--resync-every must be >= 1")
+    if args.rediscover_every < 1:
+        raise FatalConfig("--rediscover-every must be >= 1")
     if args.emit == "exec-per-event" and not args.exec:
         raise FatalConfig("--exec is required when --emit exec-per-event")
     if args.emit != "exec-per-event" and args.exec:
         sys.stderr.write("kijito-monitor: WARNING --exec ignored (emit mode is %s)\n" % args.emit)
-    if not args.url and not args.persona:
-        raise FatalConfig("either --persona or --url is required")
+    if args.url and (args.persona or args.personas or args.all_personas):
+        raise FatalConfig("--url cannot be combined with --persona/--personas/--all-personas")
 
 
 def main(argv=None):
