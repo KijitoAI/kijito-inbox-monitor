@@ -131,6 +131,10 @@ Pipe that into your harness's wake mechanism — or skip the file and run a comm
 ~/.cache/kijito-monitor/events.<persona>.ndjson  # EVENTS: the stream you tail to consume your mail
 ```
 
+> **Migration note:** the single shared `events.ndjson` (from the older `--events-file` mode) is **retired** — the
+> supervised producer now writes per-persona `events.{persona}.ndjson`. A consumer still tailing the old
+> `events.ndjson` goes **silently blind** (no writer appends to it). Repoint it to `events.<persona>.ndjson`.
+
 ## CLI
 
 | flag | meaning |
