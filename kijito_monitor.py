@@ -234,12 +234,72 @@ def _now_iso():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+class RotatingFileSink:
+    """Owns the events-log fd and rotates it by size IN-PROCESS, so the writer reopens after its OWN rename.
+
+    Why this exists: a launchd StandardOutPath fd is NEVER reopened by launchd when an external rotator
+    (newsyslog) renames the file — the producer would keep appending to the orphaned inode while a `tail -F`
+    consumer follows the new empty file → SILENT blinding (the exact failure class this tool fights). Owning
+    the fd here and reopening after our OWN rename closes that hole with no external dependency and no sudo;
+    consumers just tail -F by name. max_bytes <= 0 disables rotation (unbounded)."""
+    def __init__(self, path, max_bytes, keep):
+        self.path = path
+        self.max_bytes = max_bytes
+        self.keep = max(1, keep)
+        self._fh = None
+        self._open()
+
+    def _open(self):
+        dirn = os.path.dirname(os.path.abspath(self.path)) or "."
+        os.makedirs(dirn, exist_ok=True)
+        self._fh = open(self.path, "a", encoding="utf-8")
+
+    def write(self, line):
+        self._fh.write(line)
+        self._fh.flush()
+        self._maybe_rotate()
+
+    def _maybe_rotate(self):
+        if self.max_bytes <= 0:
+            return
+        try:
+            size = os.fstat(self._fh.fileno()).st_size
+        except OSError:
+            return
+        if size < self.max_bytes:
+            return
+        try:
+            self._fh.close()
+            oldest = "%s.%d" % (self.path, self.keep)
+            if os.path.exists(oldest):
+                os.remove(oldest)
+            for i in range(self.keep - 1, 0, -1):
+                src = "%s.%d" % (self.path, i)
+                if os.path.exists(src):
+                    os.replace(src, "%s.%d" % (self.path, i + 1))
+            if os.path.exists(self.path):
+                os.replace(self.path, "%s.1" % self.path)
+        except OSError as e:
+            sys.stderr.write("kijito-monitor: WARNING log rotation failed (non-fatal): %s\n" % e)
+        finally:
+            self._open()  # always reopen by NAME — a tail -F consumer follows us onto the fresh file
+
+    def close(self):
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            finally:
+                self._fh = None
+
+
 class Emitter:
-    def __init__(self, mode, exec_cmd, content_chars, no_content):
+    def __init__(self, mode, exec_cmd, content_chars, no_content, sink=None, suppress_authors=None):
         self.mode = mode
         self.exec_cmd = exec_cmd
         self.content_chars = content_chars
         self.no_content = no_content
+        self.sink = sink  # RotatingFileSink for the supervised --events-file mode, else None (→ stdout)
+        self.suppress_authors = set(suppress_authors or [])  # drop self-echo 'new' events from these authors
 
     def _clip(self, content):
         if self.no_content:
@@ -250,8 +310,12 @@ class Emitter:
     def emit(self, event):
         """event: dict already containing event/source/ts and type-specific fields."""
         if self.mode == "stdout-jsonl":
-            sys.stdout.write(json.dumps(event, ensure_ascii=False) + "\n")
-            sys.stdout.flush()
+            line = json.dumps(event, ensure_ascii=False) + "\n"
+            if self.sink is not None:
+                self.sink.write(line)
+            else:
+                sys.stdout.write(line)
+                sys.stdout.flush()
         else:  # exec-per-event
             env = dict(os.environ)
             env["KIJITOMON_EVENT"] = str(event.get("event", ""))
@@ -277,6 +341,8 @@ class Emitter:
 
     # convenience constructors (carry the canonical fields; ts stamped at emit time)
     def new(self, m):
+        if self.suppress_authors and m.get("from") in self.suppress_authors:
+            return  # --suppress-author: don't wake on an event WE authored (self-echo noise). Cursor still advances.
         ev = {"event": "new", "source": SOURCE, "ts": _now_iso(), "id": m.get("id"),
               "from": m.get("from"), "created": m.get("created")}
         if m.get("_persona"):
@@ -649,9 +715,6 @@ class WatchTarget:
                     self.cursor = max(self.cursor if self.cursor is not None else 0,
                                       max(m["id"] for m in new_items))
 
-                if do_arm and not args.no_fast_path and self.unread_persona and counts_available:
-                    self.fast_path = True
-                    self.last_unread = unread_counts.get(self.unread_persona, 0)
             else:
                 self.failures += 1
                 if self.failures == args.alert_after and self.fsm_state == "UP":
@@ -663,6 +726,9 @@ class WatchTarget:
         if self.state_file is not None:
             self.state_file.save(self.cursor, self.fsm_state, self.failures)
 
+        # §9 enable the fast-path once — on the first healthy poll where the count endpoint is available.
+        # (Single enable point; the max-id cursor stays the source of truth for WHAT to emit, unread is only
+        # the wake TRIGGER, so a late/again enable is harmless.)
         if self.armed and not self.fast_path and not args.no_fast_path and self.unread_persona and counts_available:
             self.fast_path = True
             self.last_unread = unread_counts.get(self.unread_persona, 0)
@@ -702,7 +768,11 @@ def discover_persona_targets(args, headers, emitter, targets, opener_by_origin, 
 
 def run(args):
     headers = build_headers(args)
-    emitter = Emitter(args.emit, args.exec, args.content_chars, args.no_content)
+    sink = None
+    if args.events_file and not args.self_test and args.emit == "stdout-jsonl":
+        sink = RotatingFileSink(args.events_file, args.max_bytes, args.keep_logs)
+    emitter = Emitter(args.emit, args.exec, args.content_chars, args.no_content, sink=sink,
+                      suppress_authors=args.suppress_author)
     directory_opener = None
     opener_by_origin = {}
 
@@ -750,6 +820,8 @@ def run(args):
             break
         seam.wait(args.poll_seconds)
 
+    if sink is not None:
+        sink.close()
     return 0
 
 
@@ -775,8 +847,19 @@ def build_parser():
     p.add_argument("--alert-after", type=int, default=3, help="Consecutive failures before an alert (min 1).")
     p.add_argument("--emit", choices=("stdout-jsonl", "exec-per-event"), default="stdout-jsonl")
     p.add_argument("--exec", help="Command to run per event (required iff --emit exec-per-event).")
+    p.add_argument("--suppress-author", action="append",
+                   help="Do not emit 'new' events authored by this persona (repeatable) — drops the self-echo you "
+                        "get when watching all personas AND sending mail. Liveness events are unaffected.")
     p.add_argument("--content-chars", type=int, default=220)
     p.add_argument("--no-content", action="store_true", help="Omit message content entirely (opaque mode).")
+    p.add_argument("--events-file",
+                   help="Write NDJSON events to this file (an OWNED, size-rotated fd) instead of stdout — the "
+                        "supervised-producer mode that survives log rotation. Consumers tail -F it. "
+                        "Only applies to --emit stdout-jsonl.")
+    p.add_argument("--max-bytes", type=int, default=5_000_000,
+                   help="Rotate --events-file once it reaches N bytes (default 5000000; <=0 disables rotation).")
+    p.add_argument("--keep-logs", type=int, default=5,
+                   help="How many rotated --events-file archives to keep (default 5, min 1).")
     p.add_argument("--seed-at", type=int, help="Cursor seed = last-handled id (overrides a state-file cursor).")
     p.add_argument("--max-replay", type=int, default=50, help="Cap on a re-arm backlog before fast-forwarding.")
     p.add_argument("--state-file",
@@ -807,6 +890,23 @@ def validate_args(args):
         sys.stderr.write("kijito-monitor: WARNING --exec ignored (emit mode is %s)\n" % args.emit)
     if args.url and (args.persona or args.personas or args.all_personas):
         raise FatalConfig("--url cannot be combined with --persona/--personas/--all-personas")
+    if args.poll_seconds < 1:
+        raise FatalConfig("--poll-seconds must be >= 1")  # 0 → a select(timeout=0) busy-loop hammering the source
+    if args.heartbeat is not None and args.heartbeat < 1:
+        raise FatalConfig("--heartbeat must be >= 1")
+    if args.content_chars < 0:
+        raise FatalConfig("--content-chars must be >= 0")
+    if args.max_replay < 0:
+        raise FatalConfig("--max-replay must be >= 0")
+    if args.keep_logs < 1:
+        raise FatalConfig("--keep-logs must be >= 1")
+    if args.events_file and args.emit != "stdout-jsonl":
+        sys.stderr.write("kijito-monitor: WARNING --events-file ignored (emit mode is %s)\n" % args.emit)
+    if args.seed_at is not None:
+        single = bool(args.url) or (len(args.persona or []) == 1 and not args.personas and not args.all_personas)
+        if not single:
+            raise FatalConfig("--seed-at requires a single target (one --persona or --url), "
+                              "not multi-persona/all-personas — each persona has its own cursor")
 
 
 def main(argv=None):
