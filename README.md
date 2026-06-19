@@ -92,40 +92,43 @@ launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.kijito.monito
 launchctl kickstart -k "gui/$(id -u)/com.kijito.monitor"
 ```
 
-`KeepAlive` covers the `kill -9` / process-death gap a bare file-tail can't see. Log rotation is handled
-IN-PROCESS by `--events-file` (no `newsyslog` / `logrotate`, no `sudo`, no orphaned-fd blinding) — consumers
-just `tail -F` `events.ndjson`. stderr goes to `~/.cache/kijito-monitor/monitor.err`.
+`KeepAlive` covers the `kill -9` / process-death gap a bare file-tail can't see. The plist uses
+`--events-file-template`, so it writes ONE owned, self-rotating file PER PERSONA
+(`~/.cache/kijito-monitor/events.<persona>.ndjson`) — each session subscribes to only its own mail (see Agent
+Signposting). Rotation is IN-PROCESS (no `newsyslog` / `logrotate` / `sudo`, no orphaned-fd blinding). stderr
+goes to `~/.cache/kijito-monitor/monitor.err`.
 
 ## Agent Signposting
 
-At the start of an agent session, the operator only needs to arm one monitor for the local hive:
+One supervised producer watches the whole hive; each session is a **consumer** that subscribes to **only its own
+persona's** events. The launchd agent (above) runs the producer permanently. To arm it manually instead:
 
 ```sh
 cd /Users/jason/Code/Kijito.ai/kijito_monitor/monitor
-./arm-hive-monitor.sh
+KIJITOMON_EVENTS_FILE_TEMPLATE="$HOME/.cache/kijito-monitor/events.{persona}.ndjson" ./arm-hive-monitor.sh
 ```
 
-The wrapper uses `~/.cache/kijito-monitor/hive.json` as the state-file base. That base path becomes one file per
-persona, for example:
-
-```text
-~/.cache/kijito-monitor/hive.codex.json
-~/.cache/kijito-monitor/hive.river.json
-~/.cache/kijito-monitor/hive.ladybug.json
-~/.cache/kijito-monitor/hive.argus.json
-```
-
-Every realtime event includes `persona`, so a harness, log tail, or notification bridge can route it back to the
-right agent context. To watch the live event stream directly:
+**Subscribe to ONLY your own mail.** The producer writes one EVENT file per persona, named after the persona —
+so a session for `argus` just follows its own file. No shared-file filter to invent (that ambiguity is the very
+LLM-UX bug this tool exists to kill):
 
 ```sh
-./arm-hive-monitor.sh --heartbeat 300
+tail -n0 -F "$HOME/.cache/kijito-monitor/events.argus.ndjson"
 ```
 
-To send events into another command instead of stdout:
+Each line is one event: `armed` once on arm, then `new` per message, plus `alert` / `recovered` / `heartbeat`.
+Pipe that into your harness's wake mechanism — or skip the file and run a command per event directly with
+`--emit exec-per-event` (fields arrive as `KIJITOMON_*` env vars):
 
 ```sh
 ./arm-hive-monitor.sh --emit exec-per-event --exec 'printf "%s %s\n" "$KIJITOMON_PERSONA" "$KIJITOMON_FROM"'
+```
+
+**Two different per-persona files — don't confuse them:**
+
+```text
+~/.cache/kijito-monitor/hive.<persona>.json      # STATE: cursor/FSM bookkeeping (internal — do NOT tail this)
+~/.cache/kijito-monitor/events.<persona>.ndjson  # EVENTS: the stream you tail to consume your mail
 ```
 
 ## CLI
@@ -144,6 +147,7 @@ To send events into another command instead of stdout:
 | `--suppress-author P` | Don't emit `new` events authored by persona P (repeatable) — drops self-echo when watching all personas. Liveness events unaffected. |
 | `--content-chars N` / `--no-content` | Truncate (default 220) or omit message content. |
 | `--events-file PATH` | Supervised mode: write NDJSON to an OWNED, size-rotated log (survives rotation) instead of stdout. Consumers `tail -F` it. |
+| `--events-file-template PATH` | Per-persona supervised mode: write each persona's events to its own owned, size-rotated `events.{persona}.ndjson`; a session tails only its own. Must contain `{persona}`. Excludes `--events-file`. |
 | `--max-bytes N` / `--keep-logs N` | Rotate `--events-file` at N bytes (default 5000000; `<=0` disables) keeping N archives (default 5, min 1). |
 | `--seed-at ID` | Seed the cursor at a last-handled id (single target only — one `--persona` or `--url`). |
 | `--max-replay N` | Cap on a re-arm backlog before fast-forwarding (default 50). |

@@ -293,13 +293,38 @@ class RotatingFileSink:
 
 
 class Emitter:
-    def __init__(self, mode, exec_cmd, content_chars, no_content, sink=None, suppress_authors=None):
+    def __init__(self, mode, exec_cmd, content_chars, no_content, sink=None, suppress_authors=None,
+                 sink_template=None, max_bytes=0, keep=5):
         self.mode = mode
         self.exec_cmd = exec_cmd
         self.content_chars = content_chars
         self.no_content = no_content
-        self.sink = sink  # RotatingFileSink for the supervised --events-file mode, else None (→ stdout)
+        self.sink = sink  # single shared RotatingFileSink (--events-file), else None (→ stdout)
         self.suppress_authors = set(suppress_authors or [])  # drop self-echo 'new' events from these authors
+        # --events-file-template: one OWNED RotatingFileSink PER PERSONA, so a session subscribes to ONLY its
+        # own mail by `tail -F events.<persona>.ndjson` — no shared-file grep to invent (the [1988] LLM-UX class).
+        self.sink_template = sink_template
+        self._max_bytes = max_bytes
+        self._keep = keep
+        self._sinks_by_persona = {}
+
+    def _sink_for(self, persona):
+        """Route an event to its persona's sink (template mode), the single shared sink, or stdout (None)."""
+        if self.sink_template is None:
+            return self.sink
+        key = persona or "_all"  # events with no persona (e.g. a bare --url target) land in one _all file
+        s = self._sinks_by_persona.get(key)
+        if s is None:
+            path = self.sink_template.replace("{persona}", _state_safe_persona(key))
+            s = RotatingFileSink(path, self._max_bytes, self._keep)
+            self._sinks_by_persona[key] = s
+        return s
+
+    def close(self):
+        if self.sink is not None:
+            self.sink.close()
+        for s in self._sinks_by_persona.values():
+            s.close()
 
     def _clip(self, content):
         if self.no_content:
@@ -311,8 +336,9 @@ class Emitter:
         """event: dict already containing event/source/ts and type-specific fields."""
         if self.mode == "stdout-jsonl":
             line = json.dumps(event, ensure_ascii=False) + "\n"
-            if self.sink is not None:
-                self.sink.write(line)
+            sink = self._sink_for(event.get("persona"))
+            if sink is not None:
+                sink.write(line)
             else:
                 sys.stdout.write(line)
                 sys.stdout.flush()
@@ -769,10 +795,15 @@ def discover_persona_targets(args, headers, emitter, targets, opener_by_origin, 
 def run(args):
     headers = build_headers(args)
     sink = None
-    if args.events_file and not args.self_test and args.emit == "stdout-jsonl":
-        sink = RotatingFileSink(args.events_file, args.max_bytes, args.keep_logs)
+    sink_template = None
+    if not args.self_test and args.emit == "stdout-jsonl":
+        if args.events_file_template:
+            sink_template = args.events_file_template  # one sink per persona (lazily created on first event)
+        elif args.events_file:
+            sink = RotatingFileSink(args.events_file, args.max_bytes, args.keep_logs)
     emitter = Emitter(args.emit, args.exec, args.content_chars, args.no_content, sink=sink,
-                      suppress_authors=args.suppress_author)
+                      suppress_authors=args.suppress_author, sink_template=sink_template,
+                      max_bytes=args.max_bytes, keep=args.keep_logs)
     directory_opener = None
     opener_by_origin = {}
 
@@ -820,8 +851,7 @@ def run(args):
             break
         seam.wait(args.poll_seconds)
 
-    if sink is not None:
-        sink.close()
+    emitter.close()
     return 0
 
 
@@ -856,8 +886,13 @@ def build_parser():
                    help="Write NDJSON events to this file (an OWNED, size-rotated fd) instead of stdout — the "
                         "supervised-producer mode that survives log rotation. Consumers tail -F it. "
                         "Only applies to --emit stdout-jsonl.")
+    p.add_argument("--events-file-template",
+                   help="Per-persona supervised mode: write EACH persona's events to its OWN owned, size-rotated "
+                        "file, e.g. ~/.cache/kijito-monitor/events.{persona}.ndjson — a session then subscribes "
+                        "to only its own mail with `tail -F events.<persona>.ndjson`, no filtering. Must contain "
+                        "'{persona}'. Mutually exclusive with --events-file.")
     p.add_argument("--max-bytes", type=int, default=5_000_000,
-                   help="Rotate --events-file once it reaches N bytes (default 5000000; <=0 disables rotation).")
+                   help="Rotate the events file(s) once one reaches N bytes (default 5000000; <=0 disables).")
     p.add_argument("--keep-logs", type=int, default=5,
                    help="How many rotated --events-file archives to keep (default 5, min 1).")
     p.add_argument("--seed-at", type=int, help="Cursor seed = last-handled id (overrides a state-file cursor).")
@@ -900,8 +935,12 @@ def validate_args(args):
         raise FatalConfig("--max-replay must be >= 0")
     if args.keep_logs < 1:
         raise FatalConfig("--keep-logs must be >= 1")
-    if args.events_file and args.emit != "stdout-jsonl":
-        sys.stderr.write("kijito-monitor: WARNING --events-file ignored (emit mode is %s)\n" % args.emit)
+    if args.events_file and args.events_file_template:
+        raise FatalConfig("--events-file and --events-file-template are mutually exclusive")
+    if args.events_file_template and "{persona}" not in args.events_file_template:
+        raise FatalConfig("--events-file-template must contain the '{persona}' placeholder")
+    if (args.events_file or args.events_file_template) and args.emit != "stdout-jsonl":
+        sys.stderr.write("kijito-monitor: WARNING --events-file/-template ignored (emit mode is %s)\n" % args.emit)
     if args.seed_at is not None:
         single = bool(args.url) or (len(args.persona or []) == 1 and not args.personas and not args.all_personas)
         if not single:
