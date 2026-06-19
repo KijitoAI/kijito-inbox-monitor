@@ -8,8 +8,10 @@ It is the **client-side** complement to Kijito's server-side unread banner: the 
 (delivered on the agent's next tool call); this watcher is the proactive layer that wakes a running agent *without*
 a call. It is NOT a server and NOT a notification service.
 
-> **Status:** v1, verified. All DONE-WHEN criteria in [`../docs/DESIGN.md`](../docs/DESIGN.md) §12 pass on real
-> runs (2 consecutive green). Single file: `kijito_monitor.py`. POSIX (Linux/macOS); Windows runs interval-only.
+> **Status:** verified, multi-persona. Watches the whole local hive from one process (one `/api/notify/pending`
+> fetch per tick, per-persona cursors, periodic new-persona rediscovery) and writes an owned, self-rotating events
+> log. DONE-WHEN in [`../docs/DESIGN.md`](../docs/DESIGN.md) §12 pass on real runs (2 consecutive green). Single
+> file: `kijito_monitor.py`. POSIX (Linux/macOS); Windows runs interval-only.
 
 ## Why it exists
 
@@ -51,10 +53,15 @@ liveness state with no missed or re-emitted messages:
 
 ```sh
 mkdir -p "$HOME/.cache/kijito-monitor"
-nohup ./arm-hive-monitor.sh \
-  >"$HOME/.cache/kijito-monitor/events.ndjson" \
-  2>"$HOME/.cache/kijito-monitor/monitor.err" &
+KIJITOMON_EVENTS_FILE="$HOME/.cache/kijito-monitor/events.ndjson" \
+  nohup ./arm-hive-monitor.sh 2>"$HOME/.cache/kijito-monitor/monitor.err" &
 ```
+
+`--events-file` (set here via `KIJITOMON_EVENTS_FILE`) makes the watcher write events to a log it **owns and
+size-rotates itself**. Do NOT redirect stdout to the log for a supervised run: an external rotator (newsyslog)
+renames the file, but a launchd / `nohup` stdout fd is never reopened — the producer would keep writing the
+orphaned inode while `tail -F` consumers follow a new empty file (silent blinding). The owned `--events-file`
+reopens after its own rotation, so consumers just `tail -F` `events.ndjson`.
 
 The state-file is single-writer locked (a second instance exits non-zero) and identity-stamped (it refuses to
 resume a different inbox's cursor). Without a state-file, run a single instance and use `--heartbeat N` to wire an
@@ -71,10 +78,12 @@ count increases or its resync floor is due. In all-persona mode, the watcher als
 periodically and adds newly-created personas without restarting; explicit `--persona` / `--personas` subsets stay
 fixed.
 
-### launchd autostart
+### launchd autostart (recommended supervised producer)
 
-The repository includes `com.kijito.monitor.plist` for the local macOS user agent. Cutover should be explicit:
-stop any existing detached producer first, then install and load the agent.
+The repo ships `com.kijito.monitor.plist` — a macOS **user** LaunchAgent (RunAtLoad + KeepAlive) that runs ONE
+all-persona producer writing the owned, self-rotating `--events-file` at `~/.cache/kijito-monitor/events.ndjson`.
+Cutover is explicit — retire any existing detached producer FIRST (the per-persona state-file locks permit only
+one writer), then install and load the agent:
 
 ```sh
 mkdir -p "$HOME/.cache/kijito-monitor" "$HOME/Library/LaunchAgents"
@@ -83,13 +92,9 @@ launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.kijito.monito
 launchctl kickstart -k "gui/$(id -u)/com.kijito.monitor"
 ```
 
-The plist writes NDJSON events to `~/.cache/kijito-monitor/events.ndjson`, stderr to
-`~/.cache/kijito-monitor/monitor.err`, and keeps the monitor alive with launchd restart semantics. The companion
-`com.kijito.monitor.newsyslog.conf` is the native log-rotation template for `/etc/newsyslog.d/`:
-
-```sh
-sudo cp com.kijito.monitor.newsyslog.conf /etc/newsyslog.d/com.kijito.monitor.conf
-```
+`KeepAlive` covers the `kill -9` / process-death gap a bare file-tail can't see. Log rotation is handled
+IN-PROCESS by `--events-file` (no `newsyslog` / `logrotate`, no `sudo`, no orphaned-fd blinding) — consumers
+just `tail -F` `events.ndjson`. stderr goes to `~/.cache/kijito-monitor/monitor.err`.
 
 ## Agent Signposting
 
@@ -136,8 +141,11 @@ To send events into another command instead of stdout:
 | `--alert-after N` | Consecutive failures before an `alert` (default 3, min 1). A single transient failure is normal. |
 | `--emit stdout-jsonl\|exec-per-event` | Output mode (default `stdout-jsonl`). |
 | `--exec 'CMD'` | Command per event (required iff `--emit exec-per-event`). Fields → `KIJITOMON_*` env vars. |
+| `--suppress-author P` | Don't emit `new` events authored by persona P (repeatable) — drops self-echo when watching all personas. Liveness events unaffected. |
 | `--content-chars N` / `--no-content` | Truncate (default 220) or omit message content. |
-| `--seed-at ID` | Seed the cursor at a last-handled id (overrides a state-file cursor). |
+| `--events-file PATH` | Supervised mode: write NDJSON to an OWNED, size-rotated log (survives rotation) instead of stdout. Consumers `tail -F` it. |
+| `--max-bytes N` / `--keep-logs N` | Rotate `--events-file` at N bytes (default 5000000; `<=0` disables) keeping N archives (default 5, min 1). |
+| `--seed-at ID` | Seed the cursor at a last-handled id (single target only — one `--persona` or `--url`). |
 | `--max-replay N` | Cap on a re-arm backlog before fast-forwarding (default 50). |
 | `--state-file PATH` | Persist + resume cursor/FSM; single-writer locked. Kijito persona targets derive one file per persona. Recommended under a supervisor. |
 | `--heartbeat N` | Emit a `heartbeat` every N seconds (external dead-man's-switch). |
