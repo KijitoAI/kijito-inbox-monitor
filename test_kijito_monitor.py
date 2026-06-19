@@ -185,6 +185,24 @@ class RotatingFileSinkTest(unittest.TestCase):
         self.assertIn('"id": 2', data)
         self.assertIn('"event": "alert"', data)
 
+    def test_events_file_template_routes_per_persona(self):
+        d = tempfile.mkdtemp()
+        tmpl = os.path.join(d, "events.{persona}.ndjson")
+        em = km.Emitter("stdout-jsonl", None, 220, False, sink_template=tmpl, max_bytes=0, keep=3)
+        self.addCleanup(em.close)
+        em.new({"id": 1, "from": "river", "_persona": "argus"})
+        em.new({"id": 2, "from": "codex", "_persona": "ladybug"})
+        em.lifecycle("armed", cursor=5, persona="argus")   # lifecycle carries persona too → same file
+        with open(os.path.join(d, "events.argus.ndjson")) as f:
+            argus = f.read()
+        with open(os.path.join(d, "events.ladybug.ndjson")) as f:
+            lady = f.read()
+        self.assertIn('"id": 1', argus)
+        self.assertIn('"event": "armed"', argus)
+        self.assertNotIn('"id": 2', argus)        # ladybug's mail does NOT leak into argus's file
+        self.assertIn('"id": 2', lady)
+        self.assertNotIn('"id": 1', lady)
+
 
 class ValidationGuardTest(unittest.TestCase):
     def _args(self, argv):
@@ -208,6 +226,14 @@ class ValidationGuardTest(unittest.TestCase):
     def test_url_conflicts_with_persona(self):
         with self.assertRaises(km.FatalConfig):
             km.validate_args(self._args(["--url", "http://x", "--persona", "argus"]))
+
+    def test_events_file_and_template_mutually_exclusive(self):
+        with self.assertRaises(km.FatalConfig):
+            km.validate_args(self._args(["--events-file", "/a", "--events-file-template", "/b.{persona}.ndjson"]))
+
+    def test_events_file_template_requires_placeholder(self):
+        with self.assertRaises(km.FatalConfig):
+            km.validate_args(self._args(["--events-file-template", "/no/placeholder.ndjson"]))
 
 
 if __name__ == "__main__":

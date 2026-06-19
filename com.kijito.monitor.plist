@@ -12,8 +12,8 @@
     <string>/Users/jason/Code/Kijito.ai/kijito_monitor/monitor/kijito_monitor.py</string>
     <string>--state-file</string>
     <string>/Users/jason/.cache/kijito-monitor/hive.json</string>
-    <string>--events-file</string>
-    <string>/Users/jason/.cache/kijito-monitor/events.ndjson</string>
+    <string>--events-file-template</string>
+    <string>/Users/jason/.cache/kijito-monitor/events.{persona}.ndjson</string>
   </array>
   <key>WorkingDirectory</key>
   <string>/Users/jason/Code/Kijito.ai/kijito_monitor/monitor</string>
