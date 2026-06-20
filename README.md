@@ -53,15 +53,18 @@ liveness state with no missed or re-emitted messages:
 
 ```sh
 mkdir -p "$HOME/.cache/kijito-monitor"
-KIJITOMON_EVENTS_FILE="$HOME/.cache/kijito-monitor/events.ndjson" \
+KIJITOMON_EVENTS_FILE_TEMPLATE="$HOME/.cache/kijito-monitor/events.{persona}.ndjson" \
   nohup ./arm-hive-monitor.sh 2>"$HOME/.cache/kijito-monitor/monitor.err" &
 ```
 
-`--events-file` (set here via `KIJITOMON_EVENTS_FILE`) makes the watcher write events to a log it **owns and
-size-rotates itself**. Do NOT redirect stdout to the log for a supervised run: an external rotator (newsyslog)
-renames the file, but a launchd / `nohup` stdout fd is never reopened — the producer would keep writing the
-orphaned inode while `tail -F` consumers follow a new empty file (silent blinding). The owned `--events-file`
-reopens after its own rotation, so consumers just `tail -F` `events.ndjson`.
+`--events-file-template` (set here via `KIJITOMON_EVENTS_FILE_TEMPLATE`) makes the watcher write **one event log
+per persona** that it **owns and size-rotates itself** — each session then tails only its own
+`events.<persona>.ndjson` (see Agent Signposting). Do NOT redirect stdout to a log for a supervised run: an
+external rotator (newsyslog) renames the file, but a launchd / `nohup` stdout fd is never reopened — the producer
+would keep writing the orphaned inode while `tail -F` consumers follow a new empty file (silent blinding). The
+owned event files reopen after their own rotation, so consumers just `tail -F` their own
+`events.<persona>.ndjson`. (For a SINGLE-target watch you can instead use `--events-file PATH` — one shared log;
+the per-persona template is the right default for the hive.)
 
 The state-file is single-writer locked (a second instance exits non-zero) and identity-stamped (it refuses to
 resume a different inbox's cursor). Without a state-file, run a single instance and use `--heartbeat N` to wire an
@@ -81,7 +84,8 @@ fixed.
 ### launchd autostart (recommended supervised producer)
 
 The repo ships `com.kijito.monitor.plist` — a macOS **user** LaunchAgent (RunAtLoad + KeepAlive) that runs ONE
-all-persona producer writing the owned, self-rotating `--events-file` at `~/.cache/kijito-monitor/events.ndjson`.
+all-persona producer writing one owned, self-rotating event log PER PERSONA via `--events-file-template` at
+`~/.cache/kijito-monitor/events.<persona>.ndjson`.
 Cutover is explicit — retire any existing detached producer FIRST (the per-persona state-file locks permit only
 one writer), then install and load the agent:
 
