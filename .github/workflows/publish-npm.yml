@@ -7,8 +7,11 @@ name: publish-npm
 # once on npmjs.com first: npmjs.com -> the package -> Settings -> Trusted Publisher ->
 # add this repo + this workflow file.
 on:
-  push:
-    tags: ["v*"]
+  # Tag-triggered publish is intentionally DISABLED until npm Trusted Publishing is
+  # configured for this (new) package on npmjs.com. A new npm package may need a one-time
+  # publish before OIDC can be wired, so the v0.1.0 tag should publish PyPI cleanly without
+  # a failing npm run here. Publish the first npm release manually from the Actions tab
+  # (workflow_dispatch); restore the `push: tags: ["v*"]` trigger once OIDC is set up.
   workflow_dispatch:
 
 permissions:
