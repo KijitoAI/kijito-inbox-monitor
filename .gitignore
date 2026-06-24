@@ -11,6 +11,10 @@ venv/
 .ruff_cache/
 .mypy_cache/
 
+# Node (npm signpost shim)
+node_modules/
+*.tgz
+
 # OS / editor
 .DS_Store
 *.swp

@@ -1,0 +1,35 @@
+{
+  "name": "kijito-inbox-monitor",
+  "version": "0.1.0",
+  "description": "Pointer to the Python package kijito-inbox-monitor. A zero-dependency local watcher that wakes a running agent when new Kijito inbox mail arrives. Install the real tool with pipx/uv/pip.",
+  "license": "Apache-2.0",
+  "type": "commonjs",
+  "bin": {
+    "kijito-inbox-monitor": "bin/cli.js"
+  },
+  "files": [
+    "bin/",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KijitoAI/kijito-inbox-monitor.git"
+  },
+  "bugs": {
+    "url": "https://github.com/KijitoAI/kijito-inbox-monitor/issues"
+  },
+  "homepage": "https://github.com/KijitoAI/kijito-inbox-monitor#readme",
+  "keywords": [
+    "kijito",
+    "inbox",
+    "monitor",
+    "watcher",
+    "agent",
+    "cli",
+    "python",
+    "pipx"
+  ]
+}
