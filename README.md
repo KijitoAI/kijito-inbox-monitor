@@ -27,7 +27,7 @@ running it in anger surfaced real bugs in its own early versions.
 ## Quickstart
 
 ```sh
-# verify it emits before trusting a live arm — run the all-persona self-test:
+# verify it emits before trusting a live arm. Run the all-persona self-test:
 python3 kijito_inbox_monitor.py --self-test
 
 # arm the local hive monitor with the standard state-file base:

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""KijitoMonitor — client-side liveness watcher for the Kijito inbox.
+"""Kijito Inbox Monitor - client-side liveness watcher for the Kijito inbox.
 
 A standalone, zero-dependency (Python stdlib only) process that polls the Kijito inbox and emits one event per new
-message into whatever harness is running — NDJSON on stdout and/or by exec-ing a command per event. It keeps a
+message into whatever harness is running - NDJSON on stdout and/or by exec-ing a command per event. It keeps a
 *running* agent's inbox live by waking it BETWEEN tool calls (the LLM-UX inbox-liveness fix). It is NOT a server.
 
 This is the v1 reference implementation of docs/DESIGN.md (rev 5). POSIX target (Linux/macOS); on Windows it runs
-interval-only (no SIGUSR1 seam, no flock). Build/behaviour invariants — see DESIGN.md sections cited inline.
+interval-only (no SIGUSR1 seam, no flock). Build/behaviour invariants - see DESIGN.md sections cited inline.
 """
 import argparse
 import datetime
@@ -54,7 +54,7 @@ def canonical_identity(url):
     port = p.port or (443 if scheme == "https" else 80)
     path = (p.path or "/").rstrip("/") or "/"
     # sort query params; the constant mark_read is excluded so its presence can't flip identity.
-    # Use LISTS (not tuples) so the identity is JSON-round-trip stable — a persisted identity reloads
+    # Use LISTS (not tuples) so the identity is JSON-round-trip stable - a persisted identity reloads
     # as lists, and the freshly-computed one must compare EQUAL (tuples would reload as lists → spurious
     # mismatch → restart-resume silently re-baselines, defeating the state-file).
     q = sorted([k, v] for k, v in urllib.parse.parse_qsl(p.query, keep_blank_values=True) if k != "mark_read")
@@ -62,7 +62,7 @@ def canonical_identity(url):
 
 
 # --------------------------------------------------------------------------------------------------------------------
-# §8 SSRF guard — applies to a user-supplied --url only; the Kijito loopback reference is exempt.
+# §8 SSRF guard - applies to a user-supplied --url only; the Kijito loopback reference is exempt.
 # --------------------------------------------------------------------------------------------------------------------
 def _ip_is_internal(ip):
     a = ipaddress.ip_address(ip)
@@ -118,7 +118,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Redirects are never followed (independent of the allow-flags) — §8."""
+    """Redirects are never followed (independent of the allow-flags) - §8."""
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
 
@@ -136,7 +136,7 @@ def build_opener(pinned_ip):
 
 
 # --------------------------------------------------------------------------------------------------------------------
-# §5 http-poll adapter — peek + shape-validate + classify healthy/failure
+# §5 http-poll adapter - peek + shape-validate + classify healthy/failure
 # --------------------------------------------------------------------------------------------------------------------
 class Poll:
     """Result of one fetch. ok=True → HEALTHY (items is the validated list). ok=False → liveness FAILURE."""
@@ -238,7 +238,7 @@ class RotatingFileSink:
     """Owns the events-log fd and rotates it by size IN-PROCESS, so the writer reopens after its OWN rename.
 
     Why this exists: a launchd StandardOutPath fd is NEVER reopened by launchd when an external rotator
-    (newsyslog) renames the file — the producer would keep appending to the orphaned inode while a `tail -F`
+    (newsyslog) renames the file - the producer would keep appending to the orphaned inode while a `tail -F`
     consumer follows the new empty file → SILENT blinding (the exact failure class this tool fights). Owning
     the fd here and reopening after our OWN rename closes that hole with no external dependency and no sudo;
     consumers just tail -F by name. max_bytes <= 0 disables rotation (unbounded)."""
@@ -282,7 +282,7 @@ class RotatingFileSink:
         except OSError as e:
             sys.stderr.write("kijito-inbox-monitor: WARNING log rotation failed (non-fatal): %s\n" % e)
         finally:
-            self._open()  # always reopen by NAME — a tail -F consumer follows us onto the fresh file
+            self._open()  # always reopen by NAME - a tail -F consumer follows us onto the fresh file
 
     def close(self):
         if self._fh is not None:
@@ -302,7 +302,7 @@ class Emitter:
         self.sink = sink  # single shared RotatingFileSink (--events-file), else None (→ stdout)
         self.suppress_authors = set(suppress_authors or [])  # drop self-echo 'new' events from these authors
         # --events-file-template: one OWNED RotatingFileSink PER PERSONA, so a session subscribes to ONLY its
-        # own mail by `tail -F events.<persona>.ndjson` — no shared-file grep to invent (the [1988] LLM-UX class).
+        # own mail by `tail -F events.<persona>.ndjson` - no shared-file grep to invent (the inbox-liveness LLM-UX problem).
         self.sink_template = sink_template
         self._max_bytes = max_bytes
         self._keep = keep
@@ -362,7 +362,7 @@ class Emitter:
                 subprocess.run(self.exec_cmd, shell=True, env=env, timeout=EXEC_TIMEOUT, check=False)
             except subprocess.TimeoutExpired:
                 sys.stderr.write("kijito-inbox-monitor: exec timed out (non-fatal): %s\n" % self.exec_cmd)
-            except Exception as e:  # non-fatal — watch continues, cursor already advanced
+            except Exception as e:  # non-fatal - watch continues, cursor already advanced
                 sys.stderr.write("kijito-inbox-monitor: exec failed (non-fatal): %s\n" % e)
 
     # convenience constructors (carry the canonical fields; ts stamped at emit time)
@@ -432,7 +432,7 @@ class StateFile:
                 and isinstance(failures, int)):
             return None
         if ident != self.identity:
-            sys.stderr.write("kijito-inbox-monitor: WARNING state-file identity mismatch (%r != %r) — NOT resuming its "
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file identity mismatch (%r != %r) - NOT resuming its "
                              "cursor; re-baselining to avoid a silently-blind watcher.\n" % (ident, self.identity))
             return None
         return (cursor, state, failures)
@@ -696,7 +696,7 @@ class WatchTarget:
             if poll.redirected and self.is_user_url and self.first_poll:
                 raise FatalConfig("SSRF guard: --url returned a redirect (refused)")
             if poll.status == 404 and (self.first_poll or args.self_test):
-                raise FatalConfig("inbox endpoint 404 (hive disabled?) — fatal at startup")
+                raise FatalConfig("inbox endpoint 404 (hive disabled?) - fatal at startup")
 
             if poll.ok:
                 recovered = False
@@ -752,7 +752,7 @@ class WatchTarget:
         if self.state_file is not None:
             self.state_file.save(self.cursor, self.fsm_state, self.failures)
 
-        # §9 enable the fast-path once — on the first healthy poll where the count endpoint is available.
+        # §9 enable the fast-path once - on the first healthy poll where the count endpoint is available.
         # (Single enable point; the max-id cursor stays the source of truth for WHAT to emit, unread is only
         # the wake TRIGGER, so a late/again enable is harmless.)
         if self.armed and not self.fast_path and not args.no_fast_path and self.unread_persona and counts_available:
@@ -878,17 +878,17 @@ def build_parser():
     p.add_argument("--emit", choices=("stdout-jsonl", "exec-per-event"), default="stdout-jsonl")
     p.add_argument("--exec", help="Command to run per event (required iff --emit exec-per-event).")
     p.add_argument("--suppress-author", action="append",
-                   help="Do not emit 'new' events authored by this persona (repeatable) — drops the self-echo you "
+                   help="Do not emit 'new' events authored by this persona (repeatable) - drops the self-echo you "
                         "get when watching all personas AND sending mail. Liveness events are unaffected.")
     p.add_argument("--content-chars", type=int, default=220)
     p.add_argument("--no-content", action="store_true", help="Omit message content entirely (opaque mode).")
     p.add_argument("--events-file",
-                   help="Write NDJSON events to this file (an OWNED, size-rotated fd) instead of stdout — the "
+                   help="Write NDJSON events to this file (an OWNED, size-rotated fd) instead of stdout - the "
                         "supervised-producer mode that survives log rotation. Consumers tail -F it. "
                         "Only applies to --emit stdout-jsonl.")
     p.add_argument("--events-file-template",
                    help="Per-persona supervised mode: write EACH persona's events to its OWN owned, size-rotated "
-                        "file, e.g. ~/.cache/kijito-inbox-monitor/events.{persona}.ndjson — a session then subscribes "
+                        "file, e.g. ~/.cache/kijito-inbox-monitor/events.{persona}.ndjson - a session then subscribes "
                         "to only its own mail with `tail -F events.<persona>.ndjson`, no filtering. Must contain "
                         "'{persona}'. Mutually exclusive with --events-file.")
     p.add_argument("--max-bytes", type=int, default=5_000_000,
@@ -945,7 +945,7 @@ def validate_args(args):
         single = bool(args.url) or (len(args.persona or []) == 1 and not args.personas and not args.all_personas)
         if not single:
             raise FatalConfig("--seed-at requires a single target (one --persona or --url), "
-                              "not multi-persona/all-personas — each persona has its own cursor")
+                              "not multi-persona/all-personas - each persona has its own cursor")
 
 
 def main(argv=None):
