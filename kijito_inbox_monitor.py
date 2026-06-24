@@ -280,7 +280,7 @@ class RotatingFileSink:
             if os.path.exists(self.path):
                 os.replace(self.path, "%s.1" % self.path)
         except OSError as e:
-            sys.stderr.write("kijito-monitor: WARNING log rotation failed (non-fatal): %s\n" % e)
+            sys.stderr.write("kijito-inbox-monitor: WARNING log rotation failed (non-fatal): %s\n" % e)
         finally:
             self._open()  # always reopen by NAME — a tail -F consumer follows us onto the fresh file
 
@@ -361,9 +361,9 @@ class Emitter:
             try:
                 subprocess.run(self.exec_cmd, shell=True, env=env, timeout=EXEC_TIMEOUT, check=False)
             except subprocess.TimeoutExpired:
-                sys.stderr.write("kijito-monitor: exec timed out (non-fatal): %s\n" % self.exec_cmd)
+                sys.stderr.write("kijito-inbox-monitor: exec timed out (non-fatal): %s\n" % self.exec_cmd)
             except Exception as e:  # non-fatal — watch continues, cursor already advanced
-                sys.stderr.write("kijito-monitor: exec failed (non-fatal): %s\n" % e)
+                sys.stderr.write("kijito-inbox-monitor: exec failed (non-fatal): %s\n" % e)
 
     # convenience constructors (carry the canonical fields; ts stamped at emit time)
     def new(self, m):
@@ -432,7 +432,7 @@ class StateFile:
                 and isinstance(failures, int)):
             return None
         if ident != self.identity:
-            sys.stderr.write("kijito-monitor: WARNING state-file identity mismatch (%r != %r) — NOT resuming its "
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file identity mismatch (%r != %r) — NOT resuming its "
                              "cursor; re-baselining to avoid a silently-blind watcher.\n" % (ident, self.identity))
             return None
         return (cursor, state, failures)
@@ -451,7 +451,7 @@ class StateFile:
                 os.fsync(f.fileno())
             os.replace(tmp, self.path)
         except OSError as e:
-            sys.stderr.write("kijito-monitor: WARNING state-file write failed (non-fatal): %s\n" % e)
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file write failed (non-fatal): %s\n" % e)
             try:
                 os.unlink(tmp)
             except OSError:
@@ -784,7 +784,7 @@ def discover_persona_targets(args, headers, emitter, targets, opener_by_origin, 
         try:
             target = build_persona_target(persona, opener_by_origin, headers, args, emitter)
         except FatalConfig as e:
-            sys.stderr.write("kijito-monitor: WARNING cannot add persona %r: %s\n" % (persona, e))
+            sys.stderr.write("kijito-inbox-monitor: WARNING cannot add persona %r: %s\n" % (persona, e))
             continue
         targets.append(target)
         added.append(persona)
@@ -836,7 +836,7 @@ def run(args):
             try:
                 discover_persona_targets(args, headers, emitter, targets, opener_by_origin, directory_opener)
             except FatalConfig as e:
-                sys.stderr.write("kijito-monitor: WARNING persona rediscovery failed: %s\n" % e)
+                sys.stderr.write("kijito-inbox-monitor: WARNING persona rediscovery failed: %s\n" % e)
             rediscover_at = _monotonic() + args.rediscover_every
         counts_available = False
         unread_counts = {}
@@ -859,7 +859,7 @@ def run(args):
 # CLI
 # --------------------------------------------------------------------------------------------------------------------
 def build_parser():
-    p = argparse.ArgumentParser(prog="kijito-monitor",
+    p = argparse.ArgumentParser(prog="kijito-inbox-monitor",
                                 description="Client-side liveness watcher for the Kijito inbox (see DESIGN.md).")
     p.add_argument("--persona", action="append",
                    help="Kijito persona whose inbox to watch. Repeat for multi-persona mode.")
@@ -888,7 +888,7 @@ def build_parser():
                         "Only applies to --emit stdout-jsonl.")
     p.add_argument("--events-file-template",
                    help="Per-persona supervised mode: write EACH persona's events to its OWN owned, size-rotated "
-                        "file, e.g. ~/.cache/kijito-monitor/events.{persona}.ndjson — a session then subscribes "
+                        "file, e.g. ~/.cache/kijito-inbox-monitor/events.{persona}.ndjson — a session then subscribes "
                         "to only its own mail with `tail -F events.<persona>.ndjson`, no filtering. Must contain "
                         "'{persona}'. Mutually exclusive with --events-file.")
     p.add_argument("--max-bytes", type=int, default=5_000_000,
@@ -922,7 +922,7 @@ def validate_args(args):
     if args.emit == "exec-per-event" and not args.exec:
         raise FatalConfig("--exec is required when --emit exec-per-event")
     if args.emit != "exec-per-event" and args.exec:
-        sys.stderr.write("kijito-monitor: WARNING --exec ignored (emit mode is %s)\n" % args.emit)
+        sys.stderr.write("kijito-inbox-monitor: WARNING --exec ignored (emit mode is %s)\n" % args.emit)
     if args.url and (args.persona or args.personas or args.all_personas):
         raise FatalConfig("--url cannot be combined with --persona/--personas/--all-personas")
     if args.poll_seconds < 1:
@@ -940,7 +940,7 @@ def validate_args(args):
     if args.events_file_template and "{persona}" not in args.events_file_template:
         raise FatalConfig("--events-file-template must contain the '{persona}' placeholder")
     if (args.events_file or args.events_file_template) and args.emit != "stdout-jsonl":
-        sys.stderr.write("kijito-monitor: WARNING --events-file/-template ignored (emit mode is %s)\n" % args.emit)
+        sys.stderr.write("kijito-inbox-monitor: WARNING --events-file/-template ignored (emit mode is %s)\n" % args.emit)
     if args.seed_at is not None:
         single = bool(args.url) or (len(args.persona or []) == 1 and not args.personas and not args.all_personas)
         if not single:
@@ -954,7 +954,7 @@ def main(argv=None):
         validate_args(args)
         return run(args)
     except FatalConfig as e:
-        sys.stderr.write("kijito-monitor: FATAL %s\n" % e)
+        sys.stderr.write("kijito-inbox-monitor: FATAL %s\n" % e)
         return 2
     except KeyboardInterrupt:
         return 0
