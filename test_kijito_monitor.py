@@ -4,7 +4,7 @@ import tempfile
 import unittest
 import urllib.error
 
-import kijito_monitor as km
+import kijito_inbox_monitor as km
 
 
 class Args:

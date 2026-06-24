@@ -4,23 +4,23 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.kijito.monitor</string>
+  <string>com.kijito.inbox-monitor</string>
   <key>ProgramArguments</key>
   <array>
     <string>/opt/homebrew/bin/python3</string>
     <string>-u</string>
-    <string>/Users/jason/Code/Kijito.ai/kijito_monitor/monitor/kijito_monitor.py</string>
+    <string>/Users/jason/Code/Kijito.ai/kijito_monitor/monitor/kijito_inbox_monitor.py</string>
     <string>--state-file</string>
-    <string>/Users/jason/.cache/kijito-monitor/hive.json</string>
+    <string>/Users/jason/.cache/kijito-inbox-monitor/hive.json</string>
     <string>--events-file-template</string>
-    <string>/Users/jason/.cache/kijito-monitor/events.{persona}.ndjson</string>
+    <string>/Users/jason/.cache/kijito-inbox-monitor/events.{persona}.ndjson</string>
   </array>
   <key>WorkingDirectory</key>
   <string>/Users/jason/Code/Kijito.ai/kijito_monitor/monitor</string>
   <key>StandardOutPath</key>
-  <string>/Users/jason/.cache/kijito-monitor/monitor.out</string>
+  <string>/Users/jason/.cache/kijito-inbox-monitor/monitor.out</string>
   <key>StandardErrorPath</key>
-  <string>/Users/jason/.cache/kijito-monitor/monitor.err</string>
+  <string>/Users/jason/.cache/kijito-inbox-monitor/monitor.err</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
