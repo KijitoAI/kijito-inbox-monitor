@@ -1,4 +1,4 @@
-# KijitoInboxMonitor: Design & Implementation Spec
+# Kijito Inbox Monitor: Design & Implementation Spec
 
 **Updated:** 2026-06-20 (rev 6, v2 multi-persona + supervised producer shipped and deployed;
 see §14). **Status:** shipped and live (v2 under launchd).
@@ -309,13 +309,13 @@ done, see §9.)
 9. **State-file safety:** a state-file whose `identity` mismatches the current `(persona,url)` does not resume its
    cursor (it re-baselines with a warning); a second watcher on the same state-file exits non-zero (flock).
 10. Lives in `monitor/` as a single zero-dep stdlib file, committed and pushed (private GitHub
-    `KijitoAI/KijitoInboxMonitor`, 2026-06-20; stays private until the public-flip gate), with a README
+    `KijitoAI/kijito-inbox-monitor`, 2026-06-20; stays private until the public-flip gate), with a README
     documenting the supervision requirement plus `--state-file` (§7.3) and the CLI (§11). (v2: still one file; see §14
     for the multi-persona DONE-WHEN that supersede the single-persona framing of #2/#4 above. They hold per-persona.)
 
 ## 13. Naming: decided (2026-06-20; renamed 2026-06-24)
 
-**Name: Kijito Inbox Monitor** (package `kijito-inbox-monitor`; GitHub `KijitoAI/KijitoInboxMonitor`,
+**Name: Kijito Inbox Monitor** (package `kijito-inbox-monitor`; GitHub `KijitoAI/kijito-inbox-monitor`,
 matching the `Kijito`/`KijitoWeb` siblings). **Argus** is retained as the builder persona and internal codename, not
 the product name. The name describes the product (marketplace tagline: "the local liveness watcher for your Kijito
 inbox"), and it is collision-safe against the crowded "Argus" monitoring/observability namespace.
@@ -404,7 +404,7 @@ success.)
   automatically; exactly one producer runs; per-persona cursors resume (no replay flood).
 
 ### 14.6 Still open (not blocking; tracked elsewhere)
-- **Name decided** (Kijito Inbox Monitor, §13) and pushed private (`KijitoAI/KijitoInboxMonitor`, 2026-06-20).
+- **Name decided** (Kijito Inbox Monitor, §13) and pushed private (`KijitoAI/kijito-inbox-monitor`, 2026-06-20).
   Remaining: the public flip when ready (confirm PyPI/npm `kijito-inbox-monitor` first); and the README links to
   `../docs/DESIGN.md`, which is repo-external (this spec lives in the workspace, not the repo), so vendor this spec
   into the repo before the public flip so the link resolves on GitHub.
