@@ -1,0 +1,29 @@
+name: publish-npm
+
+# Publishes the kijito-inbox-monitor npm SIGNPOST package on a version tag, using Trusted
+# Publishing (OIDC). The npm package is not a real installer: it points users at the Python
+# package on PyPI (see bin/cli.js). No NPM_TOKEN is stored; npm exchanges a short-lived
+# workflow credential and attaches provenance automatically. Configure the trusted publisher
+# once on npmjs.com first: npmjs.com -> the package -> Settings -> Trusted Publisher ->
+# add this repo + this workflow file.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # required for Trusted Publishing
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"        # Trusted Publishing needs Node >=22.14 on the runner
+          registry-url: "https://registry.npmjs.org"
+      # Zero runtime deps, so no `npm ci`. There is no postinstall hook (npm v12 disables
+      # install lifecycle scripts by default, and that pattern is how the worm spreads).
+      - run: npm publish --access public

@@ -1,0 +1,42 @@
+[build-system]
+# setuptools (not uv_build): uv_build cannot build a single bare top-level .py
+# module yet (astral-sh/uv#16766). setuptools auto-handles a lone module via
+# py-modules, and >=77 gives PEP 639 SPDX license support.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kijito-inbox-monitor"
+version = "0.1.0"
+description = "Zero-dependency local watcher that wakes a running agent when new Kijito inbox mail arrives."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Arcada Labs", email = "jason@arcadalabs.com" }]
+keywords = ["kijito", "inbox", "monitor", "watcher", "agent", "liveness", "cli", "notifications"]
+dependencies = []
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: POSIX",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Communications",
+  "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/KijitoAI/kijito-inbox-monitor"
+Repository = "https://github.com/KijitoAI/kijito-inbox-monitor"
+"Bug Tracker" = "https://github.com/KijitoAI/kijito-inbox-monitor/issues"
+
+[project.scripts]
+kijito-inbox-monitor = "kijito_inbox_monitor:main"
+
+[tool.setuptools]
+# Single flat module at the repo root. Explicit py-modules overrides flat-layout
+# auto-discovery so the test module is not swept into the wheel.
+py-modules = ["kijito_inbox_monitor"]
