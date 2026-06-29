@@ -25,8 +25,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"        # Trusted Publishing needs Node >=22.14 on the runner
+          node-version: "22"
           registry-url: "https://registry.npmjs.org"
+      # npm OIDC Trusted Publishing needs the npm CLI >= 11.5.1; Node 22 still bundles npm 10.x,
+      # which silently falls back to token auth (and 404s without one). Upgrade npm first.
+      - run: npm install -g npm@latest
+      - run: npm --version
       # Zero runtime deps, so no `npm ci`. There is no postinstall hook (npm v12 disables
       # install lifecycle scripts by default, and that pattern is how the worm spreads).
       - run: npm publish --access public
