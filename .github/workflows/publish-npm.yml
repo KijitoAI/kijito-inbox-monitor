@@ -5,13 +5,15 @@ name: publish-npm
 # package on PyPI (see bin/cli.js). No NPM_TOKEN is stored; npm exchanges a short-lived
 # workflow credential and attaches provenance automatically.
 #
-# Two requirements for the OIDC publish to fire:
-#   1. npm CLI >= 11.5.1 (Node 22 bundles npm 10.x, so we `npm install -g npm@latest`).
-#   2. setup-node must NOT write an auth-token .npmrc. If `registry-url` is set, setup-node
-#      writes `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}`; with no token that line is
-#      an empty credential that makes npm use token auth and SKIP OIDC entirely (publish 404s,
-#      and the run log shows no OIDC/trusted-publishing attempt at all). So we omit registry-url.
-# The package's Trusted Publisher (repo + this workflow) is configured on npmjs.com.
+# Canonical form per docs.npmjs.com/trusted-publishers: Node 24 (bundles npm >= 11.5.1, which
+# trusted publishing requires) + registry-url + `npm publish` with NO NODE_AUTH_TOKEN. There
+# are zero deps and no lockfile, so we skip `npm ci`.
+#
+# Trusted Publisher config on npmjs.com (package -> Settings -> Trusted Publisher) must match
+# EXACTLY (case-sensitive): Organization/user "KijitoAI", Repository "kijito-inbox-monitor",
+# Workflow filename "publish-npm.yml" (filename only, WITH .yml, not a path), Environment blank,
+# and Allowed actions must include "npm publish". A mismatch on any field fails with E404
+# "could not be found or you do not have permission".
 on:
   push:
     tags: ["v*"]
@@ -28,12 +30,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
-          # No registry-url on purpose: it makes setup-node write an empty-token .npmrc that
-          # suppresses OIDC. npm defaults to registry.npmjs.org anyway.
-      # npm OIDC Trusted Publishing needs the npm CLI >= 11.5.1; Node 22 bundles npm 10.x.
-      - run: npm install -g npm@latest
+          node-version: "24"        # bundles npm >= 11.5.1, required for OIDC trusted publishing
+          registry-url: "https://registry.npmjs.org"
       - run: npm --version
-      # Zero runtime deps, so no `npm ci`. There is no postinstall hook (npm v12 disables
-      # install lifecycle scripts by default, and that pattern is how the worm spreads).
+      # Zero runtime deps and no lockfile, so no `npm ci`. There is no postinstall hook
+      # (npm v12 disables install lifecycle scripts by default, and that pattern is the worm).
       - run: npm publish --access public
