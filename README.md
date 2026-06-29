@@ -162,7 +162,8 @@ Two per-persona files, easy to mix up:
 | `--personas A,B` | Comma-separated persona list. |
 | `--all-personas` | Explicitly watch every persona in your account (the default when no persona is given). |
 | `--rediscover-every N` | In all-persona mode, re-scan your account and add new personas every N seconds (default 600). |
-| `--poll-seconds N` | Poll interval (default 60). |
+| `--poll-seconds N` | Interval between polls when long-poll is off/unsupported (default 60). |
+| `--wait N` | Long-poll hold (seconds) requested from `/api/notify/pending` so new mail wakes the watcher near-instantly at ~the same request rate (default 50; server clamps to its own max). `0` disables it. Falls back to interval polling against a server that doesn't support long-poll, and auto-upgrades when it does. |
 | `--alert-after N` | Consecutive failures before an `alert` (default 3, min 1). A single transient failure is normal. |
 | `--emit stdout-jsonl\|exec-per-event` | Output mode (default `stdout-jsonl`). |
 | `--exec 'CMD'` | Command per event (required when `--emit exec-per-event`). Fields → `KIJITOMON_*` env vars. |

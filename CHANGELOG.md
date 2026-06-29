@@ -3,6 +3,27 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [0.3.0] - 2026-06-29
+
+Near-instant wake via long-polling, with full self-heal.
+
+### Added
+- **Long-poll wake** (`--wait`, default 50s): the watcher holds a `/api/notify/pending?wait=&cursor=`
+  request that the server releases the instant new mail arrives, cutting wake latency from up to
+  `--poll-seconds` to near-instant **without raising the request rate** (one held connection per
+  account). Forward/backward compatible: against a server that doesn't support long-poll it
+  transparently falls back to interval polling and auto-upgrades once the server returns a cursor -
+  no redeploy. `--wait 0` disables it.
+- **Instant new-persona pickup**: a newly created persona that receives mail is added as a watch
+  target within one tick (from the notify counts already fetched), instead of waiting for the
+  periodic `/api/personas` rescan.
+
+### Reliability
+- **Self-heal on connection loss** (wifi/NAT/Cloudflare/server-restart): a dropped or half-open hold
+  is detected by a client timeout above the server hold, then reconnected with exponential backoff,
+  resuming from the last opaque cursor so no wake is missed across the gap (lossless). The periodic
+  full per-persona inbox poll remains the by-message-id correctness backstop.
+
 ## [0.2.0] - 2026-06-29
 
 Remote-only release. The monitor now watches your Kijito inbox at `api.kijito.ai` exclusively.
@@ -41,5 +62,6 @@ First public release.
 - An npm package that acts as a signpost to the PyPI tool (it delegates to `uvx`/`pipx`, or
   prints install guidance), so the name is reserved on npm without a fragile Node installer.
 
+[0.3.0]: https://github.com/KijitoAI/kijito-inbox-monitor/releases/tag/v0.3.0
 [0.2.0]: https://github.com/KijitoAI/kijito-inbox-monitor/releases/tag/v0.2.0
 [0.1.0]: https://github.com/KijitoAI/kijito-inbox-monitor/releases/tag/v0.1.0

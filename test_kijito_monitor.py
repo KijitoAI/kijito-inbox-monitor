@@ -277,5 +277,101 @@ class AuthAndUrlTest(unittest.TestCase):
             self.assertNotIn(bad, km.KIJITO_BASE + km.INBOX_URL + km.PERSONAS_URL + km.NOTIFY_PENDING_URL)
 
 
+class LongPollTest(unittest.TestCase):
+    def test_parses_counts_and_cursor_and_request_shape(self):
+        op = FakeOpener(FakeResponse(200, {"result": [{"persona": "argus", "unread": 2}], "cursor": "c1"}))
+        available, counts, cursor = km.fetch_unread_counts_longpoll(op, {}, 50, None)
+        self.assertTrue(available)
+        self.assertEqual(counts, {"argus": 2})
+        self.assertEqual(cursor, "c1")
+        url, timeout = op.calls[0]
+        self.assertIn("wait=50", url)
+        self.assertNotIn("cursor=", url)            # no cursor echoed on the first call
+        self.assertEqual(timeout, 50 + km.LONGPOLL_SLACK)  # client timeout sits above the server hold
+
+    def test_echoes_cursor_on_subsequent_call(self):
+        op = FakeOpener(FakeResponse(200, {"result": [], "cursor": "c2"}))
+        km.fetch_unread_counts_longpoll(op, {}, 30, "prev")
+        url, _ = op.calls[0]
+        self.assertIn("cursor=prev", url)
+
+    def test_missing_cursor_means_server_not_longpolling(self):
+        # forward/back-compat: a server that ignores ?wait returns no cursor → caller interval-polls
+        op = FakeOpener(FakeResponse(200, {"result": [{"persona": "argus", "unread": 1}]}))
+        available, counts, cursor = km.fetch_unread_counts_longpoll(op, {}, 50, None)
+        self.assertTrue(available)
+        self.assertEqual(counts, {"argus": 1})
+        self.assertIsNone(cursor)
+
+    def test_connection_error_keeps_old_cursor_for_lossless_resume(self):
+        op = FakeOpener(exc=urllib.error.URLError("dropped"))
+        available, counts, cursor = km.fetch_unread_counts_longpoll(op, {}, 50, "keepme")
+        self.assertFalse(available)
+        self.assertEqual(counts, {})
+        self.assertEqual(cursor, "keepme")
+
+    def test_non_2xx_keeps_old_cursor(self):
+        op = FakeOpener(FakeResponse(503, {"result": []}))
+        available, _, cursor = km.fetch_unread_counts_longpoll(op, {}, 50, "x")
+        self.assertFalse(available)
+        self.assertEqual(cursor, "x")
+
+    def test_parse_unread_rows_rejects_bad_shape(self):
+        self.assertIsNone(km._parse_unread_rows({"result": {}}))
+        self.assertEqual(km._parse_unread_rows({"result": [{"persona": "a", "unread": 4}]}), {"a": 4})
+        self.assertEqual(km._parse_unread_rows({"result": [{"persona": "a", "unread": "bad"}]}), {"a": 0})
+
+
+class DiscoverFromCountsTest(unittest.TestCase):
+    class FakeTarget:
+        def __init__(self, persona):
+            self.persona = persona
+
+        def lifecycle(self, *a, **k):
+            pass
+
+    def setUp(self):
+        self._orig = km.build_persona_target
+
+    def tearDown(self):
+        km.build_persona_target = self._orig
+
+    def _patch_builder(self, made):
+        km.build_persona_target = (
+            lambda persona, obo, headers, args, emitter: made.append(persona) or self.FakeTarget(persona))
+
+    def test_adds_unwatched_mail_bearing_personas_in_all_mode(self):
+        made = []
+        self._patch_builder(made)
+        targets = [self.FakeTarget("argus")]
+        added = km.discover_from_counts(Args(), {"argus": 0, "river": 3, "ladybug": 1}, targets, {}, {}, None)
+        self.assertEqual(set(added), {"river", "ladybug"})
+        self.assertEqual({t.persona for t in targets}, {"argus", "river", "ladybug"})
+
+    def test_noop_for_explicit_persona_subset(self):
+        made = []
+        self._patch_builder(made)
+        targets = [self.FakeTarget("argus")]
+        added = km.discover_from_counts(Args(persona=["argus"]), {"river": 3}, targets, {}, {}, None)
+        self.assertEqual(added, [])
+        self.assertEqual(made, [])
+        self.assertEqual({t.persona for t in targets}, {"argus"})
+
+
+class WaitValidationTest(unittest.TestCase):
+    def _args(self, argv):
+        return km.build_parser().parse_args(argv)
+
+    def test_negative_wait_rejected(self):
+        with self.assertRaises(km.FatalConfig):
+            km.validate_args(self._args(["--persona", "argus", "--wait", "-1"]))
+
+    def test_wait_zero_allowed(self):
+        km.validate_args(self._args(["--persona", "argus", "--wait", "0"]))  # disables long-poll, must not raise
+
+    def test_default_wait_is_longpoll_on(self):
+        self.assertEqual(self._args(["--persona", "argus"]).wait, 50)
+
+
 if __name__ == "__main__":
     unittest.main()
