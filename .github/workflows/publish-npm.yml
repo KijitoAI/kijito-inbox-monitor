@@ -5,10 +5,13 @@ name: publish-npm
 # package on PyPI (see bin/cli.js). No NPM_TOKEN is stored; npm exchanges a short-lived
 # workflow credential and attaches provenance automatically.
 #
-# REQUIRED ONE-TIME SETUP on npmjs.com (without it, publish 404s with "you do not have
-# permission"): npmjs.com -> kijito-inbox-monitor -> Settings -> Trusted Publisher ->
-# add GitHub repo "KijitoAI/kijito-inbox-monitor" + workflow ".github/workflows/publish-npm.yml".
-# Until that exact (repo, workflow) pair is registered, OIDC cannot mint a publish credential.
+# Two requirements for the OIDC publish to fire:
+#   1. npm CLI >= 11.5.1 (Node 22 bundles npm 10.x, so we `npm install -g npm@latest`).
+#   2. setup-node must NOT write an auth-token .npmrc. If `registry-url` is set, setup-node
+#      writes `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}`; with no token that line is
+#      an empty credential that makes npm use token auth and SKIP OIDC entirely (publish 404s,
+#      and the run log shows no OIDC/trusted-publishing attempt at all). So we omit registry-url.
+# The package's Trusted Publisher (repo + this workflow) is configured on npmjs.com.
 on:
   push:
     tags: ["v*"]
@@ -26,9 +29,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-          registry-url: "https://registry.npmjs.org"
-      # npm OIDC Trusted Publishing needs the npm CLI >= 11.5.1; Node 22 still bundles npm 10.x,
-      # which silently falls back to token auth (and 404s without one). Upgrade npm first.
+          # No registry-url on purpose: it makes setup-node write an empty-token .npmrc that
+          # suppresses OIDC. npm defaults to registry.npmjs.org anyway.
+      # npm OIDC Trusted Publishing needs the npm CLI >= 11.5.1; Node 22 bundles npm 10.x.
       - run: npm install -g npm@latest
       - run: npm --version
       # Zero runtime deps, so no `npm ci`. There is no postinstall hook (npm v12 disables
