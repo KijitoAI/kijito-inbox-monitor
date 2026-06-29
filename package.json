@@ -1,7 +1,7 @@
 {
   "name": "kijito-inbox-monitor",
-  "version": "0.1.0",
-  "description": "Pointer to the Python package kijito-inbox-monitor. A zero-dependency local watcher that wakes a running agent when new Kijito inbox mail arrives. Install the real tool with pipx/uv/pip.",
+  "version": "0.2.0",
+  "description": "Pointer to the Python package kijito-inbox-monitor. A zero-dependency watcher that wakes a running agent when new Kijito inbox mail arrives. Install the real tool with pipx/uv/pip.",
   "license": "Apache-2.0",
   "type": "commonjs",
   "bin": {

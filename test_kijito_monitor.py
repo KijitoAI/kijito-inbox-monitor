@@ -8,11 +8,10 @@ import kijito_inbox_monitor as km
 
 
 class Args:
-    def __init__(self, persona=None, personas=None, all_personas=False, url=None):
+    def __init__(self, persona=None, personas=None, all_personas=False):
         self.persona = persona
         self.personas = personas
         self.all_personas = all_personas
-        self.url = url
 
 
 class FakeResponse:
@@ -84,7 +83,7 @@ class MultiPersonaHelpersTest(unittest.TestCase):
                 {"persona": "sterling", "unread": "bad"},
             ]
         }))
-        available, counts = km.fetch_unread_counts(opener, "http://127.0.0.1:7474/api/notify/pending", {})
+        available, counts = km.fetch_unread_counts(opener, km.NOTIFY_PENDING_URL, {})
         self.assertTrue(available)
         self.assertEqual(counts, {"argus": 9, "sterling": 0})
         self.assertEqual(counts.get("codex", 0), 0)
@@ -92,7 +91,7 @@ class MultiPersonaHelpersTest(unittest.TestCase):
     def test_fetch_unread_counts_unavailable_on_http_or_bad_shape(self):
         available, counts = km.fetch_unread_counts(
             FakeOpener(FakeResponse(500, {"result": []})),
-            "http://127.0.0.1:7474/api/notify/pending",
+            km.NOTIFY_PENDING_URL,
             {},
         )
         self.assertFalse(available)
@@ -100,7 +99,7 @@ class MultiPersonaHelpersTest(unittest.TestCase):
 
         available, counts = km.fetch_unread_counts(
             FakeOpener(FakeResponse(200, {"result": {}})),
-            "http://127.0.0.1:7474/api/notify/pending",
+            km.NOTIFY_PENDING_URL,
             {},
         )
         self.assertFalse(available)
@@ -109,7 +108,7 @@ class MultiPersonaHelpersTest(unittest.TestCase):
     def test_fetch_unread_counts_unavailable_on_network_exception(self):
         available, counts = km.fetch_unread_counts(
             FakeOpener(exc=urllib.error.URLError("down")),
-            "http://127.0.0.1:7474/api/notify/pending",
+            km.NOTIFY_PENDING_URL,
             {},
         )
         self.assertFalse(available)
@@ -210,7 +209,7 @@ class ValidationGuardTest(unittest.TestCase):
 
     def test_poll_seconds_must_be_positive(self):
         with self.assertRaises(km.FatalConfig):
-            km.validate_args(self._args(["--url", "http://x", "--poll-seconds", "0"]))
+            km.validate_args(self._args(["--persona", "argus", "--poll-seconds", "0"]))
 
     def test_seed_at_rejected_in_multipersona(self):
         with self.assertRaises(km.FatalConfig):
@@ -221,11 +220,7 @@ class ValidationGuardTest(unittest.TestCase):
 
     def test_keep_logs_min_one(self):
         with self.assertRaises(km.FatalConfig):
-            km.validate_args(self._args(["--url", "http://x", "--keep-logs", "0"]))
-
-    def test_url_conflicts_with_persona(self):
-        with self.assertRaises(km.FatalConfig):
-            km.validate_args(self._args(["--url", "http://x", "--persona", "argus"]))
+            km.validate_args(self._args(["--persona", "argus", "--keep-logs", "0"]))
 
     def test_events_file_and_template_mutually_exclusive(self):
         with self.assertRaises(km.FatalConfig):
@@ -234,6 +229,52 @@ class ValidationGuardTest(unittest.TestCase):
     def test_events_file_template_requires_placeholder(self):
         with self.assertRaises(km.FatalConfig):
             km.validate_args(self._args(["--events-file-template", "/no/placeholder.ndjson"]))
+
+
+class AuthAndUrlTest(unittest.TestCase):
+    class _HArgs:
+        def __init__(self, token_file=None, auth_header=None):
+            self.token_file = token_file
+            self.auth_header = auth_header
+
+    def setUp(self):
+        self._saved = os.environ.pop("KIJITOMON_TOKEN", None)
+
+    def tearDown(self):
+        if self._saved is not None:
+            os.environ["KIJITOMON_TOKEN"] = self._saved
+
+    def test_missing_token_is_fatal(self):
+        with self.assertRaises(km.FatalConfig):
+            km.build_headers(self._HArgs())
+
+    def test_env_token_yields_bearer_and_user_agent(self):
+        os.environ["KIJITOMON_TOKEN"] = "secret123"
+        h = km.build_headers(self._HArgs())
+        self.assertEqual(h["Authorization"], "Bearer secret123")
+        self.assertEqual(h["User-Agent"], km.USER_AGENT)
+        self.assertIn("kijito-inbox-monitor/", km.USER_AGENT)
+
+    def test_token_file_wins_over_env_and_custom_header(self):
+        os.environ["KIJITOMON_TOKEN"] = "envtok"
+        fd, path = tempfile.mkstemp()
+        self.addCleanup(os.unlink, path)
+        with os.fdopen(fd, "w") as f:
+            f.write("filetok\n")
+        h = km.build_headers(self._HArgs(token_file=path, auth_header="X-Kijito-Token"))
+        self.assertEqual(h["X-Kijito-Token"], "filetok")
+        self.assertNotIn("Authorization", h)
+        self.assertEqual(h["User-Agent"], km.USER_AGENT)
+
+    def test_persona_url_targets_remote_inbox_as_peek(self):
+        url = km.persona_url("argus")
+        self.assertTrue(url.startswith("https://api.kijito.ai/api/inbox?"))
+        self.assertIn("persona=argus", url)
+        self.assertIn("mark_read=false", url)
+
+    def test_no_localhost_anywhere_in_module(self):
+        for bad in ("127.0.0.1", "localhost", ":7474"):
+            self.assertNotIn(bad, km.KIJITO_BASE + km.INBOX_URL + km.PERSONAS_URL + km.NOTIFY_PENDING_URL)
 
 
 if __name__ == "__main__":

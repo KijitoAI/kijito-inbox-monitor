@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Kijito Inbox Monitor - client-side liveness watcher for the Kijito inbox.
+"""Kijito Inbox Monitor - client-side liveness watcher for your Kijito inbox.
 
-A standalone, zero-dependency (Python stdlib only) process that polls the Kijito inbox and emits one event per new
-message into whatever harness is running - NDJSON on stdout and/or by exec-ing a command per event. It keeps a
-*running* agent's inbox live by waking it BETWEEN tool calls (the LLM-UX inbox-liveness fix). It is NOT a server.
+A standalone, zero-dependency (Python stdlib only) process that polls your Kijito inbox at api.kijito.ai and emits
+one event per new message into whatever harness is running - NDJSON on stdout and/or by exec-ing a command per
+event. It keeps a *running* agent's inbox live by waking it BETWEEN tool calls (the LLM-UX inbox-liveness fix). It
+is NOT a server.
 
-This is the v1 reference implementation of docs/DESIGN.md (rev 5). POSIX target (Linux/macOS); on Windows it runs
-interval-only (no SIGUSR1 seam, no flock). Build/behaviour invariants - see DESIGN.md sections cited inline.
+Authentication is required: set $KIJITOMON_TOKEN (or --token-file) to your Kijito API token. POSIX target
+(Linux/macOS); on Windows it runs interval-only (no SIGUSR1 seam, no flock). See docs/DESIGN.md for the design.
 """
 import argparse
 import datetime
 import errno
 import http.client
-import ipaddress
 import json
 import os
 import select
@@ -30,8 +30,14 @@ try:
 except ImportError:  # pragma: no cover - Windows
     fcntl = None
 
+__version__ = "0.2.0"
 SOURCE = "kijito-inbox"
-DEFAULT_KIJITO_URL = "http://127.0.0.1:7474/api/inbox"
+# A named User-Agent is REQUIRED: api.kijito.ai is fronted by a WAF that 403s the default Python-urllib UA.
+USER_AGENT = "kijito-inbox-monitor/%s" % __version__
+KIJITO_BASE = "https://api.kijito.ai"
+INBOX_URL = KIJITO_BASE + "/api/inbox"
+PERSONAS_URL = KIJITO_BASE + "/api/personas"
+NOTIFY_PENDING_URL = KIJITO_BASE + "/api/notify/pending"
 EXEC_TIMEOUT = 10
 HTTP_TIMEOUT = 5  # §8 per-request timeout default
 IS_POSIX = os.name == "posix"
@@ -62,36 +68,17 @@ def canonical_identity(url):
 
 
 # --------------------------------------------------------------------------------------------------------------------
-# §8 SSRF guard - applies to a user-supplied --url only; the Kijito loopback reference is exempt.
+# Connection hardening - resolve-once + pin the IP (no TOCTOU re-resolve), and never follow redirects.
+# The destination is the fixed Kijito API host, so there is no user-supplied URL to guard; pinning + no-redirect
+# remain as defense-in-depth against DNS games and redirect surprises.
 # --------------------------------------------------------------------------------------------------------------------
-def _ip_is_internal(ip):
-    a = ipaddress.ip_address(ip)
-    return (a.is_private or a.is_loopback or a.is_link_local or a.is_reserved
-            or a.is_multicast or a.is_unspecified)
-
-
-def resolve_and_pin(host, port, allow_loopback, allow_private):
-    """Resolve ALL IPs for host; reject if ANY is internal (unless explicitly allowed). Return the pinned IP.
-
-    Rejecting if ANY resolved address is internal kills decimal/hex literals and DNS-rebind. Returns the first IP
-    to pin the connection to (no re-resolve at connect time = no TOCTOU)."""
+def resolve_and_pin(host, port):
+    """Resolve host and return the first IP to pin the connection to (no re-resolve at connect time = no TOCTOU)."""
     try:
         infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
     except socket.gaierror as e:
         raise FatalConfig("cannot resolve host %r: %s" % (host, e))
-    ips = []
-    for fam, _, _, _, sockaddr in infos:
-        ips.append(sockaddr[0])
-    for ip in ips:
-        a = ipaddress.ip_address(ip)
-        if _ip_is_internal(ip):
-            if a.is_loopback and allow_loopback:
-                continue
-            if (a.is_private or a.is_link_local) and allow_private:
-                continue
-            raise FatalConfig("SSRF guard: host %r resolves to internal address %s (use --allow-loopback/"
-                              "--allow-private to override)" % (host, ip))
-    return ips[0]
+    return infos[0][4][0]
 
 
 class _PinnedHTTPConnection(http.client.HTTPConnection):
@@ -118,7 +105,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Redirects are never followed (independent of the allow-flags) - §8."""
+    """Redirects are never followed - a redirect is treated as an unhealthy poll."""
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
 
@@ -178,8 +165,8 @@ def fetch(opener, url, headers):
 
 
 def fetch_personas(opener, headers):
-    """Fetch the local account persona directory for default/explicit all-persona mode."""
-    req = urllib.request.Request("http://127.0.0.1:7474/api/personas", headers=headers, method="GET")
+    """Fetch the account persona directory for default/explicit all-persona mode."""
+    req = urllib.request.Request(PERSONAS_URL, headers=headers, method="GET")
     try:
         with opener.open(req, timeout=HTTP_TIMEOUT) as resp:
             if not (200 <= resp.status < 300):
@@ -202,7 +189,7 @@ def fetch_personas(opener, headers):
 
 
 def fetch_unread_counts(opener, count_url, headers):
-    """§9 fast-path pre-check: GET /api/notify/pending once and fan out locally.
+    """§9 fast-path pre-check: GET /api/notify/pending once and fan the counts out in-process.
 
     Returns (available, {persona: unread_count}). available=False if the endpoint is absent / non-2xx / bad shape →
     callers fall back to the full inbox-list poll. Response: {"result":[{persona,unread,unread_urgent}]};
@@ -520,6 +507,11 @@ def time_sleep(s):
 # Core watcher
 # --------------------------------------------------------------------------------------------------------------------
 def build_headers(args):
+    """Resolve the required Kijito API token. --token-file wins over $KIJITOMON_TOKEN; missing token is fatal.
+
+    Every request carries a named User-Agent - the Kijito API WAF rejects the default Python-urllib UA with 403.
+    """
+    headers = {"User-Agent": USER_AGENT}
     token = None
     if args.token_file:  # --token-file wins over env
         try:
@@ -530,38 +522,24 @@ def build_headers(args):
     elif os.environ.get("KIJITOMON_TOKEN"):
         token = os.environ["KIJITOMON_TOKEN"].strip()
     if not token:
-        return {}
+        raise FatalConfig("no Kijito API token - set $KIJITOMON_TOKEN or pass --token-file (get a token from "
+                          "your Kijito account)")
     if args.auth_header:
-        return {args.auth_header: token}
-    return {"Authorization": "Bearer %s" % token}
-
-
-def effective_url(args):
-    """Return (url, is_reference). The reference is the Kijito loopback inbox for --persona."""
-    if args.url:
-        # ensure mark_read=false is present (peek) on a user --url too
-        return _ensure_peek(args.url), False
-    raise FatalConfig("internal error: effective_url() needs --url; use persona_url() for Kijito personas")
+        headers[args.auth_header] = token
+    else:
+        headers["Authorization"] = "Bearer %s" % token
+    return headers
 
 
 def persona_url(persona):
-    return "%s?persona=%s&mark_read=false" % (DEFAULT_KIJITO_URL, urllib.parse.quote(persona)), True
+    return "%s?persona=%s&mark_read=false" % (INBOX_URL, urllib.parse.quote(persona))
 
 
-def _ensure_peek(url):
-    p = urllib.parse.urlsplit(url)
-    q = dict(urllib.parse.parse_qsl(p.query, keep_blank_values=True))
-    q["mark_read"] = "false"
-    return urllib.parse.urlunsplit((p.scheme, p.netloc, p.path, urllib.parse.urlencode(q), p.fragment))
-
-
-def make_opener_for(url, is_reference, args):
+def make_opener_for(url):
     p = urllib.parse.urlsplit(url)
     host = p.hostname or ""
     port = p.port or (443 if p.scheme == "https" else 80)
-    # reference loopback is exempt → allow loopback for it
-    allow_loopback = args.allow_loopback or is_reference
-    pinned = resolve_and_pin(host, port, allow_loopback, args.allow_private)
+    pinned = resolve_and_pin(host, port)
     return build_opener(pinned)
 
 
@@ -597,7 +575,7 @@ def requested_personas(args, opener, headers):
 
 
 def watches_all_personas(args):
-    return not args.url and (args.all_personas or not (args.persona or args.personas))
+    return args.all_personas or not (args.persona or args.personas)
 
 
 def new_personas(existing, discovered):
@@ -606,11 +584,9 @@ def new_personas(existing, discovered):
 
 
 class WatchTarget:
-    def __init__(self, persona, url, is_reference, opener, headers, args, emitter):
+    def __init__(self, persona, url, opener, headers, args, emitter):
         self.persona = persona
         self.url = url
-        self.is_reference = is_reference
-        self.is_user_url = not is_reference
         self.opener = opener
         self.headers = headers
         self.args = args
@@ -627,8 +603,8 @@ class WatchTarget:
         self.first_poll = True
         self.last_heartbeat = _monotonic()
 
+        self.count_url = NOTIFY_PENDING_URL
         cp = urllib.parse.urlsplit(url)
-        self.count_url = urllib.parse.urlunsplit((cp.scheme, cp.netloc, "/api/notify/pending", "", ""))
         self.unread_persona = dict(urllib.parse.parse_qsl(cp.query)).get("persona") or persona
 
         state_path = _state_path_for_persona(args.state_file, persona)
@@ -693,10 +669,10 @@ class WatchTarget:
             self.skips = 0
             poll = fetch(self.opener, self.url, self.headers)
 
-            if poll.redirected and self.is_user_url and self.first_poll:
-                raise FatalConfig("SSRF guard: --url returned a redirect (refused)")
             if poll.status == 404 and (self.first_poll or args.self_test):
                 raise FatalConfig("inbox endpoint 404 (hive disabled?) - fatal at startup")
+            if poll.status == 401 and (self.first_poll or args.self_test):
+                raise FatalConfig("inbox endpoint 401 (bad or missing token) - fatal at startup")
 
             if poll.ok:
                 recovered = False
@@ -767,13 +743,13 @@ class WatchTarget:
 
 
 def build_persona_target(persona, opener_by_origin, headers, args, emitter):
-    url, is_reference = persona_url(persona)
+    url = persona_url(persona)
     origin = urllib.parse.urlsplit(url).netloc
     opener = opener_by_origin.get(origin)
     if opener is None:
-        opener = make_opener_for(url, is_reference, args)
+        opener = make_opener_for(url)
         opener_by_origin[origin] = opener
-    return WatchTarget(persona, url, is_reference, opener, headers, args, emitter)
+    return WatchTarget(persona, url, opener, headers, args, emitter)
 
 
 def discover_persona_targets(args, headers, emitter, targets, opener_by_origin, directory_opener):
@@ -804,20 +780,13 @@ def run(args):
     emitter = Emitter(args.emit, args.exec, args.content_chars, args.no_content, sink=sink,
                       suppress_authors=args.suppress_author, sink_template=sink_template,
                       max_bytes=args.max_bytes, keep=args.keep_logs)
-    directory_opener = None
     opener_by_origin = {}
 
-    if args.url:
-        url, is_reference = effective_url(args)
-        opener = make_opener_for(url, is_reference, args)
-        targets = [WatchTarget(None, url, is_reference, opener, headers, args, emitter)]
-    else:
-        directory_url = "http://127.0.0.1:7474/api/personas"
-        directory_opener = make_opener_for(directory_url, True, args)
-        personas = requested_personas(args, directory_opener, headers)
-        if not personas:
-            raise FatalConfig("at least one persona is required")
-        targets = [build_persona_target(p, opener_by_origin, headers, args, emitter) for p in personas]
+    directory_opener = make_opener_for(PERSONAS_URL)
+    personas = requested_personas(args, directory_opener, headers)
+    if not personas:
+        raise FatalConfig("at least one persona is required")
+    targets = [build_persona_target(p, opener_by_origin, headers, args, emitter) for p in personas]
 
     # ---- self-test (§7.2): run once, exit -------------------------------------------------------------------------
     if args.self_test:
@@ -866,13 +835,10 @@ def build_parser():
     p.add_argument("--personas", action="append",
                    help="Comma-separated personas to watch, e.g. codex,river,ladybug.")
     p.add_argument("--all-personas", action="store_true",
-                   help="Watch every persona returned by /api/personas on the local Kijito daemon (default).")
+                   help="Watch every persona in your Kijito account (default).")
     p.add_argument("--rediscover-every", type=int, default=600,
-                   help="In all-persona mode, re-scan /api/personas every N seconds and add newly-created personas "
+                   help="In all-persona mode, re-scan your account every N seconds and add newly-created personas "
                         "(default 600, min 1). Explicit persona subsets are not expanded.")
-    p.add_argument("--url", help="Destination override (still Kijito-shaped); SSRF-guarded.")
-    p.add_argument("--allow-loopback", action="store_true", help="Permit a loopback --url destination.")
-    p.add_argument("--allow-private", action="store_true", help="Permit a private/link-local --url destination.")
     p.add_argument("--poll-seconds", type=int, default=60)
     p.add_argument("--alert-after", type=int, default=3, help="Consecutive failures before an alert (min 1).")
     p.add_argument("--emit", choices=("stdout-jsonl", "exec-per-event"), default="stdout-jsonl")
@@ -923,8 +889,6 @@ def validate_args(args):
         raise FatalConfig("--exec is required when --emit exec-per-event")
     if args.emit != "exec-per-event" and args.exec:
         sys.stderr.write("kijito-inbox-monitor: WARNING --exec ignored (emit mode is %s)\n" % args.emit)
-    if args.url and (args.persona or args.personas or args.all_personas):
-        raise FatalConfig("--url cannot be combined with --persona/--personas/--all-personas")
     if args.poll_seconds < 1:
         raise FatalConfig("--poll-seconds must be >= 1")  # 0 → a select(timeout=0) busy-loop hammering the source
     if args.heartbeat is not None and args.heartbeat < 1:
@@ -942,9 +906,9 @@ def validate_args(args):
     if (args.events_file or args.events_file_template) and args.emit != "stdout-jsonl":
         sys.stderr.write("kijito-inbox-monitor: WARNING --events-file/-template ignored (emit mode is %s)\n" % args.emit)
     if args.seed_at is not None:
-        single = bool(args.url) or (len(args.persona or []) == 1 and not args.personas and not args.all_personas)
+        single = len(args.persona or []) == 1 and not args.personas and not args.all_personas
         if not single:
-            raise FatalConfig("--seed-at requires a single target (one --persona or --url), "
+            raise FatalConfig("--seed-at requires a single --persona target, "
                               "not multi-persona/all-personas - each persona has its own cursor")
 
 
