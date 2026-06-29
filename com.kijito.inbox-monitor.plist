@@ -10,6 +10,8 @@
     <string>/opt/homebrew/bin/python3</string>
     <string>-u</string>
     <string>/Users/jason/Code/Kijito.ai/kijito_monitor/monitor/kijito_inbox_monitor.py</string>
+    <string>--token-file</string>
+    <string>/Users/jason/.config/kijito-inbox-monitor/token</string>
     <string>--state-file</string>
     <string>/Users/jason/.cache/kijito-inbox-monitor/hive.json</string>
     <string>--events-file-template</string>

@@ -1,16 +1,17 @@
 # Kijito Inbox Monitor: Design & Implementation Spec
 
-**Updated:** 2026-06-20 (rev 6, v2 multi-persona + supervised producer shipped and deployed;
-see §14). **Status:** shipped and live (v2 under launchd).
+**Updated:** 2026-06-29 (rev 7, remote-only: watches your Kijito inbox at `api.kijito.ai`, token required;
+the `--url`/SSRF-by-class machinery is gone — see §5, §8, §11). Builds on rev 6 (v2 multi-persona +
+supervised producer). **Status:** shipped and live (v2 under launchd).
 
-**Goal:** give Kijito a solid, usable local liveness watcher for its built-in inbox. The concrete
+**Goal:** give Kijito a solid, usable client-side liveness watcher for its built-in inbox. The concrete
 Kijito-inbox monitor is the win. Agnosticism is a means (generalize only where it makes the tool more
 useful), not the end. Learn from prior art, and don't gold-plate.
 
 §1 through §13 are the v1 single-persona core, still accurate and load-bearing (one process watches one
-inbox; the cursor/dedup/FSM/self-test/state/SSRF/seam contracts apply per-persona unchanged). §14 records
-the v2 deltas: the deployed build watches the whole local hive from one supervised process and writes one
-owned, self-rotating event log per persona. Read §14 alongside §1, §11, and §12 for current reality.
+inbox; the cursor/dedup/FSM/self-test/state/seam contracts apply per-persona unchanged). §14 records
+the v2 deltas: the deployed build watches your whole Kijito account from one supervised process and writes
+one owned, self-rotating event log per persona. Read §14 alongside §1, §11, and §12 for current reality.
 
 ---
 
@@ -41,7 +42,7 @@ This is the client half of Kijito's server-side inbox-liveness system. Two compl
 
 - One shared signal source (the `control_plane` urgent counter) so liveness never diverges; the watcher
   consumes a server count over HTTP (§9) and never reimplements liveness.
-- v1 is a pure local poller plus the opaque-wake seam (§10), so a hosted bridge can later push wake-then-pull.
+- v1 is a pure poller of the Kijito API plus the opaque-wake seam (§10), so a hosted bridge can later push wake-then-pull.
 - Marketplace: the goal is to surface it as "the local liveness watcher for your Kijito inbox."
 
 ## 4. Architecture
@@ -54,7 +55,7 @@ v1 ships one adapter (`http-poll`, the Kijito reference). Future adapters are ex
 - **Endpoint:** `GET /api/inbox?persona=<P>&mark_read=false`
 - **Response:** `{"result": [ {"id":<int>,"from":"<persona>","content":"<plaintext>","created":"<iso-str>","read":<bool>}, ... ]}`
   (keys verbatim, in that order, per messaging.py:85-89). v1 hard-bakes this Kijito response shape (there is no
-  generic parse config; that's deferred, see §scope). `--url` overrides only the destination, not the parse contract.
+  generic parse config; that's deferred, see §scope). The destination is the fixed Kijito API; only the persona varies.
 - **`mark_read` defaults to `true`** (web_api.py:504; SET m.read=true at messaging.py:90-96). The URL must carry
   `&mark_read=false`. A watcher must peek, never consume: every fetch site (the poll loop and `--self-test`) uses
   the `mark_read=false` URL. (Triple-confirmed; the original seed was fixed for this.)
@@ -62,10 +63,11 @@ v1 ships one adapter (`http-poll`, the Kijito reference). Future adapters are ex
   max-id, never on read/unread state.
 - **No pagination:** the response is a full list (seen at 148K/539 msgs). Emit only the diff (id > cursor); never
   dump the body.
-- **Auth:** the local daemon needs no token (loopback trust; empirically the watcher polls tokenless). If
-  `$KIJITOMON_TOKEN`/`--token-file` is set, inject it as `Authorization: Bearer <token>`, or with `--auth-header NAME`
-  as `NAME: <token>` verbatim. The header name (`--auth-header`) and the token-value source (`--token-file` wins over
-  env) are independent axes. An unreadable `--token-file` is a fatal config error.
+- **Auth:** a Kijito API token is **required** (the API is authenticated). Supply it via `$KIJITOMON_TOKEN` or
+  `--token-file` (file wins over env); it is injected as `Authorization: Bearer <token>`, or with `--auth-header NAME`
+  as `NAME: <token>` verbatim. The header name (`--auth-header`) and the token-value source are independent axes. A
+  missing token is a fatal config error, and an unreadable `--token-file` is a fatal config error. Every request also
+  carries a named `User-Agent` (the API WAF rejects the default Python-urllib UA with a 403).
 - **A poll is healthy iff** HTTP 2xx, and the body parses, and the envelope is shape-valid (`result` is a list; every
   row is an object with an integer `id`). Anything else (non-2xx, connection-refused, DNS failure, connection-reset,
   timeout, parse-fail, shape-violation) is a liveness failure (UNKNOWN), never "no mail." (A 200 with a
@@ -75,8 +77,8 @@ v1 ships one adapter (`http-poll`, the Kijito reference). Future adapters are ex
   non-zero). Appearing mid-run, it is a per-poll liveness failure (the daemon may have restarted or the hive toggled
   transiently); it feeds the §7.1 FSM and does not kill the process (a transient server blip must not destroy the
   dead-man's-switch).
-- **Config:** `url` (destination override), `poll_seconds` (default 60). The reference config hard-bakes the URL
-  including `mark_read=false`.
+- **Config:** `poll_seconds` (default 60). The destination is the hard-baked Kijito API inbox URL including
+  `mark_read=false`; only the persona varies.
 
 ## 6. Emit modes (portability)
 
@@ -165,8 +167,8 @@ States are **UP** (default) and **DOWN**; `consecutive_failures` counts from 0. 
   bouncing in ~1-2s). SIGUSR1-triggered polls participate identically.
 
 ### 7.2 `--self-test`: runs once and exits (no poll loop)
-Requires `--persona` or `--url`. (a) One real peek-mode (`mark_read=false`) fetch, checked healthy per §5 (so
-hive-off/404/unreachable correctly fails self-test); (b) a synthetic `new` through the real emit path (stdout: line
+Runs for the selected persona(s) (default: every persona in the account). (a) One real peek-mode (`mark_read=false`)
+fetch, checked healthy per §5 (so hive-off/404/unreachable correctly fails self-test); (b) a synthetic `new` through the real emit path (stdout: line
 written and flushed is ok; exec: spawn `--exec` with a fake `new`, child exit 0 within timeout is ok). Exit 0 iff
 both healthy and emit-ok; else non-zero. The fetch result is printed regardless. The probe is peek-mode, so it is
 read-state-neutral (DONE-WHEN #5 holds after self-test).
@@ -175,13 +177,10 @@ read-state-neutral (DONE-WHEN #5 holds after self-test).
 - **Content (JSON):** `{"identity":<canonical-id>, "cursor":<int|null>, "state":"UP|DOWN",
   "consecutive_failures":<int>}`.
 - **Canonical identity (`<canonical-id>`)** is computed before DNS resolution so trivial URL variations don't flip
-  it. From the effective inbox URL (the baked `--persona` reference form and an equivalent `--url` form must
-  canonicalize equal), it is the tuple `(scheme.lower(), host.lower(), effective_port, path, sorted(query_params except
-  the constant mark_read))`. Normalize by stripping a trailing `/` on path, filling the scheme's default port, sorting
-  query params, and lowercasing host. (So `?persona=river&mark_read=false` ≡ `?mark_read=false&persona=river`, and
-  `:7474` ≡ default-for-scheme, and the `--persona river` reference ≡ the equivalent explicit `--url`.) `persona` is
-  encoded via the `persona=` query param already in the URL; do not add a separate persona field that the `--url` form
-  lacks.
+  it. From the effective inbox URL, it is the tuple `(scheme.lower(), host.lower(), effective_port, path,
+  sorted(query_params except the constant mark_read))`. Normalize by stripping a trailing `/` on path, filling the
+  scheme's default port, sorting query params, and lowercasing host. (So `?persona=river&mark_read=false` ≡
+  `?mark_read=false&persona=river`.) `persona` is encoded via the `persona=` query param already in the URL.
 - **Single-writer lock:** on startup, acquire an exclusive `fcntl.flock` on the state-file (LOCK_EX|LOCK_NB); if it's
   held, exit non-zero ("state-file in use"), which prevents two watchers tearing the cursor backwards. Hold the lock fd
   open for the whole process lifetime. flock is advisory and auto-released by the OS on process exit
@@ -200,20 +199,18 @@ read-state-neutral (DONE-WHEN #5 holds after self-test).
   both locks and persists). The external dead-man's-switch (`--heartbeat` to healthchecks.io / Dead Man's Snitch) is
   then the cross-restart liveness guarantee, and DONE-WHEN #3's "no re-emit while down" scopes to a single process.
 
-## 8. Security (SSRF + creds, lift, don't reinvent)
+## 8. Security (connection hardening + creds)
 
-- **SSRF guard on a user-supplied `--url` only**; the baked Kijito loopback reference is exempt. Two independent
-  rules: **(destination class)** default-deny private/loopback/link-local for a generic `--url`; opt in with
-  `--allow-loopback`/`--allow-private`. Lift `_resolve_and_pin` (notify_channels.py:57-99, resolve all IPs, reject
-  internal) plus `_PinnedHTTPSConnection` (:123-146, connect to pinned ip, no re-resolve so no TOCTOU). **(redirects)**
-  Redirects are never followed, independent of the allow-flags (refused regardless), per `_safe_post` (def :166,
-  ~:166-201, no-redirect opener plus timeout). Per-request timeout default is 5s. A user-`--url` SSRF violation
-  (blocked dest or redirect) is a fatal startup error (exit non-zero), distinct from a per-poll liveness failure.
-  Stdlib: no-redirect via `HTTPRedirectHandler.redirect_request → None`; IP-pin via custom `HTTPConnection` through
-  `do_open`; `urlopen(timeout=)`.
+- **No user-supplied URL to guard.** The destination is the fixed Kijito API host, so there is no SSRF surface from
+  config and no destination-class allow/deny machinery. Two hardenings remain as defense-in-depth: **(IP-pin)**
+  resolve the host once and pin the connection to that IP — no re-resolve at connect time, so no TOCTOU
+  (`_PinnedHTTPSConnection` connects to the pinned IP while verifying the cert against the real hostname via SNI);
+  **(no redirects)** redirects are never followed — a redirect is treated as an unhealthy poll, never chased.
+  Per-request timeout default is 5s. Stdlib: no-redirect via `HTTPRedirectHandler.redirect_request → None`; IP-pin via
+  a custom `HTTPConnection` through `do_open`; `urlopen(timeout=)`.
 - **Creds via env/file, never argv** (`$KIJITOMON_TOKEN` / `--token-file`; §5 for header and precedence).
-- **Zero-knowledge:** local content is decrypted locally (no tension); any future hosted bridge carries an opaque
-  wake only (`--no-content` supports opaque mode).
+- **Opaque mode:** content is fetched over the authenticated channel; `--no-content` omits message bodies entirely,
+  and any future hosted bridge carries an opaque wake only.
 
 ## 9. Signal strategy: the all-unread fast-path (implemented, server PR#66)
 
@@ -224,16 +221,13 @@ read-state-neutral (DONE-WHEN #5 holds after self-test).
   all read=false for that persona (a persona with 0 unread is absent, treat as 0). The watcher probes it once on
   arm; if available it consumes `unread` for its persona and does the full inbox-list fetch only when `unread`
   increases, saving the full-list diff on quiet polls. It auto-falls-back to baseline if the endpoint is absent or
-  non-2xx (a non-Kijito source, or a daemon without the field, simply runs baseline).
+  non-2xx (a server without the field simply runs baseline).
 - **Safety floor (`--resync-every`, default 10):** the watcher never skips more than N consecutive polls; it
-  forces a full inbox poll regardless. So a stale / wrong / unsupported count (e.g. a daemon running pre-PR#66 code
-  that returns 0 forever) can at worst add latency, never blind the watcher. `unread` is only the wake trigger.
+  forces a full inbox poll regardless. So a stale / wrong / unsupported count can at worst add latency, never blind
+  the watcher. `unread` is only the wake trigger.
 - `--no-fast-path` forces baseline (always full-poll). Note: a self-sent message does not bump your own `unread`
-  (the daemon doesn't treat your own outgoing mail as unread-for-you), so the fast-path wakes you on incoming mail,
+  (the server doesn't treat your own outgoing mail as unread-for-you), so the fast-path wakes you on incoming mail,
   which is the intended liveness behaviour.
-- Build-time note (2026-06-17): the `unread` field is live on prod/the box, but the local :7474 daemon was running
-  stale pre-PR#66 code (the source has it, web_api.py:601, but the running process is pending a restart). Verified:
-  the fast-path mechanics on a mock, and the resync floor catching real mail on the stale local daemon.
 
 ## 10. Opaque-wake seam (build the hook, not the bridge)
 
@@ -255,20 +249,19 @@ An internal "poll now" trigger besides the interval, wired to SIGUSR1 (POSIX onl
 
 ```
 kijito-inbox-monitor \
-  [--persona P] \                  # required UNLESS --url given
-  [--url URL] \                    # destination override (still Kijito-shaped); SSRF-guarded
-  [--allow-loopback] [--allow-private] \              # generic --url only; default deny
+  [--persona P]... [--personas A,B] [--all-personas] \  # default: every persona in the account
+  [--rediscover-every 600] \                          # all-persona mode: pick up new personas
   [--poll-seconds 60] [--alert-after 3] \             # --alert-after min 1
   [--emit stdout-jsonl|exec-per-event] [--exec 'CMD'] \ # --exec required iff emit=exec-per-event
   [--content-chars 220 | --no-content] \
   [--seed-at LAST_HANDLED_ID] [--max-replay 50] \
   [--state-file PATH] [--heartbeat SECONDS] \
-  [--auth-header NAME] [--token-file PATH] \          # also $KIJITOMON_TOKEN
+  [--auth-header NAME] [--token-file PATH] \          # also $KIJITOMON_TOKEN (a token is required)
   [--self-test]
 ```
-**Arg matrix:** `--url` absent means `--persona` required, the Kijito reference URL used. `--url` present overrides,
-and `--persona` is ignored. It's an error (exit non-zero) if both are absent. An explicit `--seed-at` overrides a
-state-file cursor.
+**Arg matrix:** with no persona flag, every persona in the account is watched (`--all-personas` is the explicit
+spelling); `--persona`/`--personas` select an explicit subset. An explicit `--seed-at` overrides a state-file cursor
+(single-persona target only).
 **`--heartbeat SECONDS`:** emitted on the poll cycle (healthy or failed; it proves the watcher is alive) once at
 least SECONDS have elapsed since process start / last heartbeat; carries `cursor` (null before baseline); resolution
 is `--poll-seconds`.
@@ -276,8 +269,8 @@ is `--poll-seconds`.
 ## 12. v1 scope & DONE-WHEN (binary)
 
 **In v1:** the generic core plus `http-poll` (Kijito reference, hard-baked shape) plus `stdout-jsonl` and
-`exec-per-event` plus the full §7 contract (cursor/FSM/self-test/state-file) plus §8 SSRF/creds plus the §10 SIGUSR1
-self-pipe seam plus the §9 baseline poll and the all-unread fast-path (`/api/notify/pending`) with the
+`exec-per-event` plus the full §7 contract (cursor/FSM/self-test/state-file) plus §8 connection-hardening/creds plus
+the §10 SIGUSR1 self-pipe seam plus the §9 baseline poll and the all-unread fast-path (`/api/notify/pending`) with the
 `--resync-every` no-blindness safety floor.
 **Deferred (explicit, not dropped):** the generic parse-config (`list_path`/`id_field`/arbitrary `fields`) for
 non-Kijito REST shapes, the adapter zoo (file/IMAP/Slack/GitHub), native A2A/MCP, pip packaging, notification fan-out,
@@ -286,27 +279,27 @@ done, see §9.)
 
 **DONE-WHEN (each independently verifiable):**
 1. `--self-test` exits 0 (one real peek-mode shape-valid fetch healthy and synthetic emit ok); exits non-zero
-   against a hive-off/unreachable daemon. Reachability is printed.
+   against an unreachable or hive-off source. Reachability is printed.
 2. (stdout-jsonl mode) Armed against the live inbox; after observing the `armed` event (cursor=C), send a test hive
    message M, and the watcher emits exactly one `new` with `id=M.id` (M.id > C); no `new` is emitted for any message
    with `id ≤ C`. (Framed as the cursor boundary, not wall-clock "pre-existing", so it's deterministic against a live
    multi-writer inbox.)
-3. `--alert-after 3` with `--state-file`: simulate source-down by pointing `--url` at an unused localhost port
-   (`--allow-loopback`), the canonical/safe test (do not stop the shared daemon), giving one `alert`; restore, giving
-   one `recovered`; no re-emit while down.
+3. `--alert-after 3` with `--state-file`: force a source-down condition (e.g. a bad token / non-2xx response, or a
+   network-unreachable interval) for ≥3 consecutive polls, giving one `alert`; restore, giving one `recovered`; no
+   re-emit while down.
 4. **Restart-safe (cursor + dedup):** Stop the watcher at cursor=C (state-file written). Send message M (id>C) while
    stopped. Relaunch with the same `--state-file` (or `--seed-at C`). Pass means M emitted exactly once and no message
    ≤C re-emitted.
 5. **Peek-stable:** after a poll and after `--self-test`, an unread message's `read` field is unchanged. Verify by a
    direct `GET /api/inbox?persona=P&mark_read=false` before and after (the target row's `read` stays the same).
-6. **SSRF:** a generic `--url` at a private/loopback destination is refused without `--allow-loopback`/
-   `--allow-private` (fatal, exit non-zero); a redirecting `--url` is refused regardless of those flags; the Kijito
-   default still works; the per-request timeout is enforced.
+6. **Connection hardening:** a redirect response is refused (treated as an unhealthy poll, never chased); the
+   connection is pinned to the resolved IP with no re-resolve at connect time (no TOCTOU); the per-request timeout is
+   enforced.
 7. **Replay cap:** with `cursor` set below a backlog of more than `--max-replay` items, the first poll emits
    `replay_capped` plus `armed` and zero `new`; with a backlog ≤ `--max-replay`, all replay as `new`.
 8. **Shape/empty:** empty `{"result":[]}` is healthy no-new; a non-2xx / non-JSON / shape-invalid body is a liveness
    failure (counts toward alert), never a false "no mail."
-9. **State-file safety:** a state-file whose `identity` mismatches the current `(persona,url)` does not resume its
+9. **State-file safety:** a state-file whose `identity` mismatches the current persona target does not resume its
    cursor (it re-baselines with a warning); a second watcher on the same state-file exits non-zero (flock).
 10. Lives in `monitor/` as a single zero-dep stdlib file, committed and pushed (private GitHub
     `KijitoAI/kijito-inbox-monitor`, 2026-06-20; stays private until the public-flip gate), with a README
@@ -335,15 +328,15 @@ package publish (verified free 2026-06-24).
 
 ## 14. v2: multi-persona hive watch + supervised producer (shipped + deployed, 2026-06-19/20)
 
-The deployed build watches the whole local hive from one process and is supervised by launchd. The §1 through §13
+The deployed build watches your whole Kijito account from one process and is supervised by launchd. The §1 through §13
 single-persona contracts are unchanged and apply per persona; this section records what was added on top. (Origin:
 the multi-persona fold-in, folded into the canonical `monitor/` tree; per-persona event streams; the current arming
 recipe.)
 
 ### 14.1 Multi-persona watch (one process, N inboxes)
-- **Default (no `--persona`/`--personas`/`--url`):** watch every persona returned by `GET /api/personas`. A new
+- **Default (no `--persona`/`--personas`):** watch every persona returned by `GET /api/personas`. A new
   persona comes online with no new process or flag. `--all-personas` is the explicit spelling.
-- **Explicit subsets:** `--persona P` (repeatable) / `--personas A,B`. `--url` remains the single-target override.
+- **Explicit subsets:** `--persona P` (repeatable) / `--personas A,B`.
 - **Per-persona isolation:** each watched persona has its own cursor, alert FSM, state-file, and flock, derived from
   the `--state-file` base path as `hive.<persona>.json` (so `--state-file ~/.cache/kijito-inbox-monitor/hive.json`
   yields `hive.argus.json`, `hive.river.json`, and so on). All §7.0/§7.1/§7.3 semantics hold independently per persona.
@@ -351,9 +344,9 @@ recipe.)
   newly-created personas without a restart. It is add-only; it never drops a persona mid-run. Explicit
   `--persona`/`--personas` subsets stay fixed (no rediscovery).
 
-### 14.2 One signal fetch per tick, fanned out locally
-The §9 fast-path generalizes cleanly to the hive: one `GET /api/notify/pending` per tick returns the per-persona
-`{persona, unread, unread_urgent}` map; the watcher fans it out locally to each persona's wake decision, and does not
+### 14.2 One signal fetch per tick, fanned out in-process
+The §9 fast-path generalizes cleanly to the whole account: one `GET /api/notify/pending` per tick returns the per-persona
+`{persona, unread, unread_urgent}` map; the watcher fans it out in-process to each persona's wake decision, and does not
 issue one request per watched persona. A persona's full inbox-list poll (§5) still fires only on arm, on its `unread`
 increase, on its `--resync-every` floor, or on fast-path fallback. The `--resync-every` no-blindness floor (§9)
 applies per persona.
@@ -396,7 +389,7 @@ success.)
 ### 14.5 v2 DONE-WHEN (supersede the single-persona framing of §12 #2/#4; they hold per-persona)
 - **m1.** Bare arm (no flags) watches every `/api/personas` persona from one process; each gets its own
   `hive.<persona>.json` (separate cursor/FSM/lock), with no shared `hive.json` and no replay flood on restart.
-- **m2.** Exactly one `/api/notify/pending` request per tick regardless of persona count (fanned out locally).
+- **m2.** Exactly one `/api/notify/pending` request per tick regardless of persona count (fanned out in-process).
 - **m3.** `--events-file-template` writes one `events.<persona>.ndjson` per persona; a session tailing its own file
   receives only its own `new` events; rotation reopens in-process (the consumer reattaches via `tail -F`).
 - **m4.** `--all-personas` plus `--suppress-author P` drops `new` events authored by P; liveness events still flow.

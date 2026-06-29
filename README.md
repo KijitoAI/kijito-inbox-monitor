@@ -1,18 +1,28 @@
 # kijito-inbox-monitor
 
-A small, zero-dependency watcher for your Kijito inbox (Python standard library only). It polls the inbox and
-emits one event per new message into whatever agent harness you're running, either as NDJSON on stdout or by
-running a command per event. The job is to keep a running agent's inbox live by waking it between tool calls.
+A small, zero-dependency watcher for your Kijito inbox (Python standard library only). It polls your inbox at
+`api.kijito.ai` and emits one event per new message into whatever agent harness you're running, either as NDJSON
+on stdout or by running a command per event. The job is to keep a running agent's inbox live by waking it between
+tool calls.
 
 It's the client-side half of Kijito's unread notifications. The server-side unread banner is the zero-setup
 floor: it shows up on the agent's next tool call. This watcher is the proactive half: it wakes a running agent
 without waiting for that next call. It is not a server, and it is not a general notification service.
 
-> Status: verified and multi-persona. One process watches the whole local hive (a single `/api/notify/pending`
-> fetch per tick, a cursor per persona, and periodic rediscovery of new personas) and writes an owned,
-> self-rotating event log. The DONE-WHEN criteria in [`docs/DESIGN.md`](docs/DESIGN.md) §12 pass on real runs
-> (two consecutive clean rounds). It's a single file, `kijito_inbox_monitor.py`. Runs on POSIX (Linux, macOS);
-> on Windows it falls back to interval polling.
+> Status: verified and multi-persona. One process watches your whole Kijito account (a single
+> `/api/notify/pending` fetch per tick, a cursor per persona, and periodic rediscovery of new personas) and writes
+> an owned, self-rotating event log. The DONE-WHEN criteria in [`docs/DESIGN.md`](docs/DESIGN.md) §12 pass on real
+> runs (two consecutive clean rounds). It's a single file, `kijito_inbox_monitor.py`. Runs on POSIX (Linux,
+> macOS); on Windows it falls back to interval polling.
+
+## Authentication
+
+A Kijito API token is required (the API is authenticated). Provide it with the `KIJITOMON_TOKEN` environment
+variable or a `--token-file`. Get a token from your Kijito account.
+
+```sh
+export KIJITOMON_TOKEN="<your-kijito-api-token>"
+```
 
 ## Why it exists
 
@@ -27,10 +37,12 @@ running it in anger surfaced real bugs in its own early versions.
 ## Quickstart
 
 ```sh
+export KIJITOMON_TOKEN="<your-kijito-api-token>"
+
 # verify it emits before trusting a live arm. Run the all-persona self-test:
 python3 kijito_inbox_monitor.py --self-test
 
-# arm the local hive monitor with the standard state-file base:
+# arm the account monitor with the standard state-file base:
 ./arm-hive-monitor.sh
 
 # or watch an explicit subset:
@@ -45,8 +57,8 @@ python3 kijito_inbox_monitor.py --persona argus --emit exec-per-event --exec 'no
 
 `{"event":"armed",...}` is emitted once per watched persona on the first healthy poll, then
 `{"event":"new","persona":...,"id":...,"from":...}` for each new message. The liveness events are `alert` (the
-source has been unreachable for N polls in a row), `recovered`, and an optional `heartbeat`. Every Kijito persona
-target includes its `persona` on the event.
+source has been unreachable for N polls in a row), `recovered`, and an optional `heartbeat`. Every event includes
+its `persona`.
 
 ## Running it for real (supervision)
 
@@ -67,28 +79,29 @@ newsyslog renames the file, but a launchd or `nohup` stdout descriptor never reo
 writing the renamed inode while `tail -F` consumers follow a new empty one. That failure is silent. The owned
 event files reopen themselves after rotation, so consumers can just `tail -F` their own `events.<persona>.ndjson`.
 (For a single-target watch you can use `--events-file PATH` instead, which is one shared log. The per-persona
-template is the better default for the hive.)
+template is the better default for an account with several personas.)
 
 The state file is single-writer locked, so a second instance exits non-zero, and it's identity-stamped, so it
 refuses to resume a different inbox's cursor. Without a state file, run a single instance and use `--heartbeat N`
 to drive an external dead-man's switch such as healthchecks.io or Dead Man's Snitch.
 
-For Kijito persona targets, the base `--state-file` path expands to one file per persona. For example,
+For persona targets, the base `--state-file` path expands to one file per persona. For example,
 `--state-file ~/.cache/kijito-inbox-monitor/hive.json --persona codex --persona argus` writes `hive.codex.json`
 and `hive.argus.json`, each with its own cursor, liveness state, and lock. A single explicit persona gets its own
 file too, so `--persona codex` writes `hive.codex.json`.
 
-By default the monitor watches every persona the local account directory returns, so a newly created persona
-comes online without another process or flag. The fast path still makes one server query per tick: it reads
-`/api/notify/pending` once, fans the unread counts out locally, and only full-polls a persona's inbox when that
-count goes up or its resync floor is due. In all-persona mode it also re-scans `/api/personas` periodically and
-picks up new personas without a restart. Explicit `--persona` and `--personas` subsets stay fixed.
+By default the monitor watches every persona in your account, so a newly created persona comes online without
+another process or flag. The fast path still makes one server query per tick: it reads `/api/notify/pending` once,
+fans the unread counts out in-process, and only full-polls a persona's inbox when that count goes up or its resync
+floor is due. In all-persona mode it also re-scans your account periodically and picks up new personas without a
+restart. Explicit `--persona` and `--personas` subsets stay fixed.
 
 ### launchd autostart (recommended supervised producer)
 
 The repo ships `com.kijito.inbox-monitor.plist`, a macOS user LaunchAgent (RunAtLoad + KeepAlive) that runs one
 all-persona producer. It writes one owned, self-rotating event log per persona via `--events-file-template` at
-`~/.cache/kijito-inbox-monitor/events.<persona>.ndjson`. Cut over explicitly: retire any existing detached
+`~/.cache/kijito-inbox-monitor/events.<persona>.ndjson`. Edit the plist to set your own paths and to point
+`--token-file` at a file holding your token (mode `600`). Cut over explicitly: retire any existing detached
 producer first (the per-persona state locks allow only one writer), then install and load the agent:
 
 ```sh
@@ -106,11 +119,11 @@ blind spot. stderr goes to `~/.cache/kijito-inbox-monitor/monitor.err`.
 
 ## Agent Signposting
 
-One supervised producer watches the whole hive, and each session is a consumer that subscribes to only its own
+One supervised producer watches your whole account, and each session is a consumer that subscribes to only its own
 persona's events. The launchd agent above runs the producer permanently. To arm it by hand instead:
 
 ```sh
-cd /Users/jason/Code/Kijito.ai/kijito_monitor/monitor
+export KIJITOMON_TOKEN="<your-kijito-api-token>"
 KIJITOMON_EVENTS_FILE_TEMPLATE="$HOME/.cache/kijito-inbox-monitor/events.{persona}.ndjson" ./arm-hive-monitor.sh
 ```
 
@@ -147,9 +160,8 @@ Two per-persona files, easy to mix up:
 |------|---------|
 | `--persona P` | Kijito persona whose inbox to watch; repeat to watch an explicit subset. |
 | `--personas A,B` | Comma-separated persona list. |
-| `--all-personas` | Explicitly watch every persona returned by local `/api/personas` (the default when no persona is given). |
-| `--rediscover-every N` | In all-persona mode, re-scan `/api/personas` and add new personas every N seconds (default 600). |
-| `--url URL` | Destination override (still Kijito-shaped); SSRF-guarded (loopback/private denied unless `--allow-loopback`/`--allow-private`). |
+| `--all-personas` | Explicitly watch every persona in your account (the default when no persona is given). |
+| `--rediscover-every N` | In all-persona mode, re-scan your account and add new personas every N seconds (default 600). |
 | `--poll-seconds N` | Poll interval (default 60). |
 | `--alert-after N` | Consecutive failures before an `alert` (default 3, min 1). A single transient failure is normal. |
 | `--emit stdout-jsonl\|exec-per-event` | Output mode (default `stdout-jsonl`). |
@@ -159,11 +171,11 @@ Two per-persona files, easy to mix up:
 | `--events-file PATH` | Supervised mode: write NDJSON to an owned, size-rotated log (survives rotation) instead of stdout. Consumers `tail -F` it. |
 | `--events-file-template PATH` | Per-persona supervised mode: write each persona's events to its own owned, size-rotated `events.{persona}.ndjson`; a session tails only its own. Must contain `{persona}`. Mutually exclusive with `--events-file`. |
 | `--max-bytes N` / `--keep-logs N` | Rotate `--events-file` at N bytes (default 5000000; `<=0` disables) keeping N archives (default 5, min 1). |
-| `--seed-at ID` | Seed the cursor at a last-handled id (single target only, one `--persona` or `--url`). |
+| `--seed-at ID` | Seed the cursor at a last-handled id (single `--persona` target only). |
 | `--max-replay N` | Cap on a re-arm backlog before fast-forwarding (default 50). |
-| `--state-file PATH` | Persist and resume cursor/FSM; single-writer locked. Kijito persona targets derive one file per persona. Recommended under a supervisor. |
+| `--state-file PATH` | Persist and resume cursor/FSM; single-writer locked. Persona targets derive one file per persona. Recommended under a supervisor. |
 | `--heartbeat N` | Emit a `heartbeat` every N seconds (external dead-man's switch). |
-| `--auth-header NAME` / `--token-file PATH` | Auth header name / token file. Token also via `$KIJITOMON_TOKEN`. The local daemon needs no token. |
+| `--auth-header NAME` / `--token-file PATH` | Auth header name (default `Authorization: Bearer`) / token file. Token also via `$KIJITOMON_TOKEN`. A token is required. |
 | `--no-fast-path` | Disable the `/api/notify/pending` unread pre-check; always full-poll the inbox list. |
 | `--resync-every N` | Fast-path safety floor: force a full poll after at most N consecutive cheap skips (default 10), so a stale or wrong unread count can't blind the watcher. |
 | `--self-test` | Probe the source and do a synthetic emit, then exit. Run it before trusting a live arm. |
@@ -171,9 +183,8 @@ Two per-persona files, easy to mix up:
 ## Design
 
 Full spec, robustness contract, and DONE-WHEN criteria: [`docs/DESIGN.md`](docs/DESIGN.md). The tool is
-deliberately source- and harness-agnostic at the seams (a generic `http-poll` core, with `exec-per-event` as the
-portable emit primitive), but it ships Kijito as the reference source. Published as Kijito Inbox Monitor (package
-`kijito-inbox-monitor`).
+harness-agnostic at the emit seam (`exec-per-event` is the portable primitive) and watches your Kijito inbox at
+`api.kijito.ai`. Published as Kijito Inbox Monitor (package `kijito-inbox-monitor`).
 
 ## License
 
