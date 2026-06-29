@@ -919,8 +919,12 @@ def run(args):
 # CLI
 # --------------------------------------------------------------------------------------------------------------------
 def build_parser():
-    p = argparse.ArgumentParser(prog="kijito-inbox-monitor",
-                                description="Client-side liveness watcher for the Kijito inbox (see DESIGN.md).")
+    p = argparse.ArgumentParser(
+        prog="kijito-inbox-monitor",
+        description="Watch your Kijito inbox and emit one event per new message. NOTE: emitting is not waking - a "
+                    "bare `tail` of the events file captures but does NOT wake your agent. To actually wake on new "
+                    "mail, use --emit exec-per-event with a command that pokes your agent loop, or run the tail "
+                    "under your harness's streaming/notification consumer. See the README 'Waking your agent'.")
     p.add_argument("--persona", action="append",
                    help="Kijito persona whose inbox to watch. Repeat for multi-persona mode.")
     p.add_argument("--personas", action="append",
