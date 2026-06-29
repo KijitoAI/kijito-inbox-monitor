@@ -1,7 +1,7 @@
 # Kijito Inbox Monitor: Design & Implementation Spec
 
 **Updated:** 2026-06-29 (rev 7, remote-only: watches your Kijito inbox at `api.kijito.ai`, token required;
-the `--url`/SSRF-by-class machinery is gone — see §5, §8, §11). Builds on rev 6 (v2 multi-persona +
+the `--url`/SSRF-by-class machinery is gone - see §5, §8, §11). Builds on rev 6 (v2 multi-persona +
 supervised producer). **Status:** shipped and live (v2 under launchd).
 
 **Goal:** give Kijito a solid, usable client-side liveness watcher for its built-in inbox. The concrete
@@ -112,11 +112,11 @@ Every event invokes `CMD`; inapplicable env vars are unset:
 | env var | new | armed | alert | recovered | heartbeat | seed_ahead | replay_capped |
 |---|---|---|---|---|---|---|---|
 | `KIJITOMON_EVENT`,`_SOURCE`,`_TS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `KIJITOMON_ID`,`_FROM`,`_CONTENT`,`_CREATED` | ✓ | – | – | – | – | – | – |
-| `KIJITOMON_CURSOR` | – | ✓ | – | ✓ | ✓ | – | – |
-| `KIJITOMON_REASON`,`_FAILURES` | – | – | ✓ | – | – | – | – |
-| `KIJITOMON_SEEDED`,`_CURRENT_MAX` | – | – | – | – | – | ✓ | – |
-| `KIJITOMON_CAPPED_TO`,`_DROPPED` | – | – | – | – | – | – | ✓ |
+| `KIJITOMON_ID`,`_FROM`,`_CONTENT`,`_CREATED` | ✓ | - | - | - | - | - | - |
+| `KIJITOMON_CURSOR` | - | ✓ | - | ✓ | ✓ | - | - |
+| `KIJITOMON_REASON`,`_FAILURES` | - | - | ✓ | - | - | - | - |
+| `KIJITOMON_SEEDED`,`_CURRENT_MAX` | - | - | - | - | - | ✓ | - |
+| `KIJITOMON_CAPPED_TO`,`_DROPPED` | - | - | - | - | - | - | ✓ |
 
 The spawned command has a 10s timeout; a non-zero exit or timeout is logged to stderr and is non-fatal (and never
 holds the cursor back, per §7.0).
@@ -203,9 +203,9 @@ read-state-neutral (DONE-WHEN #5 holds after self-test).
 
 - **No user-supplied URL to guard.** The destination is the fixed Kijito API host, so there is no SSRF surface from
   config and no destination-class allow/deny machinery. Two hardenings remain as defense-in-depth: **(IP-pin)**
-  resolve the host once and pin the connection to that IP — no re-resolve at connect time, so no TOCTOU
+  resolve the host once and pin the connection to that IP - no re-resolve at connect time, so no TOCTOU
   (`_PinnedHTTPSConnection` connects to the pinned IP while verifying the cert against the real hostname via SNI);
-  **(no redirects)** redirects are never followed — a redirect is treated as an unhealthy poll, never chased.
+  **(no redirects)** redirects are never followed - a redirect is treated as an unhealthy poll, never chased.
   Per-request timeout default is 5s. Stdlib: no-redirect via `HTTPRedirectHandler.redirect_request → None`; IP-pin via
   a custom `HTTPConnection` through `do_open`; `urlopen(timeout=)`.
 - **Creds via env/file, never argv** (`$KIJITOMON_TOKEN` / `--token-file`; §5 for header and precedence).

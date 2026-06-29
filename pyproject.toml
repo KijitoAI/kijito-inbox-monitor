@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kijito-inbox-monitor"
-version = "0.2.0"
+version = "0.3.0"
 description = "Zero-dependency watcher that wakes a running agent when new Kijito inbox mail arrives."
 readme = "README.md"
 requires-python = ">=3.9"

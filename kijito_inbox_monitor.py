@@ -30,7 +30,7 @@ try:
 except ImportError:  # pragma: no cover - Windows
     fcntl = None
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 SOURCE = "kijito-inbox"
 # A named User-Agent is REQUIRED: api.kijito.ai is fronted by a WAF that 403s the default Python-urllib UA.
 USER_AGENT = "kijito-inbox-monitor/%s" % __version__
@@ -39,7 +39,9 @@ INBOX_URL = KIJITO_BASE + "/api/inbox"
 PERSONAS_URL = KIJITO_BASE + "/api/personas"
 NOTIFY_PENDING_URL = KIJITO_BASE + "/api/notify/pending"
 EXEC_TIMEOUT = 10
-HTTP_TIMEOUT = 5  # §8 per-request timeout default
+HTTP_TIMEOUT = 5  # per-request timeout default (normal fetches)
+LONGPOLL_SLACK = 10  # client socket timeout = server hold (--wait) + this, so a half-open hold is always detected
+LONGPOLL_BACKOFF_CAP = 30  # cap (s) on exponential backoff between failed long-poll attempts
 IS_POSIX = os.name == "posix"
 
 
@@ -188,12 +190,25 @@ def fetch_personas(opener, headers):
     return personas
 
 
+def _parse_unread_rows(data):
+    """Parse a /api/notify/pending body into {persona: unread}, or None if the shape is invalid.
+    A persona with zero unread is ABSENT from the list → callers treat absent as 0."""
+    rows = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return None
+    counts = {}
+    for row in rows:
+        if isinstance(row, dict) and isinstance(row.get("persona"), str):
+            u = row.get("unread")
+            counts[row["persona"]] = u if isinstance(u, int) else 0
+    return counts
+
+
 def fetch_unread_counts(opener, count_url, headers):
     """§9 fast-path pre-check: GET /api/notify/pending once and fan the counts out in-process.
 
     Returns (available, {persona: unread_count}). available=False if the endpoint is absent / non-2xx / bad shape →
-    callers fall back to the full inbox-list poll. Response: {"result":[{persona,unread,unread_urgent}]};
-    a persona with zero unread is ABSENT from the list → callers treat absent as 0.
+    callers fall back to the full inbox-list poll. Response: {"result":[{persona,unread,unread_urgent}]}.
     """
     req = urllib.request.Request(count_url, headers=headers, method="GET")
     try:
@@ -203,15 +218,44 @@ def fetch_unread_counts(opener, count_url, headers):
             data = json.loads(resp.read())
     except Exception:
         return (False, {})
-    rows = data.get("result") if isinstance(data, dict) else None
-    if not isinstance(rows, list):
+    counts = _parse_unread_rows(data)
+    if counts is None:
         return (False, {})
-    counts = {}
-    for row in rows:
-        if isinstance(row, dict) and isinstance(row.get("persona"), str):
-            u = row.get("unread")
-            counts[row["persona"]] = u if isinstance(u, int) else 0
     return (True, counts)
+
+
+def fetch_unread_counts_longpoll(opener, headers, wait, cursor):
+    """Long-poll variant of the fast-path. GET /api/notify/pending?wait=<sec>[&cursor=<opaque>].
+
+    The server holds the request up to `wait` seconds, returning the instant the account's mail-state advances
+    beyond `cursor` (else on timeout). Returns (available, {persona: unread}, cursor):
+    - `cursor` is the server's OPAQUE token to echo on the next call - NEVER parse it.
+    - available=False on any connection error / non-2xx / bad shape → the caller falls back to the full inbox poll
+      and RECONNECTS WITH THE SAME cursor (lossless resume across a wifi/NAT/Cloudflare/server-restart drop).
+    - cursor is None when the server did NOT long-poll (no `cursor` field): the endpoint predates long-poll, so the
+      caller interval-polls. This makes the client safe to ship BEFORE the server supports it - it interval-polls
+      today and auto-upgrades to instant the moment a cursor starts coming back, no redeploy.
+    The client socket timeout is wait+LONGPOLL_SLACK so a half-open held connection is detected, never hung.
+    """
+    q = {"wait": str(wait)}
+    if cursor is not None:
+        q["cursor"] = cursor
+    url = NOTIFY_PENDING_URL + "?" + urllib.parse.urlencode(q)
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with opener.open(req, timeout=wait + LONGPOLL_SLACK) as resp:
+            if not (200 <= resp.status < 300):
+                return (False, {}, cursor)
+            data = json.loads(resp.read())
+    except Exception:
+        return (False, {}, cursor)  # keep the old cursor → next attempt resumes losslessly
+    counts = _parse_unread_rows(data)
+    if counts is None:
+        return (False, {}, cursor)
+    new_cursor = data.get("cursor")
+    if not isinstance(new_cursor, str) or not new_cursor:
+        new_cursor = None  # server didn't long-poll → caller interval-polls (forward/back-compat)
+    return (True, counts, new_cursor)
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -768,6 +812,31 @@ def discover_persona_targets(args, headers, emitter, targets, opener_by_origin, 
     return added
 
 
+def discover_from_counts(args, counts, targets, opener_by_origin, headers, emitter):
+    """Add a watch target for any persona that appears in the notify counts (i.e. has mail) but isn't watched yet.
+
+    This is how a NEW persona is picked up within one tick of receiving mail - for free from the long-poll / fast-path
+    counts we already fetch - instead of waiting for the periodic /api/personas rescan. Only auto-adds in all-personas
+    mode; an explicit --persona/--personas subset stays fixed."""
+    if not watches_all_personas(args):
+        return []
+    current = {t.persona for t in targets if t.persona}
+    added = []
+    for persona in counts:
+        if persona and persona not in current:
+            try:
+                target = build_persona_target(persona, opener_by_origin, headers, args, emitter)
+            except FatalConfig as e:
+                sys.stderr.write("kijito-inbox-monitor: WARNING cannot add persona %r from counts: %s\n"
+                                 % (persona, e))
+                continue
+            targets.append(target)
+            added.append(persona)
+            current.add(persona)
+            target.lifecycle("persona_added")
+    return added
+
+
 def run(args):
     headers = build_headers(args)
     sink = None
@@ -798,6 +867,8 @@ def run(args):
     seam = WakeSeam()
     seam.install()
     rediscover_at = _monotonic() + args.rediscover_every
+    cursor = None    # opaque long-poll cursor (the server's max-message-id token) echoed on each call
+    lp_backoff = 0   # exponential backoff (s) between FAILED long-poll attempts; 0 while healthy
 
     while not seam.stop:
         seam.drain()  # read-and-clear at START of poll (§10)
@@ -807,18 +878,38 @@ def run(args):
             except FatalConfig as e:
                 sys.stderr.write("kijito-inbox-monitor: WARNING persona rediscovery failed: %s\n" % e)
             rediscover_at = _monotonic() + args.rediscover_every
+
         counts_available = False
         unread_counts = {}
+        held = False  # True iff this iteration was a real server-HELD long-poll (it already provided the wait)
         count_target = next((t for t in targets if t.unread_persona), None)
         if count_target is not None and not args.no_fast_path:
-            counts_available, unread_counts = fetch_unread_counts(
-                count_target.opener, count_target.count_url, headers
-            )
+            if args.wait > 0:
+                counts_available, unread_counts, new_cursor = fetch_unread_counts_longpoll(
+                    count_target.opener, headers, args.wait, cursor)
+                if counts_available:
+                    lp_backoff = 0
+                    if new_cursor is not None:
+                        cursor = new_cursor   # real long-poll: advance the cursor; the hold WAS the wait
+                        held = True
+                    # new_cursor is None → server doesn't long-poll (yet) → interval-poll via the sleep below
+                else:
+                    # drop / blip / outage: back off, resume the SAME cursor next time (lossless), and this tick
+                    # falls through to per-target full inbox polls (the by-message-id correctness backstop).
+                    lp_backoff = min((lp_backoff * 2) or 1, LONGPOLL_BACKOFF_CAP)
+            else:
+                counts_available, unread_counts = fetch_unread_counts(
+                    count_target.opener, count_target.count_url, headers)
+
+        if counts_available:
+            discover_from_counts(args, unread_counts, targets, opener_by_origin, headers, emitter)
         for target in targets:
             target.poll_once(counts_available, unread_counts)
         if seam.stop:
             break
-        seam.wait(args.poll_seconds)
+        if held:
+            continue  # the server-held long-poll already supplied the inter-poll wait - loop straight back
+        seam.wait(lp_backoff if lp_backoff else args.poll_seconds)
 
     emitter.close()
     return 0
@@ -839,7 +930,15 @@ def build_parser():
     p.add_argument("--rediscover-every", type=int, default=600,
                    help="In all-persona mode, re-scan your account every N seconds and add newly-created personas "
                         "(default 600, min 1). Explicit persona subsets are not expanded.")
-    p.add_argument("--poll-seconds", type=int, default=60)
+    p.add_argument("--poll-seconds", type=int, default=60,
+                   help="Interval (s) between polls when long-poll is off/unsupported (default 60).")
+    p.add_argument("--wait", type=int, default=50,
+                   help="Long-poll hold (s) requested from /api/notify/pending so new mail wakes the watcher "
+                        "near-instantly at ~the same request rate (default 50; the server clamps to its own max). "
+                        "0 disables long-poll → plain interval polling at --poll-seconds. If the server doesn't "
+                        "support long-poll, the client auto-falls back to interval polling (no redeploy needed). "
+                        "Clean shutdown during a held poll can take up to --wait seconds (a supervisor's SIGKILL "
+                        "mid-hold is safe - state is persisted every cycle).")
     p.add_argument("--alert-after", type=int, default=3, help="Consecutive failures before an alert (min 1).")
     p.add_argument("--emit", choices=("stdout-jsonl", "exec-per-event"), default="stdout-jsonl")
     p.add_argument("--exec", help="Command to run per event (required iff --emit exec-per-event).")
@@ -891,6 +990,11 @@ def validate_args(args):
         sys.stderr.write("kijito-inbox-monitor: WARNING --exec ignored (emit mode is %s)\n" % args.emit)
     if args.poll_seconds < 1:
         raise FatalConfig("--poll-seconds must be >= 1")  # 0 → a select(timeout=0) busy-loop hammering the source
+    if args.wait < 0:
+        raise FatalConfig("--wait must be >= 0 (0 disables long-poll)")
+    if args.wait > 0 and args.no_fast_path:
+        sys.stderr.write("kijito-inbox-monitor: WARNING --wait ignored with --no-fast-path (long-poll is part of "
+                         "the fast-path)\n")
     if args.heartbeat is not None and args.heartbeat < 1:
         raise FatalConfig("--heartbeat must be >= 1")
     if args.content_chars < 0:
