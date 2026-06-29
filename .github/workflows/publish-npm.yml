@@ -3,13 +3,13 @@ name: publish-npm
 # Publishes the kijito-inbox-monitor npm SIGNPOST package on a version tag, using Trusted
 # Publishing (OIDC). The npm package is not a real installer: it points users at the Python
 # package on PyPI (see bin/cli.js). No NPM_TOKEN is stored; npm exchanges a short-lived
-# workflow credential and attaches provenance automatically. Configure the trusted publisher
-# once on npmjs.com first: npmjs.com -> the package -> Settings -> Trusted Publisher ->
-# add this repo + this workflow file.
+# workflow credential and attaches provenance automatically.
+#
+# REQUIRED ONE-TIME SETUP on npmjs.com (without it, publish 404s with "you do not have
+# permission"): npmjs.com -> kijito-inbox-monitor -> Settings -> Trusted Publisher ->
+# add GitHub repo "KijitoAI/kijito-inbox-monitor" + workflow ".github/workflows/publish-npm.yml".
+# Until that exact (repo, workflow) pair is registered, OIDC cannot mint a publish credential.
 on:
-  # npm Trusted Publishing (OIDC) is configured for this package, so a v* tag publishes here
-  # too (no token, provenance auto-attached). The v0.1.0 first publish was manual because OIDC
-  # cannot cover a brand-new package's first publish; v0.1.1+ publish via OIDC from this run.
   push:
     tags: ["v*"]
   workflow_dispatch:
