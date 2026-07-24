@@ -63,6 +63,16 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
   No mail was lost in practice before this: polling cadence kept every observed window reaching back past
   the cursor. That was luck, not correctness - roughly eight typical messages in one gap exhausts the budget.
+
+  Four further defects in that machinery, all found by Loom's third re-audit and all real:
+  **new arrivals cannot prove an old omission was recovered** - a message landing between the two fetches
+  used to satisfy the shortfall while the hidden span stayed hidden, so only rows falling strictly INSIDE
+  the uncovered span now count; **a restart must respect a restored pin** - the arming path selected every
+  id above the cursor without consulting what a previous run had already delivered, re-emitting it, and
+  the replay cap moved the cursor to the newest id before any gap check, erasing the pin entirely;
+  **pin tracking is bounded** so a gap that can never close cannot grow the state file without end; and
+  **the gap alert is keyed on the pinned watermark, not the window floor**, because the floor drifts
+  upward with every new message and re-announced the same unresolved span. The alert key is persisted too.
 - **Case-variant personas no longer self-deadlock the watcher (silent wake gap).** A persona name was
   mapped to its state file verbatim, but macOS (APFS) and Windows are case-**insensitive**, so
   `Claude-chat` and `claude-chat` name the *same* file. Discovering a case-variant of an already-watched

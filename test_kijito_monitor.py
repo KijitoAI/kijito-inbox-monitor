@@ -604,6 +604,128 @@ class BoundedWindowEndToEndTest(unittest.TestCase):
         self.assertEqual(t.cursor, 1100)   # pinned despite recovered >= omitted
         self.assertTrue([f for (e, f) in em.events if e == "alert"])
 
+    def test_LOOM3_concurrent_arrivals_cannot_false_close_a_gap(self):
+        # Loom re-audit 3, blocker 1. cursor 100, visible window [200] with an omission, and the
+        # reconcile returns [201, 300] - mail that ARRIVED between the two fetches. Both are absent from
+        # the first window and above the cursor, so the old code counted them as recovery and advanced
+        # to 300, while the hidden span (100, 200) was never read. New arrivals prove nothing about old
+        # omissions.
+        em = self.RecordingEmitter()
+        t = self._target(cursor=100, emitter=em)
+
+        def fake_fetch(opener, url, headers):
+            if "unread_only=true" in url:
+                return km.Poll(True, items=[{"id": 201}, {"id": 300}], omitted=0)
+            return km.Poll(True, items=[{"id": 200}], omitted=1)
+
+        orig, km.fetch = km.fetch, fake_fetch
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertEqual(t.cursor, 100)                       # *** must stay PINNED ***
+        self.assertEqual(em.new_ids, [200, 201, 300])         # arrivals still delivered, just not counted
+        alert = [f for e, f in em.events if e == "alert"][0]
+        self.assertEqual(alert["reconciled"], 0)              # nothing came from INSIDE the span
+
+    def test_only_rows_inside_the_span_close_it(self):
+        # Same shape, but the reconcile returns a row that really is inside (100, 200).
+        em = self.RecordingEmitter()
+        t = self._target(cursor=100, emitter=em)
+        poll = lambda o, u, h: (km.Poll(True, items=[{"id": 150}], omitted=0) if "unread_only=true" in u
+                                else km.Poll(True, items=[{"id": 200}], omitted=1))
+        orig, km.fetch = km.fetch, poll
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertEqual(em.new_ids, [150, 200])
+        self.assertEqual(t.cursor, 200)                       # genuinely closed, so it may advance
+        self.assertEqual([f for e, f in em.events if e == "alert"], [])
+
+    def test_LOOM3_restart_does_not_re_emit_what_a_pin_already_delivered(self):
+        # Loom re-audit 3, blocker 2. A restart arrives with armed=False and a RESTORED pin; the arming
+        # branch selected every id > cursor without consulting emitted_above, re-delivering it.
+        em = self.RecordingEmitter()
+        t = self._target(cursor=1100, emitter=em)
+        t.armed = False
+        t.emitted_above = {1200}
+        orig, km.fetch = km.fetch, lambda o, u, h: km.Poll(True, items=[{"id": 1200}], omitted=0)
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertEqual(em.new_ids, [])                      # 1200 was already delivered before the restart
+
+    def test_LOOM3_restart_replay_cap_does_not_erase_a_pin(self):
+        # Loom re-audit 3, blocker 3. The replay-capped branch set cursor=current_max BEFORE gap
+        # detection, jumping the watermark straight over the unresolved span on the first poll back.
+        em = self.RecordingEmitter()
+        t = self._target(cursor=100, emitter=em)
+        t.armed = False
+        t.emitted_above = {200, 201}
+        t.args.max_replay = 1
+        # Enough UNSEEN ids (202, 203, 204) that the replay cap would fire if the pin guard were absent -
+        # otherwise this test passes against the bug, which is worse than no test.
+        orig, km.fetch = km.fetch, lambda o, u, h: km.Poll(
+            True, items=[{"id": 200}, {"id": 201}, {"id": 202}, {"id": 203}, {"id": 204}], omitted=5)
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertEqual(t.cursor, 100)                       # pin survived arming
+        self.assertNotIn("replay_capped", [e for e, f in em.events])
+
+    def test_replay_cap_still_applies_when_nothing_is_pinned(self):
+        # The guard must not disable the replay cap in the normal case it exists for.
+        em = self.RecordingEmitter()
+        t = self._target(cursor=100, emitter=em)
+        t.armed = False
+        t.args.max_replay = 1
+        orig, km.fetch = km.fetch, lambda o, u, h: km.Poll(
+            True, items=[{"id": 200}, {"id": 201}, {"id": 202}], omitted=0)
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertIn("replay_capped", [e for e, f in em.events])
+        self.assertEqual(t.cursor, 202)
+
+    def test_gap_alert_is_keyed_on_the_stable_watermark_not_the_drifting_floor(self):
+        # The window floor rises as new mail arrives, so keying the alert on it re-announces the SAME
+        # unresolved span every time anyone sends anything.
+        em = self.RecordingEmitter()
+        t = self._target(cursor=100, emitter=em)
+        floors = iter([200, 250, 300])
+        def poll(o, u, h):
+            if "unread_only=true" in u:
+                return km.Poll(False, reason="http 502")
+            return km.Poll(True, items=[{"id": next(floors)}], omitted=2)
+        orig, km.fetch = km.fetch, poll
+        try:
+            for _ in range(3):
+                t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertEqual(len([f for e, f in em.events if e == "alert"]), 1)
+        self.assertEqual(t.gap_alerted, 100)                  # the watermark, not 200/250/300
+
+    def test_pin_tracking_is_bounded(self):
+        em = self.RecordingEmitter()
+        t = self._target(cursor=0, emitter=em)
+        t.emitted_above = set(range(1, km.PIN_TRACKING_CAP + 50))
+        poll = lambda o, u, h: (km.Poll(False, reason="http 502") if "unread_only=true" in u
+                                else km.Poll(True, items=[{"id": km.PIN_TRACKING_CAP + 100}], omitted=1))
+        orig, km.fetch = km.fetch, poll
+        buf, err = __import__("io").StringIO(), km.sys.stderr
+        km.sys.stderr = buf
+        try:
+            t.poll_once()
+        finally:
+            km.fetch, km.sys.stderr = orig, err
+        self.assertLessEqual(len(t.emitted_above), km.PIN_TRACKING_CAP)
+        self.assertIn("outlived its tracking budget", buf.getvalue())
+
     def test_steady_state_truncation_is_silent_and_changes_nothing(self):
         # The common case: window reaches back past the cursor, so the drops are already-emitted mail.
         # This must NOT alert, or the alarm fires on every poll and gets ignored.
@@ -917,6 +1039,29 @@ class StrandedInboxTest(unittest.TestCase):
         self.assertEqual(events[0]["event"], "alert")
         self.assertIn("stranded-mail", events[0]["reason"])
         self.assertEqual(events[0]["stranded_inboxes"], ["all"])
+
+    def test_LOOM3_suppression_releases_so_a_LATER_re_stranding_is_announced(self):
+        # Loom re-audit 3, MEDIUM. Suppressing for the process lifetime made "reported once" mean
+        # "reported once ever", silently contradicting the documented self-clearing behaviour: an inbox
+        # rescued and then stranded AGAIN would never be announced until a restart.
+        first, ev1, _ = self._report(["argus"], {"all": 2}, watchers=("argus",))
+        self.assertEqual(first, ["all"])
+        # ... the mail is consumed, so it is no longer stranded and the alarm goes quiet ...
+        gone, ev2, _ = self._report(["argus"], {}, watchers=("argus",))
+        self.assertEqual(gone, [])
+        # ... and now it is stranded a SECOND time. This must be announced again.
+        again, ev3, err3 = self._report(["argus"], {"all": 1}, watchers=("argus",))
+        self.assertEqual(again, ["all"])
+        self.assertTrue(ev3)
+        self.assertIn("stranded mail", err3)
+
+    def test_suppression_holds_while_the_condition_persists(self):
+        # Releasing must not become "alert every poll" - the condition still holding is not news.
+        self._report(["argus"], {"all": 2}, watchers=("argus",))
+        second, ev2, err2 = self._report(["argus"], {"all": 2}, watchers=("argus",))
+        self.assertEqual(second, [])
+        self.assertEqual(ev2, [])
+        self.assertEqual(err2, "")
 
     def test_reported_once_per_process_not_once_per_tick(self):
         first, ev1, _ = self._report(["argus"], {"all": 2}, watchers=("argus",))
