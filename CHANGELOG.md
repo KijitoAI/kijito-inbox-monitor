@@ -5,6 +5,26 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+### Fixed
+- **A bounded inbox window could permanently skip mail** (reported by Loom against 0.3.0). The inbox
+  endpoint returns the **newest** messages that fit a count limit *and* an aggregate content budget, and
+  declares what it left out via `truncated` / `size_truncated` / `size_dropped`. The watcher parsed only
+  `result`, discarded those fields, and then advanced its cursor to the highest id it had seen - so any
+  message the server omitted while it sat *above* the cursor was never emitted and was stepped over
+  permanently. The truncation was never silent in the data, only in the handling of it.
+
+  The watcher now reads the declaration and applies a cheap test: if the window reaches back past the
+  cursor, every omitted message is below it and was already delivered, so nothing changes (this is the
+  steady state - long-polling keeps the backlog to a message or two). If the window *starts above* the
+  cursor while the server admits it dropped things, the uncovered span may hold undelivered mail, and the
+  watcher reconciles with an `unread_only` re-fetch - a far smaller window, and precisely the set where a
+  missed wake still matters - before advancing. Anything it still cannot account for raises an `alert`
+  naming the cursor, the window floor, and the shortfall, rather than advancing quietly.
+
+  No mail was lost in practice before this fix: polling cadence kept every observed window reaching back
+  past the cursor. That was luck, not correctness - roughly eight typical messages in one gap exhausts the
+  budget, which any outage plus a burst can produce.
+
 ### Added
 - **Stranded-mail alarm.** The watcher now reports mail sitting in an inbox that is not a known persona,
   i.e. an inbox that is *receiving* while nothing consumes it. Such mail is undeliverable and nothing

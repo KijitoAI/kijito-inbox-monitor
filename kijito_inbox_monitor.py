@@ -128,13 +128,21 @@ def build_opener(pinned_ip):
 # §5 http-poll adapter - peek + shape-validate + classify healthy/failure
 # --------------------------------------------------------------------------------------------------------------------
 class Poll:
-    """Result of one fetch. ok=True → HEALTHY (items is the validated list). ok=False → liveness FAILURE."""
-    def __init__(self, ok, items=None, reason=None, status=None, redirected=False):
+    """Result of one fetch. ok=True → HEALTHY (items is the validated list). ok=False → liveness FAILURE.
+
+    `omitted` carries the server's OWN declaration that this window is incomplete. The inbox endpoint
+    returns the NEWEST messages that fit a count limit AND an aggregate content budget, and reports what
+    it left out via truncated / size_truncated / size_dropped. Discarding those fields is how a bounded
+    window turns into permanent mail loss: items the server omitted are never emitted, and the cursor
+    then advances past them. The truncation is not silent in the DATA - only in the handling of it.
+    """
+    def __init__(self, ok, items=None, reason=None, status=None, redirected=False, omitted=0):
         self.ok = ok
         self.items = items
         self.reason = reason
         self.status = status
         self.redirected = redirected
+        self.omitted = omitted   # >0 iff the server said this window is incomplete
 
 
 def fetch(opener, url, headers):
@@ -163,7 +171,21 @@ def fetch(opener, url, headers):
     for m in items:
         if not isinstance(m, dict) or not isinstance(m.get("id"), int):
             return Poll(False, reason="shape-invalid: row missing integer id", status=status)
-    return Poll(True, items=items, status=status)
+    return Poll(True, items=items, status=status, omitted=_declared_omissions(data))
+
+
+def _declared_omissions(data):
+    """How many messages the server says it left out of this window (0 if it says none).
+
+    Counted CONSERVATIVELY: a boolean truncated/size_truncated with no number still means "incomplete",
+    so it counts as at least one omission rather than zero. Treating an unquantified truncation as
+    "nothing missing" would reintroduce exactly the silent-skip this exists to prevent.
+    """
+    dropped = data.get("size_dropped")
+    n = dropped if isinstance(dropped, int) and dropped > 0 else 0
+    if not n and (data.get("truncated") is True or data.get("size_truncated") is True):
+        n = 1
+    return n
 
 
 def fetch_personas(opener, headers):
@@ -728,6 +750,43 @@ class WatchTarget:
             fields["persona"] = self.persona
         self.emitter.lifecycle(event, **fields)
 
+    def _uncovered_gap(self, poll, items):
+        """(cursor, window_floor, omitted) iff omitted mail may sit ABOVE the cursor, else None.
+
+        THE DISCRIMINATOR, and it is the whole reason this is not a permanent alarm:
+          window_floor <= cursor  -> the window reaches back PAST what we already emitted, so every
+                                     omitted message is BELOW the cursor and was already delivered. Safe.
+          window_floor >  cursor  -> the window starts above the cursor while the server says it dropped
+                                     things, so the uncovered span (cursor, window_floor) may hold mail
+                                     we have never emitted. Unsafe.
+        In steady state the long-poll keeps the backlog to a message or two, so the window always reaches
+        back and this returns None - no behaviour change. It fires after an outage or a burst, which is
+        exactly when a bounded window starts hiding things.
+        """
+        if not poll.omitted or self.cursor is None or not self.armed or not items:
+            return None
+        floor = min(m["id"] for m in items)
+        if floor <= self.cursor:
+            return None
+        return (self.cursor, floor, poll.omitted)
+
+    def _reconcile_gap(self, args):
+        """Re-fetch unread-only to recover mail the bounded window hid. Returns validated rows.
+
+        Why unread_only: the endpoint has NO backward pagination (after_id/since_id/offset/order are
+        ignored, and a smaller limit just returns even NEWER messages), so the omitted span cannot be
+        requested directly. But unread-only is a far smaller window - it excludes everything already
+        read - so it is much less likely to truncate, and un-emitted mail that nobody has read yet is
+        precisely the set where a missed wake actually costs something.
+        Best-effort by design: a failure here must never turn a healthy poll into a liveness failure,
+        because the alert we emit alongside it is already carrying the bad news.
+        """
+        sep = "&" if "?" in self.url else "?"
+        poll = fetch(self.opener, self.url + sep + "unread_only=true", self.headers)
+        if not poll.ok or not poll.items:
+            return []
+        return sorted(poll.items, key=lambda m: m["id"])
+
     def poll_once(self, counts_available=False, unread_counts=None):
         args = self.args
         unread_counts = unread_counts or {}
@@ -793,6 +852,30 @@ class WatchTarget:
                     self.lifecycle(diag[0], **diag[1])
                 if do_arm:
                     self.lifecycle("armed", cursor=self.cursor)
+                # §5.1 A BOUNDED WINDOW MUST NOT SILENTLY SWALLOW MAIL.
+                # The server returns the NEWEST messages that fit, and declares what it left out. If it
+                # omitted anything AND the window does not reach back to our cursor, un-emitted mail can
+                # be sitting in the uncovered gap - and advancing the cursor past it loses it forever.
+                gap = self._uncovered_gap(poll, items)
+                if gap is not None:
+                    recovered_items = self._reconcile_gap(args)
+                    known = {m["id"] for m in new_items}
+                    for m in recovered_items:
+                        if m["id"] > (self.cursor or 0) and m["id"] not in known:
+                            new_items.append(m)
+                    new_items.sort(key=lambda m: m["id"])
+                    still_missing = gap[2] - len(recovered_items)
+                    # Fail LOUD on whatever reconciliation could not reach. The endpoint offers no
+                    # backward pagination, so a gap we cannot close must wake somebody rather than vanish.
+                    self.lifecycle("alert",
+                                   reason=("bounded-window: server omitted %d message(s) and the window "
+                                           "started at id %s above cursor %s; recovered %d by reconcile, "
+                                           "%d may never have been delivered"
+                                           % (gap[2], gap[1], gap[0], len(recovered_items),
+                                              max(still_missing, 0))),
+                                   omitted=gap[2], window_floor=gap[1], cursor_at=gap[0],
+                                   reconciled=len(recovered_items))
+
                 for m in new_items:
                     m = dict(m)
                     m["_persona"] = self.persona

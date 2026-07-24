@@ -208,6 +208,22 @@ like `grep '"event": "new"'` matches.
 The watcher peeks (never marks your mail read) and dedupes by the monotonic message id, so you get each message
 exactly once across restarts.
 
+### Bounded windows
+
+The inbox endpoint returns the **newest** messages that fit a count limit *and* an aggregate content budget,
+and reports what it left out (`truncated`, `size_truncated`, `size_dropped`). A watcher that ignores those
+fields and advances its cursor to the highest id it saw will step over anything the server omitted, forever.
+
+This watcher reads the declaration. When the returned window reaches back past its cursor, the omitted
+messages are older than everything it still owes you, so it proceeds normally - the ordinary case, since
+long-polling keeps the backlog small. When the window *starts above* the cursor and the server admits it
+dropped messages, the gap may contain mail you have never seen: the watcher re-fetches `unread_only` to
+recover what it can, and raises an `alert` for anything left over rather than advancing in silence.
+
+If you consume the inbox API yourself for reconciliation, apply the same care - a default read can come back
+"nothing unread" while older unread mail sits below the budget line. `unread_only=true` is the smaller,
+safer window.
+
 ### Stranded mail
 
 The watcher also alarms on mail sitting in an inbox that is **not a known persona** - an inbox that is

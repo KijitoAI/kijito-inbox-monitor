@@ -397,6 +397,189 @@ class DiscoverFromCountsTest(unittest.TestCase):
         self.assertEqual(made, ["Vellum"])
 
 
+class DeclaredOmissionsTest(unittest.TestCase):
+    """The server declares an incomplete window; the parser must not throw the declaration away."""
+
+    def test_size_dropped_is_read(self):
+        self.assertEqual(km._declared_omissions({"result": [], "size_dropped": 15}), 15)
+
+    def test_boolean_truncation_without_a_count_still_counts_as_incomplete(self):
+        # "incomplete but unquantified" must never round down to "nothing missing".
+        self.assertEqual(km._declared_omissions({"result": [], "truncated": True}), 1)
+        self.assertEqual(km._declared_omissions({"result": [], "size_truncated": True}), 1)
+
+    def test_a_complete_window_declares_nothing(self):
+        self.assertEqual(km._declared_omissions({"result": [], "truncated": False,
+                                                 "size_truncated": False, "size_dropped": 0}), 0)
+
+    def test_fetch_carries_the_declaration_onto_the_poll(self):
+        body = json.dumps({"result": [{"id": 5}], "size_truncated": True, "size_dropped": 3}).encode()
+        poll = km.fetch(FakeOpener(FakeResponse(200, json.loads(body))), "http://x/api/inbox", {})
+        self.assertTrue(poll.ok)
+        self.assertEqual(poll.omitted, 3)
+
+
+class BoundedWindowGapTest(unittest.TestCase):
+    """A bounded window must never let the cursor silently cross mail the server admits it dropped."""
+
+    def _target(self, cursor, armed=True):
+        t = km.WatchTarget.__new__(km.WatchTarget)
+        t.cursor, t.armed, t.persona, t.url = cursor, armed, "argus", "http://x/api/inbox?persona=argus"
+        t.opener, t.headers = None, {}
+        return t
+
+    def test_window_reaching_back_past_the_cursor_is_safe(self):
+        # Steady state: long-poll keeps the backlog tiny, so the window covers the cursor. Dropped
+        # messages are all BELOW it and were already emitted. Must NOT fire - or it alarms forever.
+        t = self._target(cursor=1135)
+        poll = km.Poll(True, items=[{"id": 1101}, {"id": 1135}], omitted=15)
+        self.assertIsNone(t._uncovered_gap(poll, poll.items))
+
+    def test_window_starting_above_the_cursor_with_omissions_is_the_loss_case(self):
+        # After an outage/burst: server dropped 10 and the window starts at 1200 while we are at 1100,
+        # so (1100, 1200) may hold mail we never emitted.
+        t = self._target(cursor=1100)
+        poll = km.Poll(True, items=[{"id": 1200}, {"id": 1260}], omitted=10)
+        self.assertEqual(t._uncovered_gap(poll, poll.items), (1100, 1200, 10))
+
+    def test_no_declared_omissions_means_no_gap_however_high_the_window_starts(self):
+        # ids are account-global, so a window starting above the cursor is NORMAL when the server
+        # says it dropped nothing - other personas' mail occupies the intervening ids.
+        t = self._target(cursor=1100)
+        poll = km.Poll(True, items=[{"id": 1200}], omitted=0)
+        self.assertIsNone(t._uncovered_gap(poll, poll.items))
+
+    def test_unarmed_target_never_reports_a_gap(self):
+        t = self._target(cursor=1100, armed=False)
+        poll = km.Poll(True, items=[{"id": 1200}], omitted=5)
+        self.assertIsNone(t._uncovered_gap(poll, poll.items))
+
+    def test_reconcile_queries_unread_only_and_returns_rows_in_id_order(self):
+        t = self._target(cursor=1100)
+        seen = {}
+
+        def fake_fetch(opener, url, headers):
+            seen["url"] = url
+            return km.Poll(True, items=[{"id": 1150}, {"id": 1105}], omitted=0)
+
+        orig, km.fetch = km.fetch, fake_fetch
+        try:
+            rows = t._reconcile_gap(Args())
+        finally:
+            km.fetch = orig
+        self.assertIn("unread_only=true", seen["url"])
+        self.assertEqual([m["id"] for m in rows], [1105, 1150])   # ascending, so emission order is stable
+
+    def test_reconcile_failure_is_best_effort_not_a_liveness_failure(self):
+        t = self._target(cursor=1100)
+        orig, km.fetch = km.fetch, lambda *a, **k: km.Poll(False, reason="http 502")
+        try:
+            self.assertEqual(t._reconcile_gap(Args()), [])   # returns empty, does not raise
+        finally:
+            km.fetch = orig
+
+
+class BoundedWindowEndToEndTest(unittest.TestCase):
+    """poll_once end-to-end: mail hidden by a bounded window must still reach the consumer."""
+
+    class RecordingEmitter:
+        def __init__(self):
+            self.new_ids, self.events = [], []
+
+        def new(self, m):
+            self.new_ids.append(m["id"])
+
+        def lifecycle(self, event, **f):
+            self.events.append((event, f))
+
+    class FullArgs:
+        persona = personas = None
+        all_personas = False
+        alert_after = 3
+        poll_seconds = 60
+        heartbeat = 0
+        max_replay = 50
+        no_fast_path = True     # force the full inbox poll, which is the path under test
+        resync_every = 10
+        self_test = False
+
+    def _target(self, cursor, emitter):
+        t = km.WatchTarget.__new__(km.WatchTarget)
+        t.persona, t.url, t.headers = "argus", "http://x/api/inbox?persona=argus", {}
+        t.opener, t.emitter, t.args = None, emitter, self.FullArgs()
+        t.cursor, t.armed, t.fsm_state, t.failures = cursor, True, "UP", 0
+        t.state_file = t.last_unread = None
+        t.fast_path = False
+        t.skips = t.first_poll = 0
+        t.last_heartbeat = km._monotonic()
+        t.count_url, t.unread_persona = km.NOTIFY_PENDING_URL, "argus"
+        return t
+
+    def test_mail_hidden_by_a_truncated_window_is_recovered_and_the_gap_is_announced(self):
+        em = self.RecordingEmitter()
+        t = self._target(cursor=1100, emitter=em)
+
+        # Server drops the 2 OLDEST and returns a window starting ABOVE our cursor. 1105 and 1150 are
+        # real mail addressed to us that the window hid; unread-only reconciliation can still see them.
+        def fake_fetch(opener, url, headers):
+            if "unread_only=true" in url:
+                return km.Poll(True, items=[{"id": 1105}, {"id": 1150}], omitted=0)
+            return km.Poll(True, items=[{"id": 1200}, {"id": 1260}], omitted=2)
+
+        orig, km.fetch = km.fetch, fake_fetch
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+
+        # 1. the hidden messages were emitted, not skipped
+        self.assertEqual(em.new_ids, [1105, 1150, 1200, 1260])
+        # 2. the gap was announced loudly rather than swallowed
+        alerts = [f for (e, f) in em.events if e == "alert"]
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["omitted"], 2)
+        self.assertEqual(alerts[0]["window_floor"], 1200)
+        self.assertEqual(alerts[0]["cursor_at"], 1100)
+        self.assertEqual(alerts[0]["reconciled"], 2)
+        # 3. cursor advanced only after the hidden mail was accounted for
+        self.assertEqual(t.cursor, 1260)
+
+    def test_steady_state_truncation_is_silent_and_changes_nothing(self):
+        # The common case: window reaches back past the cursor, so the drops are already-emitted mail.
+        # This must NOT alert, or the alarm fires on every poll and gets ignored.
+        em = self.RecordingEmitter()
+        t = self._target(cursor=1135, emitter=em)
+        orig, km.fetch = km.fetch, lambda o, u, h: km.Poll(
+            True, items=[{"id": 1101}, {"id": 1140}], omitted=15)
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertEqual(em.new_ids, [1140])
+        self.assertEqual([e for (e, f) in em.events if e == "alert"], [])
+        self.assertEqual(t.cursor, 1140)
+
+    def test_unrecoverable_gap_still_alerts_with_the_shortfall(self):
+        # Reconciliation itself truncates or fails: we cannot close the gap, so it MUST be announced.
+        em = self.RecordingEmitter()
+        t = self._target(cursor=1100, emitter=em)
+
+        def fake_fetch(opener, url, headers):
+            if "unread_only=true" in url:
+                return km.Poll(False, reason="http 502")
+            return km.Poll(True, items=[{"id": 1200}], omitted=4)
+
+        orig, km.fetch = km.fetch, fake_fetch
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        alerts = [f for (e, f) in em.events if e == "alert"]
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["reconciled"], 0)
+        self.assertIn("may never have been delivered", alerts[0]["reason"])
+
+
 class StrandedInboxTest(unittest.TestCase):
     class FakeTarget:
         def __init__(self, persona):
