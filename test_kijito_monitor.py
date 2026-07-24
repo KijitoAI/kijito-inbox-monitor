@@ -580,6 +580,57 @@ class BoundedWindowEndToEndTest(unittest.TestCase):
         self.assertIn("may never have been delivered", alerts[0]["reason"])
 
 
+class OwnershipSignalTest(unittest.TestCase):
+    """Directory membership stopped being sufficient once the directory listed every recipient."""
+
+    def setUp(self):
+        self._orig = dict(km._PERSONA_MEMORY_COUNTS)
+        km._PERSONA_MEMORY_COUNTS.clear()
+
+    def tearDown(self):
+        km._PERSONA_MEMORY_COUNTS.clear()
+        km._PERSONA_MEMORY_COUNTS.update(self._orig)
+
+    def test_memory_count_is_read_from_the_top_level_field(self):
+        self.assertEqual(km._row_memory_count({"persona": "x", "memory_count": 148}), 148)
+        self.assertEqual(km._row_memory_count({"persona": "x", "memory_count": 0}), 0)
+
+    def test_absent_memory_count_is_None_not_zero(self):
+        # None means "server didn't say" and must never be read as "owns nothing".
+        self.assertIsNone(km._row_memory_count({"persona": "x"}))
+        self.assertIsNone(km._row_memory_count({"persona": "x", "memory_count": "many"}))
+
+    def test_project_counts_are_NOT_summed_as_a_fallback(self):
+        # Live: maestro sums to 0 across projects but owns 61 memories, because global-scoped memories
+        # carry no project. Summing that field would flag half the fleet as unowned.
+        row = {"persona": "maestro", "projects": [], "memory_count": 61}
+        self.assertEqual(km._row_memory_count(row), 61)
+
+    def test_a_registered_recipient_owning_no_memories_is_stranded(self):
+        # The post-unification case: it IS in the directory, so absence can never catch it.
+        km._PERSONA_MEMORY_COUNTS.update({"all": 0, "argus": 94})
+        self.assertEqual(km.stranded_inboxes(["all", "argus"], {"all": 2, "argus": 1}), ["all"])
+
+    def test_a_persona_that_owns_memories_is_never_stranded(self):
+        km._PERSONA_MEMORY_COUNTS.update({"vellum": 129})
+        self.assertEqual(km.stranded_inboxes(["vellum"], {"vellum": 6}), [])
+
+    def test_unknown_memory_count_degrades_to_directory_membership_only(self):
+        # Older server with no memory_count: the second signal stays quiet rather than guessing.
+        km._PERSONA_MEMORY_COUNTS.update({"someone": None})
+        self.assertEqual(km.stranded_inboxes(["someone"], {"someone": 3}), [])
+
+    def test_absence_from_the_directory_still_wins_on_its_own(self):
+        km._PERSONA_MEMORY_COUNTS.update({"argus": 94})
+        self.assertEqual(km.stranded_inboxes(["argus"], {"argus": 1, "ghost": 1}), ["ghost"])
+
+    def test_ownership_case_is_diagnosed_distinctly_from_a_case_variant(self):
+        km._PERSONA_MEMORY_COUNTS.update({"all": 0})
+        d = km._stranded_detail("all", ["all", "argus"], {"all": 2})
+        self.assertIn("owns no memories", d)
+        self.assertNotIn("case-variant", d)
+
+
 class StrandedInboxTest(unittest.TestCase):
     class FakeTarget:
         def __init__(self, persona):
