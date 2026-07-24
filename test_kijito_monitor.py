@@ -502,6 +502,38 @@ class StrandedInboxTest(unittest.TestCase):
         self.assertEqual(sorted(events[0]["stranded_inboxes"]), ["all", "ghost", "typo"])
 
 
+class ExecEnvTest(unittest.TestCase):
+    """--exec is the portable primitive, so every field the NDJSON carries must reach a shell consumer."""
+
+    def _env_for(self, event):
+        captured = {}
+        orig = km.subprocess.run
+        km.subprocess.run = lambda *a, **k: captured.update(k.get("env") or {})
+        try:
+            km.Emitter("exec-per-event", "true", 220, False).emit(event)
+        finally:
+            km.subprocess.run = orig
+        return captured
+
+    def test_stranded_list_reaches_exec_comma_separated_not_as_a_python_repr(self):
+        env = self._env_for({"event": "alert", "source": "kijito-inbox", "ts": "t", "persona": "argus",
+                             "reason": "stranded-mail: ...", "stranded_inboxes": ["Claude-chat", "all"]})
+        self.assertEqual(env["KIJITOMON_STRANDED"], "Claude-chat,all")
+        self.assertNotIn("[", env["KIJITOMON_STRANDED"])   # "['Claude-chat', 'all']" is unusable in $VAR
+
+    def test_absent_fields_are_simply_omitted_not_defaulted_or_fatal(self):
+        env = self._env_for({"event": "alert", "source": "kijito-inbox", "ts": "t", "persona": "argus",
+                             "reason": "stranded-mail: ...", "stranded_inboxes": ["all"]})
+        self.assertNotIn("KIJITOMON_FAILURES", env)   # a stranded alert is not a reachability failure
+        self.assertNotIn("KIJITOMON_ID", env)         # and carries no message id
+
+    def test_scalar_fields_are_unaffected_by_the_list_handling(self):
+        env = self._env_for({"event": "new", "source": "kijito-inbox", "ts": "t",
+                             "id": 41, "from": "river", "persona": "argus"})
+        self.assertEqual(env["KIJITOMON_ID"], "41")
+        self.assertEqual(env["KIJITOMON_FROM"], "river")
+
+
 class WarnOncePerPersonaTest(unittest.TestCase):
     def setUp(self):
         self._orig = set(km._WARNED_PERSONAS)

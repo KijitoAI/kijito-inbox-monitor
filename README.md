@@ -197,7 +197,7 @@ Each line of the events file (and each `exec-per-event` invocation) is one event
 |---------|---------|----------------------|
 | `armed` | emitted once per persona on the first healthy poll (baseline set) | `KIJITOMON_CURSOR` |
 | `new` | a new inbox message | `KIJITOMON_ID`, `KIJITOMON_FROM`, `KIJITOMON_CONTENT`, `KIJITOMON_CREATED`, `KIJITOMON_PERSONA` |
-| `alert` | the source has been unreachable for `--alert-after` polls (dead-man) | `KIJITOMON_REASON`, `KIJITOMON_FAILURES` |
+| `alert` | the source has been unreachable for `--alert-after` polls (dead-man), **or** mail is stranded in an inbox nobody watches (see below) | `KIJITOMON_REASON`, `KIJITOMON_FAILURES`, `KIJITOMON_STRANDED` |
 | `recovered` | the source came back after an `alert` | `KIJITOMON_CURSOR` |
 | `heartbeat` | optional liveness tick (`--heartbeat N`) | `KIJITOMON_CURSOR` |
 
@@ -207,6 +207,39 @@ Every event also carries `KIJITOMON_EVENT`, `KIJITOMON_SOURCE`, `KIJITOMON_TS`, 
 like `grep '"event": "new"'` matches.
 The watcher peeks (never marks your mail read) and dedupes by the monotonic message id, so you get each message
 exactly once across restarts.
+
+### Stranded mail
+
+The watcher also alarms on mail sitting in an inbox that is **not a known persona** - an inbox that is
+*receiving* while nothing consumes it. Such mail is undeliverable and nothing else reports it: the sender gets a
+success and a message id, the recipient gets no signal, and there is no bounce. Two real cases prompted this: a
+case-variant of a live persona (`Claude-chat` vs `claude-chat`), whose reply sat unread for fourteen days; and a
+group-looking name (`all`) that has no broadcast semantics behind it, which swallowed an announcement meant for
+everyone.
+
+It is found by diffing the persona **directory** (`/api/personas`) against the **inbox** namespace
+(`/api/notify/pending`). Both are already fetched, so the check costs no extra request. It is reported once per
+inbox per process - to stderr, and as one `alert` summarising the whole backlog:
+
+```json
+{"event": "alert", "source": "kijito-inbox", "persona": "you",
+ "reason": "stranded-mail: 1 inbox(es) receiving mail nobody watches: Claude-chat (1 unread; case-variant of known persona 'claude-chat')",
+ "stranded_inboxes": ["Claude-chat"]}
+```
+
+Three details matter if you consume these:
+
+- It is an **`alert`, not a new event name**, so a consumer already filtering `new|alert|recovered` surfaces it
+  without being rearmed. If you parse `alert` strictly, note it carries an extra `stranded_inboxes` field and **no
+  message id**. On `--exec` the same list arrives comma-separated as `$KIJITOMON_STRANDED`, and
+  `$KIJITOMON_FAILURES` is absent (this alert is not a reachability failure).
+- It is delivered **only to real directory personas**. A stranded inbox has mail, so the watcher gives it a target
+  and a stream of its own - alerting every target would write the alarm into the very stream nobody reads.
+- It **clears when the mail is consumed**, not when someone acknowledges it. There is no ack, by design: an ack
+  lets you silence the flag while the mail stays unread, which is how dead-letter queues rot.
+
+Disable with `--no-stranded-alerts` if you keep deliberate test inboxes. Prefer draining them instead - an alarm
+you have trained everyone to ignore is one that has been disabled without anyone deciding to disable it.
 
 ## CLI
 
@@ -229,6 +262,7 @@ exactly once across restarts.
 | `--max-bytes N` / `--keep-logs N` | Rotate event files at N bytes (default 5000000; `<=0` disables) keeping N archives (default 5). |
 | `--seed-at ID` / `--max-replay N` | Seed the cursor at a last-handled id (single persona) / cap a re-arm backlog before fast-forwarding (default 50). |
 | `--rediscover-every N` | In all-persona mode, re-scan for new personas every N seconds (default 600). |
+| `--no-stranded-alerts` | Don't alarm on mail sitting in an inbox that isn't a known persona (see [Stranded mail](#stranded-mail)). On by default, because such mail is undeliverable and nothing else reports it. |
 | `--auth-header NAME` / `--token-file PATH` | Auth header name (default `Authorization: Bearer`) / token file. Token also via `$KIJITOMON_TOKEN`. A token is required. |
 | `--no-fast-path` | Disable the `/api/notify/pending` pre-check; always full-poll the inbox list. |
 | `--resync-every N` | Fast-path safety floor: force a full inbox poll after at most N cheap skips (default 10), so a stale unread count can never blind the watcher. |
