@@ -592,14 +592,41 @@ def _state_path_for_persona(base_path, persona):
         return base_path
     root, ext = os.path.splitext(base_path)
     safe = _state_safe_persona(persona)
-    base = os.path.basename(root)
+    base = os.path.basename(root).casefold()
     if base == safe or base.endswith("." + safe):
         return base_path
     return root + "." + safe + (ext or ".json")
 
 
 def _state_safe_persona(persona):
-    return "".join(c if (c.isalnum() or c in "._-") else "_" for c in persona)
+    """Map a persona to a filename component - CASEFOLDED, deliberately.
+
+    macOS (APFS) and Windows are case-INSENSITIVE, so 'Claude-chat' and 'claude-chat' name the SAME
+    file. Deriving the path from the raw name made the producer block on its OWN flock every tick for
+    a case-variant persona, and left that persona with no event stream at all - a SILENT wake gap,
+    which is the exact failure this tool exists to prevent. Matching case-insensitively here is the
+    filesystem half of the fix; the persona's ORIGINAL case is preserved for the API (persona_url),
+    i.e. case-insensitive match, case-preserving display.
+    """
+    return "".join(c if (c.isalnum() or c in "._-") else "_" for c in persona.casefold())
+
+
+_WARNED_PERSONAS = set()
+
+
+def _warn_persona_once(persona, text):
+    """Emit a per-persona warning at most ONCE per process.
+
+    Persona discovery runs every tick, so a condition that cannot resolve itself (a state file held by
+    another watcher, an unusable path) otherwise grows stderr without bound: one observed 3-day run had
+    20,079 of 20,129 stderr lines from a single repeated warning, which buries every other diagnostic.
+    """
+    key = persona.casefold()
+    if key in _WARNED_PERSONAS:
+        return
+    _WARNED_PERSONAS.add(key)
+    sys.stderr.write("kijito-inbox-monitor: WARNING %s (further warnings for %r suppressed)\n"
+                     % (text, persona))
 
 
 def requested_personas(args, opener, headers):
@@ -623,8 +650,17 @@ def watches_all_personas(args):
 
 
 def new_personas(existing, discovered):
-    seen = set(existing)
-    return [p for p in discovered if p not in seen]
+    # Case-INSENSITIVE: a case-variant of a persona we already watch is the SAME inbox and (on a
+    # case-insensitive filesystem) the same state file - adopting it again self-deadlocks. Also
+    # collapses variants within `discovered`, keeping the first spelling seen.
+    seen = {p.casefold() for p in existing}
+    out = []
+    for p in discovered:
+        key = p.casefold()
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
 
 
 class WatchTarget:
@@ -804,7 +840,7 @@ def discover_persona_targets(args, headers, emitter, targets, opener_by_origin, 
         try:
             target = build_persona_target(persona, opener_by_origin, headers, args, emitter)
         except FatalConfig as e:
-            sys.stderr.write("kijito-inbox-monitor: WARNING cannot add persona %r: %s\n" % (persona, e))
+            _warn_persona_once(persona, "cannot add persona %r: %s" % (persona, e))
             continue
         targets.append(target)
         added.append(persona)
@@ -820,19 +856,21 @@ def discover_from_counts(args, counts, targets, opener_by_origin, headers, emitt
     mode; an explicit --persona/--personas subset stays fixed."""
     if not watches_all_personas(args):
         return []
-    current = {t.persona for t in targets if t.persona}
+    # Case-INSENSITIVE membership: see new_personas(). The counts come from the INBOX namespace, which
+    # can legitimately hold a name the persona DIRECTORY does not (that divergence is what stranded mail
+    # in the first place), so this is the path where case-variants actually show up.
+    current = {t.persona.casefold() for t in targets if t.persona}
     added = []
     for persona in counts:
-        if persona and persona not in current:
+        if persona and persona.casefold() not in current:
             try:
                 target = build_persona_target(persona, opener_by_origin, headers, args, emitter)
             except FatalConfig as e:
-                sys.stderr.write("kijito-inbox-monitor: WARNING cannot add persona %r from counts: %s\n"
-                                 % (persona, e))
+                _warn_persona_once(persona, "cannot add persona %r from counts: %s" % (persona, e))
                 continue
             targets.append(target)
             added.append(persona)
-            current.add(persona)
+            current.add(persona.casefold())
             target.lifecycle("persona_added")
     return added
 
