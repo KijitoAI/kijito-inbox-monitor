@@ -233,8 +233,11 @@ case-variant of a live persona (`Claude-chat` vs `claude-chat`), whose reply sat
 group-looking name (`all`) that has no broadcast semantics behind it, which swallowed an announcement meant for
 everyone.
 
-It is found by diffing the persona **directory** (`/api/personas`) against the **inbox** namespace
-(`/api/notify/pending`). Both are already fetched, so the check costs no extra request. It is reported once per
+An inbox counts as stranded when it holds mail and **either** the persona directory (`/api/personas`) does
+not list it, **or** it owns zero memories - nothing has ever written as that persona, so nobody is working
+under it. The second test matters because a directory built as a union of registered *recipients* lists
+every typo the moment someone sends to it, which would make the first test unable to fire. Both signals
+come from endpoints the watcher already fetches, so the check costs no extra request. It is reported once per
 inbox per process - to stderr, and as one `alert` summarising the whole backlog:
 
 ```json

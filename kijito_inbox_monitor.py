@@ -188,6 +188,25 @@ def _declared_omissions(data):
     return n
 
 
+# Memory count per persona, refreshed on every directory fetch. Used by the stranded-mail check to ask
+# "does anyone actually OWN this inbox", which survives a directory that lists every registered recipient.
+# None (not 0) means the server did not report a count, so the check must not infer anything from it.
+_PERSONA_MEMORY_COUNTS = {}
+
+
+def _row_memory_count(row):
+    """Memories owned by this persona, or None if the server did not say.
+
+    Prefers the top-level `memory_count`. Deliberately does NOT fall back to summing `projects[].count`:
+    project counts exclude GLOBAL-scoped memories, so a persona whose memories are all global sums to
+    zero and looks unowned. Measured live: maestro sums to 0 across projects but owns 61 memories; the
+    same gap exists for codex, ladybug, leadgen, omniview, quill, sterling and vellum. Summing the wrong
+    field would have made the alarm cry wolf about half the fleet.
+    """
+    n = row.get("memory_count")
+    return n if isinstance(n, int) and n >= 0 else None
+
+
 def fetch_personas(opener, headers):
     """Fetch the account persona directory for default/explicit all-persona mode."""
     req = urllib.request.Request(PERSONAS_URL, headers=headers, method="GET")
@@ -207,6 +226,7 @@ def fetch_personas(opener, headers):
     for row in rows:
         if isinstance(row, dict) and isinstance(row.get("persona"), str) and row["persona"]:
             personas.append(row["persona"])
+            _PERSONA_MEMORY_COUNTS[row["persona"]] = _row_memory_count(row)
     if not personas:
         raise FatalConfig("/api/personas returned no personas")
     return personas
@@ -986,9 +1006,28 @@ def stranded_inboxes(directory, counts):
     is case-INSENSITIVE and cannot hold two state files for the two names, so the watcher can never adopt
     the variant. The rules are complementary rather than contradictory - the variant is unwatchable
     locally AND unwatched remotely, which is exactly why it has to be alarmed on instead of adopted.
+
+    TWO SIGNALS, because directory membership alone stopped being sufficient. A server may build its
+    directory as a UNION that includes every registered RECIPIENT - and a recipient is registered the
+    moment anyone sends to that name, typo included. On such a server every future phantom is "in the
+    directory" instantly and absence can never fire again. So an inbox also counts as stranded when it
+    holds mail while owning ZERO memories: nothing has ever written as that persona, so nobody is
+    working under it. That tracks the real invariant - whether a CONSUMER exists - rather than a proxy
+    for it. Where the server reports no memory counts at all the second signal simply stays quiet, so
+    this degrades to the original behaviour instead of guessing.
     """
     known = {p for p in directory if p}
-    return [p for p in sorted(counts) if p and counts.get(p) and p not in known]
+    out = []
+    for p in sorted(counts):
+        if not p or not counts.get(p):
+            continue
+        if p not in known:
+            out.append(p)
+            continue
+        owned = _PERSONA_MEMORY_COUNTS.get(p)
+        if owned == 0:
+            out.append(p)
+    return out
 
 
 def _stranded_detail(persona, directory, counts):
@@ -1001,6 +1040,9 @@ def _stranded_detail(persona, directory, counts):
                  if d and d != persona and d.casefold() == persona.casefold()), None)
     if twin is not None:
         return "%s (%s unread; case-variant of known persona %r)" % (persona, counts.get(persona), twin)
+    if persona in set(directory) and _PERSONA_MEMORY_COUNTS.get(persona) == 0:
+        return "%s (%s unread; registered as a recipient but owns no memories, so nobody works as it)" % (
+            persona, counts.get(persona))
     return "%s (%s unread)" % (persona, counts.get(persona))
 
 

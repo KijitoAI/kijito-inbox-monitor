@@ -5,6 +5,24 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+### Changed
+- **The stranded-mail check now asks whether anyone OWNS an inbox, not just whether the directory lists
+  it.** Directory membership was a sound proxy for "nobody consumes this" only while the directory was
+  derived from authorship. A server may instead build it as a union that includes every registered
+  *recipient* - and a recipient is registered the moment anyone sends to that name, typo included - which
+  makes every future phantom "known" instantly and the absence signal unable to fire at all.
+
+  So an inbox is now also flagged when it holds mail while owning **zero memories**: nothing has ever
+  written as that persona, so nobody is working under it. That tracks the actual invariant - whether a
+  consumer exists - instead of a proxy for it. The original absence signal is kept, so a name missing from
+  the directory still fires on its own, and where a server reports no memory counts the new signal stays
+  quiet rather than guessing.
+
+  Ownership is read from the top-level `memory_count`, deliberately **not** by summing `projects[].count`:
+  project counts exclude global-scoped memories, so a persona whose memories are all global sums to zero
+  and looks unowned. Measured against a live account, that mistake would have flagged eight of nine
+  active personas.
+
 ### Fixed
 - **A bounded inbox window could permanently skip mail** (reported by Loom against 0.3.0). The inbox
   endpoint returns the **newest** messages that fit a count limit *and* an aggregate content budget, and
