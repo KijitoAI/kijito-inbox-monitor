@@ -5,6 +5,25 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+### Added
+- **Stranded-mail alarm.** The watcher now reports mail sitting in an inbox that is not a known persona,
+  i.e. an inbox that is *receiving* while nothing consumes it. Such mail is undeliverable and nothing
+  else reports it: the sender gets a success and a message id, the recipient gets no signal, and there is
+  no bounce. Two real cases prompted this - a case-variant of a live persona (a substantive reply sat
+  unread for 14 days), and a group-looking name (`all`) that has no broadcast semantics behind it, which
+  swallowed a fleet-wide announcement for 4 days.
+  Detected by diffing the persona **directory** (`/api/personas`) against the **inbox** namespace
+  (`/api/notify/pending`), both of which are already fetched, so the check costs no extra request.
+  Reported once per inbox per process, to stderr and as an `alert` event summarising the whole backlog
+  into one event per watcher. A case-variant is diagnosed as such, naming its twin. Disable with
+  `--no-stranded-alerts` if you keep deliberate test inboxes.
+
+  Two routing rules are load-bearing and easy to get wrong: the alarm is an `alert` rather than a new
+  event name, so consumers already filtering `new|alert|recovered` surface it without being rearmed; and
+  it is routed only to watchers backed by a real directory persona, because a stranded inbox has mail and
+  therefore acquires a watch target and stream of its own - alerting every target would write the alarm
+  into the very stream nobody reads. Producing an event is not delivering it.
+
 ### Fixed
 - **Case-variant personas no longer self-deadlock the watcher (silent wake gap).** A persona name was
   mapped to its state file verbatim, but macOS (APFS) and Windows are case-**insensitive**, so

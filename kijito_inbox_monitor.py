@@ -836,6 +836,8 @@ def discover_persona_targets(args, headers, emitter, targets, opener_by_origin, 
     current = [t.persona for t in targets if t.persona]
     discovered = fetch_personas(directory_opener, headers)
     added = []
+    # `discovered` is returned as well as used: it is the DIRECTORY namespace, which the stranded-mail
+    # check diffs the inbox namespace against. Fetched here already, so the check costs no extra request.
     for persona in new_personas(current, discovered):
         try:
             target = build_persona_target(persona, opener_by_origin, headers, args, emitter)
@@ -845,7 +847,7 @@ def discover_persona_targets(args, headers, emitter, targets, opener_by_origin, 
         targets.append(target)
         added.append(persona)
         target.lifecycle("persona_added")
-    return added
+    return added, discovered
 
 
 def discover_from_counts(args, counts, targets, opener_by_origin, headers, emitter):
@@ -875,6 +877,79 @@ def discover_from_counts(args, counts, targets, opener_by_origin, headers, emitt
     return added
 
 
+_REPORTED_STRANDED = set()
+
+
+def stranded_inboxes(directory, counts):
+    """Inboxes holding unread mail that the persona DIRECTORY does not know about.
+
+    Two namespaces exist and are populated by different paths: the DIRECTORY (who exists) and the INBOX
+    (who can receive). When they diverge, mail lands in an inbox that nobody owns and nothing watches -
+    it is never delivered, and nothing reports it, so the sender sees success and the recipient sees
+    nothing. Both cases observed in the wild had this shape: a case-variant of a live persona, and a
+    group-looking name ('all') with no broadcast semantics behind it. One held a substantive reply for
+    14 days before anyone noticed.
+
+    Compared EXACTLY, deliberately NOT casefolded. The SERVER's inbox namespace is case-SENSITIVE -
+    verified: the 'Claude-chat' inbox held a different message set from 'claude-chat' - so a case-variant
+    is a real, DISTINCT inbox holding real mail, and casefolding here would hide the very incident this
+    check exists to catch.
+
+    Note the deliberate asymmetry with _state_safe_persona(), which DOES casefold: the local filesystem
+    is case-INSENSITIVE and cannot hold two state files for the two names, so the watcher can never adopt
+    the variant. The rules are complementary rather than contradictory - the variant is unwatchable
+    locally AND unwatched remotely, which is exactly why it has to be alarmed on instead of adopted.
+    """
+    known = {p for p in directory if p}
+    return [p for p in sorted(counts) if p and counts.get(p) and p not in known]
+
+
+def _stranded_detail(persona, directory, counts):
+    """Describe one stranded inbox, naming its twin when it is a case-variant.
+
+    'case-variant of known persona X' is a far more actionable diagnosis than 'unknown inbox': it tells
+    the operator the mail was meant for a real person and how it went astray.
+    """
+    twin = next((d for d in sorted(directory)
+                 if d and d != persona and d.casefold() == persona.casefold()), None)
+    if twin is not None:
+        return "%s (%s unread; case-variant of known persona %r)" % (persona, counts.get(persona), twin)
+    return "%s (%s unread)" % (persona, counts.get(persona))
+
+
+def report_stranded_inboxes(directory, counts, targets, emitter):
+    """Alarm on undelivered mail: an inbox RECEIVING while nobody owns or watches it.
+
+    Reported at most once per inbox per process, and summarised into ONE event per watcher rather than
+    one per (watcher, inbox), so discovering a backlog cannot turn into a wake storm.
+
+    Routed ONLY to watchers backed by a real DIRECTORY persona. This is not a formality: a stranded inbox
+    holds mail, so discover_from_counts() gives it a watch target and an event stream of its own - and
+    routing the alarm to every target would therefore write it straight into the unconsumed stream whose
+    unconsumed-ness is the fault being reported. Producing an event there is not delivering it.
+
+    The event is an `alert` (not a new event name) so consumers already filtering new|alert|recovered
+    surface it without being rearmed; a fresh event name would itself have gone unwatched.
+    """
+    if not directory:
+        return []   # unknown directory: alarming would flag EVERY persona. No data is not evidence of a fault.
+    fresh = [p for p in stranded_inboxes(directory, counts) if p.casefold() not in _REPORTED_STRANDED]
+    if not fresh:
+        return []
+    for persona in fresh:
+        _REPORTED_STRANDED.add(persona.casefold())
+        sys.stderr.write(
+            "kijito-inbox-monitor: ALERT stranded mail - %s is not a known persona, so no agent consumes its "
+            "mail (further reports for %r suppressed)\n" % (_stranded_detail(persona, directory, counts), persona))
+    detail = ", ".join(_stranded_detail(p, directory, counts) for p in fresh)
+    known = {p for p in directory if p}
+    for watcher in sorted({t.persona for t in targets if t.persona and t.persona in known}):
+        emitter.lifecycle("alert", persona=watcher,
+                          reason="stranded-mail: %d inbox(es) receiving mail nobody watches: %s" % (len(fresh), detail),
+                          stranded_inboxes=list(fresh))
+    return fresh
+
+
 def run(args):
     headers = build_headers(args)
     sink = None
@@ -894,6 +969,10 @@ def run(args):
     if not personas:
         raise FatalConfig("at least one persona is required")
     targets = [build_persona_target(p, opener_by_origin, headers, args, emitter) for p in personas]
+    # The DIRECTORY namespace, kept separate from `targets` on purpose: targets also accumulate personas
+    # discovered from the inbox counts, so diffing against targets would silently absorb the very phantom
+    # inboxes the stranded-mail check exists to find.
+    directory_personas = list(personas) if watches_all_personas(args) else []
 
     # ---- self-test (§7.2): run once, exit -------------------------------------------------------------------------
     if args.self_test:
@@ -912,7 +991,10 @@ def run(args):
         seam.drain()  # read-and-clear at START of poll (§10)
         if watches_all_personas(args) and directory_opener is not None and _monotonic() >= rediscover_at:
             try:
-                discover_persona_targets(args, headers, emitter, targets, opener_by_origin, directory_opener)
+                _, discovered = discover_persona_targets(
+                    args, headers, emitter, targets, opener_by_origin, directory_opener)
+                if discovered:
+                    directory_personas = discovered
             except FatalConfig as e:
                 sys.stderr.write("kijito-inbox-monitor: WARNING persona rediscovery failed: %s\n" % e)
             rediscover_at = _monotonic() + args.rediscover_every
@@ -941,6 +1023,8 @@ def run(args):
 
         if counts_available:
             discover_from_counts(args, unread_counts, targets, opener_by_origin, headers, emitter)
+            if not args.no_stranded_alerts:
+                report_stranded_inboxes(directory_personas, unread_counts, targets, emitter)
         for target in targets:
             target.poll_once(counts_available, unread_counts)
         if seam.stop:
@@ -969,6 +1053,10 @@ def build_parser():
                    help="Comma-separated personas to watch, e.g. codex,river,ladybug.")
     p.add_argument("--all-personas", action="store_true",
                    help="Watch every persona in your Kijito account (default).")
+    p.add_argument("--no-stranded-alerts", action="store_true",
+                   help="do not alarm on mail sitting in an inbox that is not a known persona. Off by "
+                        "default because such mail is UNDELIVERABLE and nothing else reports it; set this "
+                        "only if you keep deliberate test inboxes and expect the alarm.")
     p.add_argument("--rediscover-every", type=int, default=600,
                    help="In all-persona mode, re-scan your account every N seconds and add newly-created personas "
                         "(default 600, min 1). Explicit persona subsets are not expanded.")
