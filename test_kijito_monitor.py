@@ -57,6 +57,18 @@ class MultiPersonaHelpersTest(unittest.TestCase):
         self.assertEqual(km._state_path_for_persona("/tmp/hive.json", "team/person"),
                          "/tmp/hive.team_person.json")
 
+    def test_state_path_casefolds_so_variants_cannot_collide_on_a_case_insensitive_fs(self):
+        # On APFS/NTFS 'hive.Claude-chat.json' and 'hive.claude-chat.json' are the SAME file, so the
+        # producer used to block on its own flock adopting the variant. One name -> one path.
+        self.assertEqual(km._state_path_for_persona("/tmp/hive.json", "Claude-chat"),
+                         km._state_path_for_persona("/tmp/hive.json", "claude-chat"))
+        self.assertEqual(km._state_path_for_persona("/tmp/hive.json", "Claude-chat"),
+                         "/tmp/hive.claude-chat.json")
+
+    def test_state_path_idempotency_survives_a_case_variant_base(self):
+        self.assertEqual(km._state_path_for_persona("/tmp/hive.Claude-chat.json", "Claude-chat"),
+                         "/tmp/hive.Claude-chat.json")
+
     def test_requested_personas_dedupes_and_strips(self):
         args = Args(persona=[" codex ", ""], personas=["argus, river", "codex"])
         self.assertEqual(km.requested_personas(args, None, {}), ["codex", "argus", "river"])
@@ -75,6 +87,12 @@ class MultiPersonaHelpersTest(unittest.TestCase):
     def test_new_personas_preserves_discovered_order_and_never_drops(self):
         self.assertEqual(km.new_personas(["codex", "argus"], ["argus", "river", "codex", "ladybug"]),
                          ["river", "ladybug"])
+
+    def test_new_personas_treats_a_case_variant_as_already_watched(self):
+        self.assertEqual(km.new_personas(["claude-chat"], ["Claude-chat", "river"]), ["river"])
+
+    def test_new_personas_collapses_case_variants_within_one_batch(self):
+        self.assertEqual(km.new_personas([], ["Claude-chat", "claude-chat"]), ["Claude-chat"])
 
     def test_fetch_unread_counts_maps_persona_counts_and_absence_is_implicit_zero(self):
         opener = FakeOpener(FakeResponse(200, {
@@ -356,6 +374,61 @@ class DiscoverFromCountsTest(unittest.TestCase):
         self.assertEqual(added, [])
         self.assertEqual(made, [])
         self.assertEqual({t.persona for t in targets}, {"argus"})
+
+    def test_case_variant_in_counts_is_not_readopted(self):
+        # THE REGRESSION TEST. The inbox namespace held both 'claude-chat' and 'Claude-chat'; adopting
+        # the variant tried to lock a state file the producer itself already held (same inode on a
+        # case-insensitive FS) and warned on EVERY tick - 20,079 lines in one 3-day run.
+        made = []
+        self._patch_builder(made)
+        targets = [self.FakeTarget("claude-chat")]
+        added = km.discover_from_counts(Args(), {"claude-chat": 9, "Claude-chat": 1}, targets, {}, {}, None)
+        self.assertEqual(added, [])
+        self.assertEqual(made, [])
+        self.assertEqual({t.persona for t in targets}, {"claude-chat"})
+
+    def test_a_genuinely_new_uppercase_persona_is_still_adopted_with_its_case_preserved(self):
+        # Case-insensitive MATCHING must not become case-mangling: the name still goes to the API as sent.
+        made = []
+        self._patch_builder(made)
+        targets = [self.FakeTarget("argus")]
+        added = km.discover_from_counts(Args(), {"Vellum": 2}, targets, {}, {}, None)
+        self.assertEqual(added, ["Vellum"])
+        self.assertEqual(made, ["Vellum"])
+
+
+class WarnOncePerPersonaTest(unittest.TestCase):
+    def setUp(self):
+        self._orig = set(km._WARNED_PERSONAS)
+        km._WARNED_PERSONAS.clear()
+
+    def tearDown(self):
+        km._WARNED_PERSONAS.clear()
+        km._WARNED_PERSONAS.update(self._orig)
+
+    def _capture(self, fn):
+        import io
+        buf, orig = io.StringIO(), km.sys.stderr
+        km.sys.stderr = buf
+        try:
+            fn()
+        finally:
+            km.sys.stderr = orig
+        return buf.getvalue()
+
+    def test_repeat_warnings_for_one_persona_are_suppressed_after_the_first(self):
+        out = self._capture(lambda: [km._warn_persona_once("ghost", "cannot add persona 'ghost': locked")
+                                     for _ in range(50)])
+        self.assertEqual(out.count("cannot add persona"), 1)
+        self.assertIn("further warnings", out)
+
+    def test_suppression_is_case_insensitive_and_per_persona(self):
+        def emit():
+            km._warn_persona_once("Ghost", "boom")
+            km._warn_persona_once("ghost", "boom")   # same persona, different case -> suppressed
+            km._warn_persona_once("other", "boom")   # distinct persona -> still warns
+        out = self._capture(emit)
+        self.assertEqual(out.count("boom"), 2)
 
 
 class WaitValidationTest(unittest.TestCase):

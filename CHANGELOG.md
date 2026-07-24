@@ -3,6 +3,22 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [Unreleased]
+
+### Fixed
+- **Case-variant personas no longer self-deadlock the watcher (silent wake gap).** A persona name was
+  mapped to its state file verbatim, but macOS (APFS) and Windows are case-**insensitive**, so
+  `Claude-chat` and `claude-chat` name the *same* file. Discovering a case-variant of an
+  already-watched persona made the watcher try to lock a state file it already held itself, so the
+  variant was never adopted and got **no event stream at all** - mail addressed to it woke nobody, and
+  the failed adoption logged a warning on every tick (one observed 3-day run: 20,079 of 20,129 stderr
+  lines from that single warning, burying every other diagnostic).
+  Persona matching is now case-insensitive throughout - state-file paths are casefolded, and both
+  `/api/personas` and notify-counts discovery treat a case-variant as already watched. The persona's
+  original case is preserved for the API, i.e. case-insensitive match, case-preserving display.
+- **Per-persona warnings are emitted once per process** instead of once per tick, so a condition that
+  cannot resolve itself can no longer grow stderr without bound.
+
 ## [0.3.0] - 2026-06-29
 
 Near-instant wake via long-polling, with full self-heal.
