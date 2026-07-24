@@ -385,10 +385,14 @@ class Emitter:
                 "reason": "KIJITOMON_REASON", "consecutive_failures": "KIJITOMON_FAILURES",
                 "seeded": "KIJITOMON_SEEDED", "current_max": "KIJITOMON_CURRENT_MAX",
                 "capped_to": "KIJITOMON_CAPPED_TO", "dropped": "KIJITOMON_DROPPED",
+                "stranded_inboxes": "KIJITOMON_STRANDED",
             }
             for k, envname in keymap.items():
                 if k in event and event[k] is not None:
-                    env[envname] = str(event[k])
+                    v = event[k]
+                    # A list is comma-joined, not str()'d: a Python repr ("['a', 'b']") is unusable from a
+                    # shell consumer, and exec-per-event is the portable primitive people reach for first.
+                    env[envname] = ",".join(str(x) for x in v) if isinstance(v, list) else str(v)
             try:
                 subprocess.run(self.exec_cmd, shell=True, env=env, timeout=EXEC_TIMEOUT, check=False)
             except subprocess.TimeoutExpired:
