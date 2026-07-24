@@ -397,6 +397,111 @@ class DiscoverFromCountsTest(unittest.TestCase):
         self.assertEqual(made, ["Vellum"])
 
 
+class StrandedInboxTest(unittest.TestCase):
+    class FakeTarget:
+        def __init__(self, persona):
+            self.persona = persona
+
+    class FakeEmitter:
+        def __init__(self):
+            self.events = []
+
+        def lifecycle(self, event, **fields):
+            self.events.append(dict(event=event, **fields))
+
+    def setUp(self):
+        km._REPORTED_STRANDED.clear()
+
+    def tearDown(self):
+        km._REPORTED_STRANDED.clear()
+
+    def _report(self, directory, counts, watchers=("argus", "river")):
+        em = self.FakeEmitter()
+        targets = [self.FakeTarget(p) for p in watchers]
+        buf, orig = __import__("io").StringIO(), km.sys.stderr
+        km.sys.stderr = buf
+        try:
+            fresh = km.report_stranded_inboxes(directory, counts, targets, em)
+        finally:
+            km.sys.stderr = orig
+        return fresh, em.events, buf.getvalue()
+
+    def test_flags_an_inbox_with_mail_that_is_not_a_known_persona(self):
+        # 'all' looks like a broadcast but has no broadcast semantics; mail to it reached nobody for 4 days.
+        self.assertEqual(km.stranded_inboxes(["argus", "river"], {"argus": 2, "all": 2}), ["all"])
+
+    def test_case_variant_IS_flagged_because_the_server_namespace_is_case_sensitive(self):
+        # The incident: 'Claude-chat' held a DIFFERENT message set from 'claude-chat' - a real, distinct,
+        # unwatched inbox. Casefolding this comparison would hide exactly what the check is for. (The
+        # state-file mapping casefolds for the opposite reason; see _state_safe_persona.)
+        self.assertEqual(km.stranded_inboxes(["claude-chat"], {"Claude-chat": 1}), ["Claude-chat"])
+
+    def test_a_watched_persona_is_never_flagged(self):
+        self.assertEqual(km.stranded_inboxes(["claude-chat", "argus"], {"claude-chat": 9, "argus": 1}), [])
+
+    def test_case_variant_is_diagnosed_as_such_naming_its_twin(self):
+        detail = km._stranded_detail("Claude-chat", ["claude-chat", "argus"], {"Claude-chat": 1})
+        self.assertIn("case-variant of known persona 'claude-chat'", detail)
+
+    def test_an_unknown_name_is_not_mislabelled_a_case_variant(self):
+        detail = km._stranded_detail("all", ["claude-chat", "argus"], {"all": 2})
+        self.assertNotIn("case-variant", detail)
+        self.assertIn("2 unread", detail)
+
+    def test_inbox_with_zero_unread_is_not_flagged(self):
+        self.assertEqual(km.stranded_inboxes(["argus"], {"ghost": 0}), [])
+
+    def test_unknown_directory_never_alarms(self):
+        # A failed /api/personas must not make every persona look stranded.
+        fresh, events, err = self._report([], {"argus": 1, "all": 2})
+        self.assertEqual(fresh, [])
+        self.assertEqual(events, [])
+        self.assertEqual(err, "")
+
+    def test_alert_goes_to_every_watcher_and_never_to_the_stranded_inbox(self):
+        fresh, events, err = self._report(["argus", "river"], {"all": 2})
+        self.assertEqual(fresh, ["all"])
+        self.assertEqual({e["persona"] for e in events}, {"argus", "river"})
+        self.assertNotIn("all", {e["persona"] for e in events})  # nothing tails it; an alarm there is no alarm
+        self.assertIn("stranded mail", err)
+
+    def test_alert_does_not_leak_into_a_phantom_that_became_a_watch_target(self):
+        # REGRESSION, caught only against live data: a stranded inbox HAS mail, so discover_from_counts
+        # gives it a watch target and a stream. Routing the alarm to every target therefore wrote it into
+        # the very stream nobody consumes. Watchers must be filtered to real DIRECTORY personas.
+        fresh, events, _ = self._report(["argus", "river"], {"all": 2},
+                                        watchers=("argus", "river", "all"))
+        self.assertEqual(fresh, ["all"])
+        self.assertEqual({e["persona"] for e in events}, {"argus", "river"})
+
+    def test_no_directory_backed_watcher_means_no_event_but_still_a_stderr_alarm(self):
+        fresh, events, err = self._report(["argus"], {"all": 2}, watchers=("all",))
+        self.assertEqual(fresh, ["all"])
+        self.assertEqual(events, [])          # nowhere safe to deliver it
+        self.assertIn("stranded mail", err)   # operator channel still gets it
+
+    def test_alert_uses_the_alert_event_name_so_existing_consumers_surface_it(self):
+        _, events, _ = self._report(["argus"], {"all": 2}, watchers=("argus",))
+        self.assertEqual(events[0]["event"], "alert")
+        self.assertIn("stranded-mail", events[0]["reason"])
+        self.assertEqual(events[0]["stranded_inboxes"], ["all"])
+
+    def test_reported_once_per_process_not_once_per_tick(self):
+        first, ev1, _ = self._report(["argus"], {"all": 2}, watchers=("argus",))
+        second, ev2, err2 = self._report(["argus"], {"all": 2}, watchers=("argus",))
+        self.assertEqual(first, ["all"])
+        self.assertEqual(second, [])          # the 20k-line spam lesson, applied to the new alarm
+        self.assertEqual(ev2, [])
+        self.assertEqual(err2, "")
+
+    def test_a_backlog_is_summarised_into_one_event_per_watcher_not_a_wake_storm(self):
+        fresh, events, _ = self._report(["argus", "river"], {"all": 2, "ghost": 1, "typo": 3},
+                                        watchers=("argus", "river"))
+        self.assertEqual(set(fresh), {"all", "ghost", "typo"})
+        self.assertEqual(len(events), 2)      # 2 watchers, not 3 inboxes x 2 watchers
+        self.assertEqual(sorted(events[0]["stranded_inboxes"]), ["all", "ghost", "typo"])
+
+
 class WarnOncePerPersonaTest(unittest.TestCase):
     def setUp(self):
         self._orig = set(km._WARNED_PERSONAS)
