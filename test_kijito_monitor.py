@@ -726,6 +726,58 @@ class BoundedWindowEndToEndTest(unittest.TestCase):
         self.assertEqual(t.cursor, 1100)   # fail closed, not fail loud-then-advance
 
 
+class CaseAsymmetryInvariantTest(unittest.TestCase):
+    """THE TWO CASE RULES POINT OPPOSITE WAYS ON PURPOSE. Do not 'harmonise' them.
+
+    Reading the source, the path layer casefolds and the identity layer does not, which looks like an
+    inconsistency and invites a tidy-up. It is not. They answer different questions about different
+    systems:
+
+      PATH  (_state_safe_persona)  MUST casefold  - the local filesystem is case-INSENSITIVE (APFS,
+            NTFS), so 'Claude-chat' and 'claude-chat' are the SAME FILE. Not casefolding made the
+            watcher block on a flock it already held, so the variant got no event stream and its mail
+            woke nobody.
+      IDENTITY (stranded_inboxes) MUST NOT casefold - the SERVER's inbox namespace is case-SENSITIVE.
+            The 'Claude-chat' inbox held a genuinely different message set from 'claude-chat'.
+            Casefolding here silently merges two distinct inboxes and hides stranded mail - it was
+            shipped that way for an hour and stopped detecting the very incident it existed for.
+
+    A comment cannot defend this; the next person to make the code look consistent would delete it. This
+    test is the defence. If it fails, someone has made the two layers agree - and making them agree IS
+    the bug.
+    """
+
+    def setUp(self):
+        self._orig = dict(km._PERSONA_MEMORY_COUNTS)
+        km._PERSONA_MEMORY_COUNTS.clear()
+
+    def tearDown(self):
+        km._PERSONA_MEMORY_COUNTS.clear()
+        km._PERSONA_MEMORY_COUNTS.update(self._orig)
+
+    def test_path_layer_COLLAPSES_case_variants(self):
+        self.assertEqual(km._state_path_for_persona("/tmp/hive.json", "Claude-chat"),
+                         km._state_path_for_persona("/tmp/hive.json", "claude-chat"))
+
+    def test_identity_layer_KEEPS_case_variants_distinct(self):
+        # 'claude-chat' is a known directory persona owning memories; 'Claude-chat' is a separate inbox
+        # holding mail. The variant MUST be flagged, or the 14-day stranding goes undetected again.
+        km._PERSONA_MEMORY_COUNTS.update({"claude-chat": 35})
+        self.assertEqual(
+            km.stranded_inboxes(["claude-chat"], {"claude-chat": 9, "Claude-chat": 1}),
+            ["Claude-chat"])
+
+    def test_the_two_layers_disagree_and_that_is_the_invariant(self):
+        # Stated as one assertion so the intent survives even if the tests above are edited apart.
+        same_path = (km._state_path_for_persona("/tmp/hive.json", "Claude-chat")
+                     == km._state_path_for_persona("/tmp/hive.json", "claude-chat"))
+        km._PERSONA_MEMORY_COUNTS.update({"claude-chat": 35})
+        distinct_identity = km.stranded_inboxes(["claude-chat"], {"Claude-chat": 1}) == ["Claude-chat"]
+        self.assertTrue(same_path and distinct_identity,
+                        "path layer must collapse case variants AND identity layer must keep them "
+                        "distinct; if you just made these agree, you have reintroduced a real defect")
+
+
 class OwnershipSignalTest(unittest.TestCase):
     """Directory membership stopped being sufficient once the directory listed every recipient."""
 
