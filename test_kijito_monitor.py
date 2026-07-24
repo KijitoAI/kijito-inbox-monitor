@@ -408,6 +408,21 @@ class DeclaredOmissionsTest(unittest.TestCase):
         self.assertEqual(km._declared_omissions({"result": [], "truncated": True}), 1)
         self.assertEqual(km._declared_omissions({"result": [], "size_truncated": True}), 1)
 
+    def test_a_lone_oversized_message_is_NOT_an_omission(self):
+        # size_truncated with size_dropped=0 means one message's BODY was clipped, not that a row was
+        # withheld. Counting it invents a gap and alarms about mail that was never missing.
+        self.assertEqual(km._declared_omissions(
+            {"result": [{"id": 1}], "size_truncated": True, "size_dropped": 0}), 0)
+
+    def test_count_truncation_with_zero_size_drops_is_still_an_omission(self):
+        # Measured live: limit=3 returns truncated=True, size_dropped=0, and rows ARE missing.
+        # These are different mechanisms and must not cancel each other out.
+        self.assertEqual(km._declared_omissions(
+            {"result": [], "truncated": True, "size_truncated": False, "size_dropped": 0}), 1)
+
+    def test_count_and_size_truncation_accumulate(self):
+        self.assertEqual(km._declared_omissions({"result": [], "truncated": True, "size_dropped": 4}), 5)
+
     def test_a_complete_window_declares_nothing(self):
         self.assertEqual(km._declared_omissions({"result": [], "truncated": False,
                                                  "size_truncated": False, "size_dropped": 0}), 0)
@@ -426,6 +441,7 @@ class BoundedWindowGapTest(unittest.TestCase):
         t = km.WatchTarget.__new__(km.WatchTarget)
         t.cursor, t.armed, t.persona, t.url = cursor, armed, "argus", "http://x/api/inbox?persona=argus"
         t.opener, t.headers = None, {}
+        t.emitted_above, t.gap_alerted = set(), None
         return t
 
     def test_window_reaching_back_past_the_cursor_is_safe(self):
@@ -454,7 +470,7 @@ class BoundedWindowGapTest(unittest.TestCase):
         poll = km.Poll(True, items=[{"id": 1200}], omitted=5)
         self.assertIsNone(t._uncovered_gap(poll, poll.items))
 
-    def test_reconcile_queries_unread_only_and_returns_rows_in_id_order(self):
+    def test_reconcile_queries_unread_only(self):
         t = self._target(cursor=1100)
         seen = {}
 
@@ -464,19 +480,31 @@ class BoundedWindowGapTest(unittest.TestCase):
 
         orig, km.fetch = km.fetch, fake_fetch
         try:
-            rows = t._reconcile_gap(Args())
+            got = t._reconcile_gap(Args())
         finally:
             km.fetch = orig
         self.assertIn("unread_only=true", seen["url"])
-        self.assertEqual([m["id"] for m in rows], [1105, 1150])   # ascending, so emission order is stable
+        self.assertEqual({m["id"] for m in got.items}, {1105, 1150})
+
+    def test_reconcile_returns_the_poll_so_its_own_truncation_is_visible(self):
+        # A reconciling window that was ITSELF cut short cannot prove a gap is closed, so the caller
+        # must be able to see that - returning bare rows would hide it.
+        t = self._target(cursor=1100)
+        orig, km.fetch = km.fetch, lambda *a, **k: km.Poll(True, items=[{"id": 1150}], omitted=7)
+        try:
+            got = t._reconcile_gap(Args())
+        finally:
+            km.fetch = orig
+        self.assertEqual(got.omitted, 7)
 
     def test_reconcile_failure_is_best_effort_not_a_liveness_failure(self):
         t = self._target(cursor=1100)
         orig, km.fetch = km.fetch, lambda *a, **k: km.Poll(False, reason="http 502")
         try:
-            self.assertEqual(t._reconcile_gap(Args()), [])   # returns empty, does not raise
+            got = t._reconcile_gap(Args())   # must not raise
         finally:
             km.fetch = orig
+        self.assertFalse(got.ok)
 
 
 class BoundedWindowEndToEndTest(unittest.TestCase):
@@ -513,9 +541,10 @@ class BoundedWindowEndToEndTest(unittest.TestCase):
         t.skips = t.first_poll = 0
         t.last_heartbeat = km._monotonic()
         t.count_url, t.unread_persona = km.NOTIFY_PENDING_URL, "argus"
+        t.emitted_above, t.gap_alerted = set(), None
         return t
 
-    def test_mail_hidden_by_a_truncated_window_is_recovered_and_the_gap_is_announced(self):
+    def test_fully_recovered_gap_delivers_the_mail_advances_and_stays_quiet(self):
         em = self.RecordingEmitter()
         t = self._target(cursor=1100, emitter=em)
 
@@ -532,17 +561,48 @@ class BoundedWindowEndToEndTest(unittest.TestCase):
         finally:
             km.fetch = orig
 
-        # 1. the hidden messages were emitted, not skipped
+        # 1. the hidden messages were recovered and emitted, not skipped
         self.assertEqual(em.new_ids, [1105, 1150, 1200, 1260])
-        # 2. the gap was announced loudly rather than swallowed
+        # 2. NO alert: the server said it withheld 2, a complete unread_only window yielded exactly 2
+        #    previously-unseen rows, so the span is accounted for. Alerting on a successful self-heal
+        #    is how an alarm gets trained into background noise.
+        self.assertEqual([f for (e, f) in em.events if e == "alert"], [])
+        # 3. and only THEN may the watermark advance
+        self.assertEqual(t.cursor, 1260)
+        self.assertEqual(t.emitted_above, set())
+
+    def test_partial_recovery_still_pins_because_the_span_is_not_accounted_for(self):
+        # Server withheld 3; reconciliation surfaces only 1 previously-unseen row. Two are unaccounted
+        # for, so this must NOT be treated as a success.
+        em = self.RecordingEmitter()
+        t = self._target(cursor=1100, emitter=em)
+        poll = lambda o, u, h: (km.Poll(True, items=[{"id": 1105}], omitted=0) if "unread_only=true" in u
+                                else km.Poll(True, items=[{"id": 1200}], omitted=3))
+        orig, km.fetch = km.fetch, poll
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertEqual(em.new_ids, [1105, 1200])
         alerts = [f for (e, f) in em.events if e == "alert"]
         self.assertEqual(len(alerts), 1)
-        self.assertEqual(alerts[0]["omitted"], 2)
-        self.assertEqual(alerts[0]["window_floor"], 1200)
-        self.assertEqual(alerts[0]["cursor_at"], 1100)
-        self.assertEqual(alerts[0]["reconciled"], 2)
-        # 3. cursor advanced only after the hidden mail was accounted for
-        self.assertEqual(t.cursor, 1260)
+        self.assertEqual(alerts[0]["reconciled"], 1)
+        self.assertEqual(t.cursor, 1100)
+
+    def test_a_truncated_reconciliation_window_cannot_close_a_gap(self):
+        # Even if it yields enough rows, a reconciling window that was ITSELF cut short is not evidence.
+        em = self.RecordingEmitter()
+        t = self._target(cursor=1100, emitter=em)
+        poll = lambda o, u, h: (km.Poll(True, items=[{"id": 1105}, {"id": 1106}], omitted=9)
+                                if "unread_only=true" in u
+                                else km.Poll(True, items=[{"id": 1200}], omitted=2))
+        orig, km.fetch = km.fetch, poll
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertEqual(t.cursor, 1100)   # pinned despite recovered >= omitted
+        self.assertTrue([f for (e, f) in em.events if e == "alert"])
 
     def test_steady_state_truncation_is_silent_and_changes_nothing(self):
         # The common case: window reaches back past the cursor, so the drops are already-emitted mail.
@@ -558,6 +618,90 @@ class BoundedWindowEndToEndTest(unittest.TestCase):
         self.assertEqual(em.new_ids, [1140])
         self.assertEqual([e for (e, f) in em.events if e == "alert"], [])
         self.assertEqual(t.cursor, 1140)
+
+    def test_LOOM_REPRO_unresolved_gap_pins_the_cursor_instead_of_stepping_over_it(self):
+        # Loom's exact repro (msg 1150): cursor 1100, visible floor 1200, omitted 4, reconciliation fails.
+        # The old code emitted [1200] and advanced the cursor to 1200, so the NEXT poll saw floor<=cursor,
+        # declared itself safe, and buried the omission forever. The watermark must HOLD.
+        em = self.RecordingEmitter()
+        t = self._target(cursor=1100, emitter=em)
+
+        def fake_fetch(opener, url, headers):
+            if "unread_only=true" in url:
+                return km.Poll(False, reason="http 502")
+            return km.Poll(True, items=[{"id": 1200}], omitted=4)
+
+        orig, km.fetch = km.fetch, fake_fetch
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertEqual(em.new_ids, [1200])          # visible mail still delivered (liveness kept)
+        self.assertEqual(t.cursor, 1100)              # *** PINNED - the whole point ***
+        self.assertEqual(t.emitted_above, {1200})     # remembered, so the next poll will not re-emit it
+
+    def test_a_pinned_watermark_does_not_re_emit_on_the_next_poll(self):
+        # Failing closed must not become a duplicate storm.
+        em = self.RecordingEmitter()
+        t = self._target(cursor=1100, emitter=em)
+        poll = lambda o, u, h: (km.Poll(False, reason="http 502") if "unread_only=true" in u
+                                else km.Poll(True, items=[{"id": 1200}], omitted=4))
+        orig, km.fetch = km.fetch, poll
+        try:
+            t.poll_once()
+            t.poll_once()
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertEqual(em.new_ids, [1200])          # emitted ONCE across three polls
+        self.assertEqual(t.cursor, 1100)
+
+    def test_a_pinned_gap_alerts_once_not_once_per_poll(self):
+        em = self.RecordingEmitter()
+        t = self._target(cursor=1100, emitter=em)
+        poll = lambda o, u, h: (km.Poll(False, reason="http 502") if "unread_only=true" in u
+                                else km.Poll(True, items=[{"id": 1200}], omitted=4))
+        orig, km.fetch = km.fetch, poll
+        try:
+            for _ in range(5):
+                t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertEqual(len([e for e, f in em.events if e == "alert"]), 1)
+
+    def test_reconciliation_echoing_the_visible_window_is_NOT_counted_as_recovery(self):
+        # Loom blocker 2: the producer peeks with mark_read=false, so visible rows stay unread and an
+        # unread_only retry commonly returns THE SAME suffix. Counting those as recovered reports a
+        # success that never happened - a false green, worse than a loud failure.
+        em = self.RecordingEmitter()
+        t = self._target(cursor=1100, emitter=em)
+        poll = lambda o, u, h: km.Poll(True, items=[{"id": 1200}, {"id": 1260}],
+                                       omitted=0 if "unread_only=true" in u else 3)
+        orig, km.fetch = km.fetch, poll
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        alert = [f for e, f in em.events if e == "alert"][0]
+        self.assertEqual(alert["reconciled"], 0)      # echoed rows recovered NOTHING
+        self.assertEqual(t.cursor, 1100)              # so the watermark stays pinned
+
+    def test_watermark_resumes_advancing_once_windows_are_complete_again(self):
+        em = self.RecordingEmitter()
+        t = self._target(cursor=1100, emitter=em)
+        poll = lambda o, u, h: (km.Poll(False, reason="http 502") if "unread_only=true" in u
+                                else km.Poll(True, items=[{"id": 1200}], omitted=4))
+        orig, km.fetch = km.fetch, poll
+        try:
+            t.poll_once()
+            self.assertEqual(t.cursor, 1100)
+            km.fetch = lambda o, u, h: km.Poll(True, items=[{"id": 1200}, {"id": 1300}], omitted=0)
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertEqual(t.cursor, 1300)              # advanced once the server stopped hiding rows
+        self.assertEqual(t.emitted_above, set())      # tracking cleared below the new watermark
+        self.assertEqual(em.new_ids, [1200, 1300])    # 1200 not re-emitted
 
     def test_unrecoverable_gap_still_alerts_with_the_shortfall(self):
         # Reconciliation itself truncates or fails: we cannot close the gap, so it MUST be announced.
@@ -577,7 +721,9 @@ class BoundedWindowEndToEndTest(unittest.TestCase):
         alerts = [f for (e, f) in em.events if e == "alert"]
         self.assertEqual(len(alerts), 1)
         self.assertEqual(alerts[0]["reconciled"], 0)
-        self.assertIn("may never have been delivered", alerts[0]["reason"])
+        self.assertTrue(alerts[0]["pinned"])
+        self.assertIn("PINNED", alerts[0]["reason"])
+        self.assertEqual(t.cursor, 1100)   # fail closed, not fail loud-then-advance
 
 
 class OwnershipSignalTest(unittest.TestCase):
