@@ -177,14 +177,22 @@ def fetch(opener, url, headers):
 def _declared_omissions(data):
     """How many messages the server says it left out of this window (0 if it says none).
 
-    Counted CONSERVATIVELY: a boolean truncated/size_truncated with no number still means "incomplete",
-    so it counts as at least one omission rather than zero. Treating an unquantified truncation as
-    "nothing missing" would reintroduce exactly the silent-skip this exists to prevent.
+    An alarm that invents losses is as corrosive as one that hides them, so this must not round in
+    either direction. THREE DISTINCT SIGNALS, and conflating them is wrong BOTH ways:
+      truncated=True                    -> rows withheld by the COUNT limit. Count unknown, so >= 1.
+      size_dropped=N>0                  -> N rows withheld by the content budget.
+      size_truncated=True, size_dropped=0 -> a lone oversized message had its BODY clipped. No row was
+                                           withheld, so this contributes NOTHING. Verified live: a
+                                           limit=3 request returns truncated=True with size_dropped=0
+                                           and rows genuinely missing, while an oversized single message
+                                           reports size_truncated with nothing dropped.
     """
+    n = 1 if data.get("truncated") is True else 0
     dropped = data.get("size_dropped")
-    n = dropped if isinstance(dropped, int) and dropped > 0 else 0
-    if not n and (data.get("truncated") is True or data.get("size_truncated") is True):
-        n = 1
+    if isinstance(dropped, int):
+        n += max(dropped, 0)
+    elif data.get("size_truncated") is True:
+        n = max(n, 1)   # size truncation with no number at all: unquantified, so assume at least one
     return n
 
 
@@ -512,12 +520,20 @@ class StateFile:
             sys.stderr.write("kijito-inbox-monitor: WARNING state-file identity mismatch (%r != %r) - NOT resuming its "
                              "cursor; re-baselining to avoid a silently-blind watcher.\n" % (ident, self.identity))
             return None
-        return (cursor, state, failures)
+        # Ids already emitted ABOVE a pinned watermark. Absent in files written by older versions, which is
+        # exactly the forward-compat case: an empty set just means "nothing pinned", the pre-pinning behaviour.
+        emitted = d.get("emitted_above")
+        emitted = set(emitted) if isinstance(emitted, list) and all(isinstance(i, int) for i in emitted) else set()
+        return (cursor, state, failures, emitted)
 
-    def save(self, cursor, state, failures):
+    def save(self, cursor, state, failures, emitted_above=None):
         if not IS_POSIX:
             return  # best-effort; skip on Windows
         d = {"identity": self.identity, "cursor": cursor, "state": state, "consecutive_failures": failures}
+        # Persisted so a RESTART cannot re-emit what we already delivered above a pinned watermark.
+        # Without this, failing closed would trade silent loss for a duplicate storm on every restart.
+        if emitted_above:
+            d["emitted_above"] = sorted(emitted_above)
         dirn = os.path.dirname(os.path.abspath(self.path)) or "."
         os.makedirs(dirn, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=dirn, prefix=".kijmon-", suffix=".tmp")
@@ -728,6 +744,12 @@ class WatchTarget:
         self.skips = 0
         self.first_poll = True
         self.last_heartbeat = _monotonic()
+        # FAIL-CLOSED state. `cursor` is a CONFIRMED-CONTIGUOUS watermark: everything at or below it is
+        # known delivered. When the server admits it hid messages above the cursor, the watermark PINS
+        # rather than stepping over them, and ids emitted above the pin are remembered here so liveness
+        # (delivering what we can see) does not cost us duplicates. Both are persisted.
+        self.emitted_above = set()
+        self.gap_alerted = None   # the pinned floor we have already alerted on, so pinning does not spam
 
         self.count_url = NOTIFY_PENDING_URL
         cp = urllib.parse.urlsplit(url)
@@ -740,9 +762,10 @@ class WatchTarget:
                 self.state_file.lock()
                 loaded = self.state_file.load()
                 if loaded is not None:
-                    r_cursor, r_state, r_failures = loaded
+                    r_cursor, r_state, r_failures, r_emitted = loaded
                     self.cursor = r_cursor
                     self.fsm_state, self.failures = r_state, r_failures
+                    self.emitted_above = r_emitted
         if args.seed_at is not None:
             self.cursor = args.seed_at
 
@@ -800,12 +823,13 @@ class WatchTarget:
         precisely the set where a missed wake actually costs something.
         Best-effort by design: a failure here must never turn a healthy poll into a liveness failure,
         because the alert we emit alongside it is already carrying the bad news.
+
+        Returns the POLL, not just rows, because the caller must know whether this window was ITSELF
+        truncated. A reconciling window that was also cut short cannot be used as evidence that a gap
+        is closed, and silence from it means nothing.
         """
         sep = "&" if "?" in self.url else "?"
-        poll = fetch(self.opener, self.url + sep + "unread_only=true", self.headers)
-        if not poll.ok or not poll.items:
-            return []
-        return sorted(poll.items, key=lambda m: m["id"])
+        return fetch(self.opener, self.url + sep + "unread_only=true", self.headers)
 
     def poll_once(self, counts_available=False, unread_counts=None):
         args = self.args
@@ -864,7 +888,12 @@ class WatchTarget:
                             new_items = sorted((m for m in items if m["id"] > self.cursor), key=lambda m: m["id"])
                     self.armed = True
                 else:
-                    new_items = sorted((m for m in items if m["id"] > self.cursor), key=lambda m: m["id"])
+                    # `emitted_above` is normally empty. It is non-empty only while the watermark is PINNED
+                    # below an unresolved gap, and it is what lets us keep delivering visible mail without
+                    # re-delivering it on every subsequent poll.
+                    new_items = sorted((m for m in items
+                                        if m["id"] > self.cursor and m["id"] not in self.emitted_above),
+                                       key=lambda m: m["id"])
 
                 if recovered:
                     self.lifecycle("recovered", cursor=self.cursor)
@@ -877,32 +906,61 @@ class WatchTarget:
                 # omitted anything AND the window does not reach back to our cursor, un-emitted mail can
                 # be sitting in the uncovered gap - and advancing the cursor past it loses it forever.
                 gap = self._uncovered_gap(poll, items)
+                pinned = False
                 if gap is not None:
-                    recovered_items = self._reconcile_gap(args)
+                    cursor_at, window_floor, omitted = gap
+                    visible = {m["id"] for m in items}
+                    # Count ONLY rows the visible window did not already contain and that sit above the
+                    # watermark. Counting every returned row lets a retry that echoes the same suffix be
+                    # reported as a recovery that never happened - a false success, worse than a loud failure.
+                    rec_poll = self._reconcile_gap(args)
+                    genuinely_new = [m for m in rec_poll.items or []
+                                     if m["id"] > (self.cursor or 0) and m["id"] not in visible
+                                     and m["id"] not in self.emitted_above]
                     known = {m["id"] for m in new_items}
-                    for m in recovered_items:
-                        if m["id"] > (self.cursor or 0) and m["id"] not in known:
+                    for m in genuinely_new:
+                        if m["id"] not in known:
                             new_items.append(m)
+                            known.add(m["id"])
                     new_items.sort(key=lambda m: m["id"])
-                    still_missing = gap[2] - len(recovered_items)
-                    # Fail LOUD on whatever reconciliation could not reach. The endpoint offers no
-                    # backward pagination, so a gap we cannot close must wake somebody rather than vanish.
-                    self.lifecycle("alert",
-                                   reason=("bounded-window: server omitted %d message(s) and the window "
-                                           "started at id %s above cursor %s; recovered %d by reconcile, "
-                                           "%d may never have been delivered"
-                                           % (gap[2], gap[1], gap[0], len(recovered_items),
-                                              max(still_missing, 0))),
-                                   omitted=gap[2], window_floor=gap[1], cursor_at=gap[0],
-                                   reconciled=len(recovered_items))
+
+                    # FAIL CLOSED unless there is POSITIVE evidence the span is accounted for. Recovery here
+                    # is a heuristic (unread_only), not an authoritative backward page, so silence from it
+                    # proves nothing. Treat the gap as closed only when the reconciling window was itself
+                    # COMPLETE (it declared no omissions of its own) and it yielded at least as many
+                    # previously-unseen rows as the server said it withheld. Anything less pins the
+                    # watermark: stepping over would make the next poll see floor<=cursor, declare itself
+                    # safe, and bury the omission permanently.
+                    closed = rec_poll.ok and rec_poll.omitted == 0 and len(genuinely_new) >= omitted
+                    pinned = not closed
+                    if pinned and self.gap_alerted != window_floor:
+                        # Alert once per distinct gap, not once per poll: a pinned watermark re-detects
+                        # the same gap forever, and an alarm that repeats every tick gets filtered out.
+                        self.gap_alerted = window_floor
+                        self.lifecycle("alert",
+                                       reason=("bounded-window: server omitted %d message(s) and the window "
+                                               "started at id %s above cursor %s; recovered %d, watermark "
+                                               "PINNED at %s until the span can be read authoritatively"
+                                               % (omitted, window_floor, cursor_at, len(genuinely_new),
+                                                  cursor_at)),
+                                       omitted=omitted, window_floor=window_floor, cursor_at=cursor_at,
+                                       reconciled=len(genuinely_new), pinned=True)
 
                 for m in new_items:
                     m = dict(m)
                     m["_persona"] = self.persona
                     self.emitter.new(m)
-                if new_items:
+                if pinned:
+                    # Watermark HELD. Remember what we delivered above it so the next poll (and any
+                    # restart, since this is persisted) neither re-emits it nor forgets the gap.
+                    self.emitted_above.update(m["id"] for m in new_items)
+                elif new_items:
                     self.cursor = max(self.cursor if self.cursor is not None else 0,
                                       max(m["id"] for m in new_items))
+                    # Watermark moved, so anything at or below it is confirmed and no longer needs tracking.
+                    if self.emitted_above:
+                        self.emitted_above = {i for i in self.emitted_above if i > self.cursor}
+                    self.gap_alerted = None
 
             else:
                 self.failures += 1
@@ -913,7 +971,7 @@ class WatchTarget:
                                    seconds=self.failures * args.poll_seconds)
 
         if self.state_file is not None:
-            self.state_file.save(self.cursor, self.fsm_state, self.failures)
+            self.state_file.save(self.cursor, self.fsm_state, self.failures, self.emitted_above)
 
         # §9 enable the fast-path once - on the first healthy poll where the count endpoint is available.
         # (Single enable point; the max-id cursor stays the source of truth for WHAT to emit, unread is only
