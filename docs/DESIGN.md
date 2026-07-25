@@ -216,6 +216,43 @@ wait count and the last-evidence stamp alongside it, and a test asserts the text
 need opposite responses (one wants a ping, one wants a human to restart a bridge). That rule lives in the
 code, not only here, because a rule that lives only in prose does not run.
 
+### 5.5 Urgent-unanswered: escalated mail nobody is answering
+
+    ALARM IF  unread_urgent > 0  AND  activity_since(persona) is False
+
+**Why this alarm can exist at all.** "Is this member stuck?" normally cannot be answered from outside,
+because a member idle BY DESIGN and one that is wedged look identical - so the alarm fires on every dormant
+persona and rots into noise, which is worse than not having it. What breaks the tie is a declared
+EXPECTATION. `unread_urgent` is one: not the recipient declaring liveness, but a **sender** declaring that
+this needs attention now. Silence only means something once something was expected, and this is the only
+place the hive records an expectation.
+
+The consequence is that a quiet persona with no urgent mail NEVER trips it. The alarm fires exactly where
+somebody escalated and nothing happened, which is the population worth waking a human for.
+
+**Both halves must be positive.** `activity_since` is a tri-state (§5.4) and only an explicit `False`
+qualifies - a NOT-OBSERVABLE answer means the watcher was not running for the span in question, and
+reporting that as silence would be the fabrication the tri-state exists to refuse.
+
+**It costs nothing.** `unread_urgent` arrives on the same `/api/notify/pending` row as the unread count the
+fast path already fetches every tick; the field was previously parsed and discarded.
+
+**Kept disjoint from stranded-mail (§ above) on purpose:** that alarm is for inboxes nobody OWNS, this one
+for real directory members who are not responding. Two alarms covering one inbox drift apart and then
+disagree about it, so this one skips any persona the directory does not know and lets the stranded check own
+that case.
+
+Routing and honesty follow the same rules as every other alarm here: an `alert` rather than a new event
+name, one summarising event per watcher so discovering several at once cannot become a wake storm, the
+OBSERVATION and never the diagnosis, and self-clearing when **either** half of the predicate clears - with
+no ack, since an ack would let someone silence "nobody is answering escalated mail" while it stayed true.
+
+> **Known uncovered property.** The alarm is evaluated AFTER the per-target polls, so this tick's authorship
+> is already recorded when it judges. That ordering is asserted by a comment and by review, not by a test -
+> it is a property of the run loop's composition that the unit suite does not reach. Its failure mode is
+> benign and self-correcting: a member who authored mail during the same tick could be reported quiet once,
+> and the next tick clears it.
+
 ## 6. Emit modes (portability)
 
 "NDJSON-on-stdout is universal" is false on ingestion: Claude Code ingests per-event (hooks: JSON-on-stdin,

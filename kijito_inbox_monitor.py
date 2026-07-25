@@ -344,9 +344,21 @@ def fetch_personas(opener, headers):
     return personas
 
 
+# Urgent unread per persona, from the SAME row the unread count comes from - no extra request. Kept
+# separately from `counts` so the fast-path arithmetic is untouched. A sender marking a message urgent is
+# the closest thing the hive has to a declared expectation of attention, which makes it the one signal
+# that can distinguish "idle by design" from "nobody is coming" without asking the silent party.
+_URGENT_UNREAD = {}
+
+
 def _parse_unread_rows(data):
     """Parse a /api/notify/pending body into {persona: unread}, or None if the shape is invalid.
-    A persona with zero unread is ABSENT from the list → callers treat absent as 0."""
+    A persona with zero unread is ABSENT from the list → callers treat absent as 0.
+
+    Also records `unread_urgent` into _URGENT_UNREAD as a side table. The endpoint hands it over on every
+    tick and it was previously discarded; a signal you already receive and throw away is the cheapest kind
+    of blindness.
+    """
     rows = data.get("result") if isinstance(data, dict) else None
     if not isinstance(rows, list):
         return None
@@ -355,6 +367,11 @@ def _parse_unread_rows(data):
         if isinstance(row, dict) and isinstance(row.get("persona"), str):
             u = row.get("unread")
             counts[row["persona"]] = u if isinstance(u, int) else 0
+            ug = row.get("unread_urgent")
+            # Absent (an older server) means NO STATEMENT, not zero - the same tri-state discipline as
+            # §5.2. Recording a 0 we were never told would assert "nothing is escalated" on no evidence.
+            if isinstance(ug, int) and not isinstance(ug, bool) and ug >= 0:
+                _URGENT_UNREAD[row["persona"]] = ug
     return counts
 
 
@@ -2558,6 +2575,11 @@ def write_activity_file(path, now_iso=None):
         "updated": now_iso or _now_iso(),
         # A question about anything at or below observation_floor_id is NOT ANSWERABLE from this file.
         "last_authored": {p: {"id": i, "created": c} for p, (i, c) in sorted(_LAST_AUTHORED.items())},
+        # Personas with mail a SENDER escalated. Published alongside authorship because the pair is what
+        # separates "idle by design" from "nobody is coming": urgency is an expectation someone declared,
+        # and silence only means something once something was expected. A persona absent here was not
+        # reported on, which is not the same as zero.
+        "urgent_unread": {p: n for p, n in sorted(_URGENT_UNREAD.items()) if n},
     }
     dirn = os.path.dirname(os.path.abspath(path)) or "."
     try:
@@ -2568,6 +2590,74 @@ def write_activity_file(path, now_iso=None):
         os.replace(tmp, path)             # atomic: a reader never sees a half-written table
     except OSError as e:
         sys.stderr.write("kijito-inbox-monitor: WARNING activity-file write failed (non-fatal): %s\n" % e)
+
+
+_REPORTED_URGENT_QUIET = set()
+
+
+def urgent_unanswered(directory):
+    """Directory personas holding SENDER-ESCALATED mail while showing no observed activity (§5.5).
+
+    THE PREDICATE, and the reason this alarm is buildable at all:
+        unread_urgent > 0   AND   activity_since(persona) is False
+    An "is this agent stuck" alarm normally cannot exist, because an agent idle BY DESIGN and an agent that
+    is wedged look identical from outside - so it fires on every dormant persona and rots into noise. What
+    breaks the tie is a declared EXPECTATION, and `unread_urgent` is one: not the recipient declaring
+    liveness, but a SENDER declaring that this needs attention now. Silence only means something once
+    something was expected.
+
+    Both halves must be POSITIVE. `activity_since` is a tri-state and only `False` counts - a NOT-OBSERVABLE
+    answer means the watcher was not running for the span in question, and reporting that as silence is the
+    fabrication this whole signal exists to refuse.
+
+    Restricted to DIRECTORY personas on purpose, which keeps this disjoint from the stranded-mail alarm:
+    that one is for inboxes nobody OWNS, this one is for real members who are not responding. Two alarms
+    with two philosophies drift apart and then disagree about the same inbox.
+    """
+    out = []
+    floor = observation_floor_id()
+    if floor is None:
+        return out            # nothing observed at all: assert nothing
+    known = {p for p in (directory or ()) if p}
+    for persona, n in sorted(_URGENT_UNREAD.items()):
+        if n and persona in known and activity_since(persona, floor) is False:
+            out.append((persona, n))
+    return out
+
+
+def report_urgent_unanswered(directory, targets, emitter):
+    """Emit the §5.5 observation. Self-clears when EITHER half of the predicate clears; never an ack.
+
+    An ack would let someone silence "nobody is answering escalated mail" while it stayed true, which is
+    how a dead-letter surface rots. Releasing the suppression the moment the condition lifts means a
+    recurrence is announced again without anyone having to remember to reset anything.
+    """
+    directory = directory or ()
+    current = urgent_unanswered(directory)
+    names = {p for p, _ in current}
+    _REPORTED_URGENT_QUIET.intersection_update(names)   # release: either half clearing re-arms the alarm
+    fresh = [(p, n) for p, n in current if p not in _REPORTED_URGENT_QUIET]
+    if not fresh:
+        return []
+    detail = []
+    for persona, n in fresh:
+        _REPORTED_URGENT_QUIET.add(persona)
+        seen = _LAST_AUTHORED.get(persona)
+        detail.append("%s (%d urgent unread; %s)" % (
+            persona, n,
+            ("last observed message %s" % seen[1]) if seen else "no message from them observed at all"))
+    known = {p for p in directory if p}
+    # One summarising event per watcher, exactly as the stranded alarm does - discovering several at once
+    # must not become a wake storm.
+    for watcher in sorted({t.persona for t in targets if t.persona and t.persona in known}):
+        emitter.lifecycle(
+            "alert", persona=watcher,
+            reason=("urgent-unanswered: %d member(s) hold mail a sender marked URGENT while no activity "
+                    "from them has been observed: %s. OBSERVATION, NOT A DIAGNOSIS: not-yet-read, unable "
+                    "to receive, and still working are indistinguishable from here and need different "
+                    "responses. Checked: authored mail." % (len(fresh), ", ".join(detail))),
+            urgent_unanswered=[p for p, _ in fresh])
+    return [p for p, _ in fresh]
 
 
 _REPORTED_STRANDED = set()
@@ -2755,6 +2845,10 @@ def run(args):
         refresh_directory_backing(args, directory_personas, targets)
         for target in targets:
             target.poll_once(counts_available, unread_counts)
+        # AFTER the polls, so this tick's authorship is already recorded - evaluating before them would
+        # judge a member silent using a view that predates the very message proving they are not.
+        if counts_available and not args.no_stranded_alerts:
+            report_urgent_unanswered(directory_personas, targets, emitter)
         if args.activity_file:
             write_activity_file(args.activity_file)
         if seam.stop:
