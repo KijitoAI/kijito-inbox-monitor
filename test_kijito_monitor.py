@@ -805,7 +805,7 @@ class CorruptPinStateTest(unittest.TestCase):
             loaded = km.StateFile(p, "idx").load()
         finally:
             km.sys.stderr = err
-        cursor, state, failures, emitted, alerted, intact = loaded
+        cursor, emitted, intact = loaded["cursor"], loaded["emitted_above"], loaded["pin_evidence_intact"]
         self.assertEqual(cursor, 100)
         self.assertEqual(emitted, set())
         self.assertFalse(intact)                    # <- the pin is HELD, evidence marked unusable
@@ -814,14 +814,18 @@ class CorruptPinStateTest(unittest.TestCase):
     def test_a_recorded_gap_alert_without_tracking_is_treated_as_inconsistent(self):
         p = self._write({"identity": "idx", "cursor": 100, "state": "UP",
                          "consecutive_failures": 0, "gap_alerted": 100})
-        _, _, _, emitted, alerted, intact = km.StateFile(p, "idx").load()
+        loaded = km.StateFile(p, "idx").load()
+        emitted, alerted, intact = (loaded["emitted_above"], loaded["gap_alerted"],
+                                    loaded["pin_evidence_intact"])
         self.assertEqual(emitted, set())
         self.assertEqual(alerted, 100)
         self.assertFalse(intact)                    # something was pinned when this was written
 
     def test_a_clean_file_with_no_pin_loads_intact(self):
         p = self._write({"identity": "idx", "cursor": 100, "state": "UP", "consecutive_failures": 0})
-        _, _, _, emitted, alerted, intact = km.StateFile(p, "idx").load()
+        loaded = km.StateFile(p, "idx").load()
+        emitted, alerted, intact = (loaded["emitted_above"], loaded["gap_alerted"],
+                                    loaded["pin_evidence_intact"])
         self.assertEqual((emitted, alerted, intact), (set(), None, True))
 
     def test_a_forced_pin_survives_arming_so_replay_cap_cannot_cross_it(self):
@@ -1242,8 +1246,7 @@ class WaitValidationTest(unittest.TestCase):
         self.assertEqual(self._args(["--persona", "argus"]).wait, 50)
 
 
-if __name__ == "__main__":
-    unittest.main()
+
 
 
 class Loom5ContractValidationTest(unittest.TestCase):
@@ -1385,9 +1388,14 @@ class Loom5CorruptStateTest(unittest.TestCase):
     def test_a_genuinely_absent_file_is_still_absent(self):
         self.assertIsNone(km.StateFile(os.path.join(tempfile.mkdtemp(), "nope.json"), "idx").load())
 
-    def test_an_empty_file_is_still_absent(self):
-        loaded, _ = self._load("   ")
-        self.assertIsNone(loaded)
+    def test_LOOM6_a_zero_byte_file_is_CORRUPT_not_absent(self):
+        # I asserted the opposite last round and loom was right: a file that EXISTS is evidence a cursor
+        # existed here, whatever its contents. Treating zero bytes as a first launch baselines over
+        # everything since - the identical fail-open the unparseable path was just fixed for.
+        for blank in ("", "   ", "\n\n"):
+            loaded, warned = self._load(blank)
+            self.assertIs(loaded, km.CORRUPT_STATE, "blank %r must not read as absent" % blank)
+            self.assertIn("EMPTY", warned)
 
     def test_LOOM5_corrupt_state_re_emits_the_window_instead_of_baselining_over_it(self):
         # loom's repro: corrupt prior cursor 100 + visible 150,200 => baselined to 200 and skipped BOTH.
@@ -1404,3 +1412,188 @@ class Loom5CorruptStateTest(unittest.TestCase):
             km.fetch = orig
         self.assertEqual(em.new_ids, [150, 200])    # *** both emitted, neither skipped ***
         self.assertTrue([f for e, f in em.events if e == "state_corrupt"])
+
+
+class Loom6ContractValidationTest(unittest.TestCase):
+    """Loom re-audit 6 - written from its repros. Every page is validated, including the empty and the
+    self-contradictory ones, and the corruption pin now survives a restart."""
+
+    def _target(self, cursor, emitter):
+        return BoundedWindowEndToEndTest()._target(cursor, emitter)
+
+    def _run(self, t, f):
+        orig, km.fetch = km.fetch, f
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+
+    def test_LOOM6_an_EMPTY_page_claiming_more_must_pin(self):
+        # loom's repro: main [200] omitted; page before 200 is EMPTY with next=150; page 150 returns
+        # [100] terminal => span declared covered while 175 was never observed. The oldest-row check
+        # cannot fire on an empty page, so emptiness itself has to be the signal.
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = self._target(cursor=100, emitter=em)
+        pages = {200: {"result": [], "next_before_id": 150},
+                 150: {"result": [{"id": 100}], "next_before_id": None}}
+
+        def f(opener, url, headers):
+            if "before_id=" in url:
+                return km.fetch_from_payload(pages[int(url.split("before_id=")[1].split("&")[0])])
+            return km.Poll(True, items=[{"id": 200}], omitted=1, next_before_id=200)
+        self._run(t, f)
+        self.assertEqual(t.cursor, 100)                 # *** did not step over 175 ***
+        self.assertTrue([x for e, x in em.events if e == "alert"])
+
+    def test_an_empty_page_that_AFFIRMS_the_end_still_closes(self):
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = self._target(cursor=100, emitter=em)
+
+        def f(opener, url, headers):
+            if "before_id=" in url:
+                return km.fetch_from_payload({"result": [], "next_before_id": None})
+            return km.Poll(True, items=[{"id": 200}], omitted=1, next_before_id=200)
+        self._run(t, f)
+        self.assertEqual(t.cursor, 200)
+
+    def test_LOOM6_a_page_that_declares_withholding_AND_the_end_is_contradictory(self):
+        # loom: page [150], truncated=true, next=null advances despite the declared withholding.
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = self._target(cursor=100, emitter=em)
+
+        def f(opener, url, headers):
+            if "before_id=" in url:
+                return km.fetch_from_payload({"result": [{"id": 150}], "truncated": True,
+                                              "next_before_id": None})
+            return km.Poll(True, items=[{"id": 200}], omitted=1, next_before_id=200)
+        self._run(t, f)
+        self.assertEqual(t.cursor, 100)
+        self.assertTrue([x for e, x in em.events if e == "alert"])
+
+    def test_LOOM6_empty_plus_truncated_plus_terminal_is_also_contradictory(self):
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = self._target(cursor=100, emitter=em)
+
+        def f(opener, url, headers):
+            if "before_id=" in url:
+                return km.fetch_from_payload({"result": [], "truncated": True, "next_before_id": None})
+            return km.Poll(True, items=[{"id": 200}], omitted=1, next_before_id=200)
+        self._run(t, f)
+        self.assertEqual(t.cursor, 100)
+
+    # ---- MEDIUM: bools, duplicates, uninterpretable flags ----------------------------------------
+    def test_a_boolean_is_not_a_row_id(self):
+        self.assertFalse(km.fetch_from_payload({"result": [{"id": True}]}).ok)
+
+    def test_a_boolean_is_not_a_size_dropped(self):
+        self.assertEqual(km._declared_omissions({"result": [], "size_dropped": True}), (0, True))
+
+    def test_duplicate_ids_in_one_page_are_rejected(self):
+        # The cursor dedupes against what it has ALREADY delivered, so a repeat inside one window is
+        # emitted twice.
+        p = km.fetch_from_payload({"result": [{"id": 5}, {"id": 5}], "next_before_id": None})
+        self.assertFalse(p.ok)
+        self.assertIn("duplicate", p.reason)
+
+    def test_an_uninterpretable_truncation_flag_is_not_a_denial(self):
+        for junk in ("yes", 1, [], {}):
+            n, exact = km._declared_omissions({"result": [], "truncated": junk})
+            self.assertGreaterEqual(n, 1, "truncated=%r must not read as 'nothing withheld'" % (junk,))
+            self.assertFalse(exact)
+        self.assertEqual(km._declared_omissions({"result": [], "truncated": False}), (0, True))
+
+
+class Loom6PinPersistenceTest(unittest.TestCase):
+    """Loom re-audit 6, HIGH 1. A pin that does not survive a restart is not a pin."""
+
+    def _path(self):
+        return os.path.join(tempfile.mkdtemp(), "hive.json")
+
+    def test_the_corruption_pin_round_trips(self):
+        p = self._path()
+        km.StateFile(p, "idx").save(149, "UP", 0, pin_forced=True, pin_evidence_intact=False,
+                                    state_corrupt=True)
+        loaded = km.StateFile(p, "idx").load()
+        self.assertTrue(loaded["pin_forced"])
+        self.assertFalse(loaded["pin_evidence_intact"])
+        self.assertTrue(loaded["state_corrupt"])
+        self.assertEqual(loaded["cursor"], 149)
+
+    def test_an_ordinary_save_persists_no_pin(self):
+        p = self._path()
+        km.StateFile(p, "idx").save(200, "UP", 0)
+        loaded = km.StateFile(p, "idx").load()
+        self.assertFalse(loaded["pin_forced"])
+        self.assertTrue(loaded["pin_evidence_intact"])
+        self.assertFalse(loaded["state_corrupt"])
+        with open(p) as f:
+            self.assertNotIn("pin_forced", json.load(f))     # absent, not written as false
+
+    def test_LOOM6_a_restart_cannot_let_the_replay_cap_cross_a_corruption_pin(self):
+        # loom's repro: corrupt prior, visible 150/200 => cursor 149 forced; RESTART with a bounded
+        # window 200/201/202 and max_replay 1 => cursor jumped to 202, crossing the hidden span.
+        p = self._path()
+        km.StateFile(p, "idx").save(149, "UP", 0, pin_forced=True, pin_evidence_intact=False,
+                                    state_corrupt=True)
+        loaded = km.StateFile(p, "idx").load()
+
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = BoundedWindowEndToEndTest()._target(cursor=loaded["cursor"], emitter=em)
+        t.armed = False
+        t.pin_forced = loaded["pin_forced"] or not loaded["pin_evidence_intact"]
+        t.pin_evidence_intact = loaded["pin_evidence_intact"]
+        t.state_corrupt = loaded["state_corrupt"]
+        t.args.max_replay = 1
+        orig, km.fetch = km.fetch, lambda o, u, h: km.Poll(
+            True, items=[{"id": 200}, {"id": 201}, {"id": 202}], omitted=2, next_before_id=200)
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertEqual(t.cursor, 149)             # *** the pin survived the restart ***
+        self.assertEqual([e for e, _ in em.events if e == "replay_capped"], [])
+
+
+    def test_LOOM6_the_pin_is_restored_by_WatchTarget_init_itself(self):
+        # The previous test simulated what __init__ does; this one EXERCISES it, which is the difference
+        # between testing the property and testing my restatement of it. The mutation harness caught
+        # that gap: breaking the real load path changed nothing the suite could see.
+        base = self._path()
+        url = "http://x/api/inbox?persona=argus"
+        # The watcher derives ONE FILE PER PERSONA from the base path, so the fixture has to write where
+        # __init__ will actually look. Writing to the base path made this test pass vacuously at first.
+        derived = km._state_path_for_persona(base, "argus")
+        km.StateFile(derived, km.canonical_identity(url)).save(
+            149, "UP", 0, pin_forced=True, pin_evidence_intact=False, state_corrupt=True)
+
+        class A(BoundedWindowEndToEndTest.FullArgs):
+            state_file = base
+            seed_at = None
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = km.WatchTarget("argus", url, None, {}, A(), em)
+        self.addCleanup(lambda: t.state_file and t.state_file.close()
+                        if hasattr(t.state_file, "close") else None)
+        self.assertTrue(t.pin_forced)              # restored by __init__, not by the test
+        self.assertFalse(t.pin_evidence_intact)
+        self.assertTrue(t.state_corrupt)
+        self.assertEqual(t.cursor, 149)
+
+    def test_LOOM6_the_persisted_pin_is_authoritative_ON_ITS_OWN(self):
+        # ISOLATION MATTERS HERE. With both flags set, "pin_forced" and "evidence lost" produce the same
+        # answer, so a load path that ignores the persisted flag entirely still looks correct. This case
+        # persists ONLY pin_forced, where the inference from missing evidence would say False.
+        base = self._path()
+        url = "http://x/api/inbox?persona=argus"
+        km.StateFile(km._state_path_for_persona(base, "argus"), km.canonical_identity(url)).save(
+            149, "UP", 0, pin_forced=True, pin_evidence_intact=True, state_corrupt=False)
+
+        class A(BoundedWindowEndToEndTest.FullArgs):
+            state_file = base
+            seed_at = None
+        t = km.WatchTarget("argus", url, None, {}, A(), BoundedWindowEndToEndTest.RecordingEmitter())
+        self.assertTrue(t.pin_forced)              # from the FLAG, not inferred from lost evidence
+        self.assertTrue(t.pin_evidence_intact)
+
+
+if __name__ == "__main__":
+    unittest.main()
