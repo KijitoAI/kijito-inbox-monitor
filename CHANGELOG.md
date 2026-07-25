@@ -5,6 +5,17 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+### Security
+- **The event stream was world-readable and it carries message bodies** (Loom re-audit 8, HIGH 1). Event
+  files and the state-file lock sidecar were created with a plain `open()`, which takes the process umask -
+  022 by default - so every `events.<persona>.ndjson` was mode 0644 and readable by any other local user,
+  with message content in it unless `--no-content` was set. The auth token (0600) and the state file (0600
+  via `mkstemp`) were already correct, which is what made the gap easy to miss: the one file nobody had
+  thought about is the one holding the plaintext. Both are now created 0600, directories this tool creates
+  are 0700, and an **existing** file that is more permissive is tightened on open and the change reported -
+  because the creation mode does nothing for files that already leaked. Rotated archives inherit 0600 from
+  the live file. If you have been running an earlier version, check the modes on your events files.
+
 ### Changed
 - **Delivery is now ACKNOWLEDGED rather than assumed, and the delivery guarantee is stated honestly as
   at-least-once, in order** (Loom re-audit 7, HIGH 1). The cursor *is* the acknowledgement: once it moves
@@ -39,6 +50,17 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
   pinned, the identical window was re-emitted on every poll and across every restart. The pin now carries a
   persisted release floor, and every delivered id the watermark does not cover is remembered whatever left it
   uncovered. (Repairing a fail-open into a permanent fail-closed is not a repair.)
+- **The events file's DIRECTORY ENTRY was never made durable** (Loom re-audit 8, HIGH 2). `fsync` on the
+  file descriptor makes the *bytes* durable; the *name* lives in the directory. On create and on rotation
+  the directory was left unsynced, so the state directory could persist an advanced cursor while the event
+  pathname or a rotated archive was lost - and `--state-file` and `--events-file-template` may be in
+  *different* directories, so syncing one proves nothing about the other. The events directory is now
+  synced before the cursor that acknowledges those events is persisted, and a failure holds the cursor.
+- **A failed state-directory `fsync` was reported as success** (Loom re-audit 8, HIGH 3). `save()` called
+  the sync and discarded its answer, so the cursor was written and its durability merely assumed, with no
+  diagnostic. `save()` now returns whether the write is durable and says so loudly when it is not. (The
+  failure direction is re-delivery rather than loss - a reverted state file replays mail - but a watcher
+  that cannot tell you it failed to persist will keep not telling you.)
 - **A cursor could outlive the event it acknowledged** (Loom re-audit 7, MEDIUM). The state file's temp was
   fsynced but the directory holding the rename was not, and the event sink was flushed but never fsynced.
   Events are now fsynced *before* the cursor that acknowledges them is persisted, and the state directory is
