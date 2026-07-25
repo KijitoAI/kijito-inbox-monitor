@@ -42,6 +42,13 @@ class FakeOpener:
         return self.response
 
 
+def read_file(path):
+    """Read a file and CLOSE it. `open(p).read()` leaves the handle to the GC, which is what the suite's
+    ResourceWarnings were made of - and this repo treats a leaked fd as a real defect (see StateFile)."""
+    with open(path) as f:
+        return f.read()
+
+
 _AUTO = object()
 
 
@@ -1822,6 +1829,98 @@ class Loom7DeliveryAcknowledgementTest(unittest.TestCase):
         self.assertIn("holding the cursor", buf.getvalue())
 
 
+class Loom7PoisonMessageTest(unittest.TestCase):
+    """A CONTENT BYTE MUST NEVER BECOME A DELIVERY FAILURE.
+
+    ★ FOUND BY RE-READING ROUND 7 ADVERSARIALLY, and it is the delivery gate's own shadow: before the
+    gate, an event that could not be represented was swallowed; after it, the SAME event would report a
+    permanent non-delivery and wedge the watermark on one message forever. Two real shapes do this - a
+    NUL (illegal in an environment value) and a lone surrogate (not encodable to UTF-8). The file path
+    was worse still: it raised UnicodeEncodeError straight out of poll_once, which under a KeepAlive
+    supervisor is a CRASH LOOP, because the same message is refetched every restart.
+
+    Trading a silent skip for a permanent stall is the exact failure this project keeps re-learning, so
+    the event is made representable rather than failed on.
+    """
+    def test_a_NUL_in_content_does_not_block_exec_delivery(self):
+        e = km.Emitter("exec-per-event", "true", 220, False)
+        self.assertIs(e.new({"id": 1, "from": "river", "content": "hello\x00world"}), True)
+
+    def test_a_LONE_SURROGATE_does_not_block_exec_delivery(self):
+        e = km.Emitter("exec-per-event", "true", 220, False)
+        self.assertIs(e.new({"id": 2, "from": "river", "content": "bad \ud800 char"}), True)
+
+    def test_a_LONE_SURROGATE_does_not_CRASH_the_file_sink(self):
+        d = tempfile.mkdtemp()
+        sink = km.RotatingFileSink(os.path.join(d, "events.ndjson"), 0, 5)
+        self.addCleanup(sink.close)
+        e = km.Emitter("stdout-jsonl", None, 220, False, sink=sink)
+        self.assertIs(e.new({"id": 3, "from": "river", "content": "bad \ud800 char"}), True)
+        line = read_file(os.path.join(d, "events.ndjson"))
+        self.assertIn('"id": 3', line)
+        self.assertNotIn("\ud800", line)
+
+    def test_the_unrepresentable_field_can_be_ANY_field_not_just_content(self):
+        # sanitising the SERIALISED line covers `from`, an alarm `reason` built from server data, etc.
+        d = tempfile.mkdtemp()
+        sink = km.RotatingFileSink(os.path.join(d, "events.ndjson"), 0, 5)
+        self.addCleanup(sink.close)
+        e = km.Emitter("stdout-jsonl", None, 220, False, sink=sink)
+        self.assertIs(e.lifecycle("alert", reason="stranded-mail: \ud800 inbox", persona="argus"), True)
+        self.assertIn("stranded-mail", read_file(os.path.join(d, "events.ndjson")))
+
+    def test_ordinary_unicode_is_left_ALONE(self):
+        # The control. A sanitiser that mangles normal text would be its own defect - most mail is not ASCII.
+        d = tempfile.mkdtemp()
+        sink = km.RotatingFileSink(os.path.join(d, "events.ndjson"), 0, 5)
+        self.addCleanup(sink.close)
+        e = km.Emitter("stdout-jsonl", None, 220, False, sink=sink)
+        e.new({"id": 4, "from": "river", "content": "naïve café 日本語 — ★ emoji 🎉"})
+        self.assertIn("naïve café 日本語 — ★ emoji 🎉", read_file(os.path.join(d, "events.ndjson")))
+        self.assertEqual(km._safe_text("naïve café 日本語 🎉"), "naïve café 日本語 🎉")
+
+    def test_an_encoding_error_on_write_is_a_FAILED_DELIVERY_not_a_crash(self):
+        # The sanitiser makes this branch unreachable through the normal path, which is exactly why it
+        # needs its own test: the mutation harness showed that reverting the guard to OSError-only broke
+        # nothing, i.e. the defence was untested. Whatever the cause, an encoding error must come back as
+        # a non-delivery (loud, retried) rather than propagate out of poll_once, because an exception
+        # escaping the poll loop under a KeepAlive supervisor is a silent crash loop.
+        d = tempfile.mkdtemp()
+        sink = km.RotatingFileSink(os.path.join(d, "events.ndjson"), 0, 5)
+        self.addCleanup(sink.close)
+        real_fh = sink._fh
+        self.addCleanup(real_fh.close)
+
+        class Strict:
+            def write(self, s):
+                raise UnicodeEncodeError("utf-8", "x", 0, 1, "surrogates not allowed")
+            def flush(self):
+                pass
+            def close(self):
+                pass
+        sink._fh = Strict()
+        buf, err = __import__("io").StringIO(), km.sys.stderr
+        km.sys.stderr = buf
+        try:
+            self.assertIs(sink.write("{}\n"), False)      # reported, not raised
+        finally:
+            km.sys.stderr = err
+        self.assertIn("holding the cursor", buf.getvalue())
+
+    def test_a_poison_message_does_not_WEDGE_the_watermark(self):
+        # End to end: the whole point. This message can never be delivered by a naive emitter, and the
+        # delivery gate would hold the cursor below it on every poll, forever.
+        E2E = BoundedWindowEndToEndTest
+        d = tempfile.mkdtemp()
+        sink = km.RotatingFileSink(os.path.join(d, "events.ndjson"), 0, 5)
+        self.addCleanup(sink.close)
+        em = km.Emitter("stdout-jsonl", None, 220, False, sink=sink)
+        t = E2E()._target(cursor=100, emitter=em)
+        E2E()._run(t, lambda o, u, h: server_page(
+            [{"id": 200, "from": "river", "content": "poison \ud800\x00 payload"}], omitted=0))
+        self.assertEqual(t.cursor, 200, "an unrepresentable message must not freeze the watermark")
+
+
 class Loom7DurabilityOrderingTest(unittest.TestCase):
     """Loom re-audit 7, MEDIUM. The EVENT must be durable BEFORE the CURSOR that acknowledges it."""
     E2E = BoundedWindowEndToEndTest
@@ -2145,6 +2244,40 @@ class Loom7InversePaginationContradictionTest(unittest.TestCase):
         self.assertEqual(t.cursor, 100)              # ...but the watermark does NOT step over the span
         self.assertTrue([x for e, x in em.events if e == "alert"])
 
+    def test_a_window_that_did_not_ANSWER_cannot_assert_it_withheld_nothing(self):
+        # ★ FOUND BY RE-READING ROUND 7 ADVERSARIALLY, and it is the audit-5 HIGH 1 rule one layer over:
+        # the WALK has refused to read an absent/malformed continuation as exhaustion since round 5, but
+        # the GAP CHECK consulted only `omitted`. So a server that garbled `next_before_id` while
+        # declaring no omission advanced the watermark over whatever it was hiding - silently, no alert.
+        # The two fields are ONE statement; half of it being unreadable makes the other half unusable.
+        for label, payload in (
+            ("malformed", {"result": [{"id": 200}], "next_before_id": "abc"}),
+            ("absent", {"result": [{"id": 200}]}),
+            ("non-integral", {"result": [{"id": 200}], "next_before_id": 1.5}),
+        ):
+            poll = km.fetch_from_payload(payload)
+            self.assertFalse(poll.continuation_ok, label)
+            t = BoundedWindowGapTest()._target(cursor=100)
+            gap = t._uncovered_gap(poll, poll.items)
+            self.assertIsNotNone(gap, "a %s continuation must not read as 'nothing was omitted'" % label)
+            self.assertFalse(gap[3], "there is no stated quantity, so the omission is INEXACT")
+        # the control: a window that DID answer, and answered "nothing older", still advances freely
+        ok = km.fetch_from_payload({"result": [{"id": 200}], "next_before_id": None})
+        self.assertTrue(ok.continuation_ok)
+        self.assertIsNone(BoundedWindowGapTest()._target(cursor=100)._uncovered_gap(ok, ok.items))
+
+    def test_a_window_that_did_not_answer_cannot_RELEASE_a_pin_either(self):
+        em = self.E2E.RecordingEmitter()
+        t = self.E2E()._target(cursor=100, emitter=em)
+        t.pin_evidence_intact, t.pin_forced = False, True
+        orig, km.fetch = km.fetch, lambda o, u, h: km.fetch_from_payload(
+            {"result": [{"id": 90}, {"id": 100}, {"id": 120}], "next_before_id": "abc"})
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertTrue(t.pin_forced, "a window that did not answer cannot be the proof that nothing is hidden")
+
     def test_a_walk_page_with_the_inverse_contradiction_is_NOT_coverage(self):
         t = WalkBackTest()._target(cursor=100)
 
@@ -2270,6 +2403,91 @@ class Loom7CorruptionPinReleaseTest(unittest.TestCase):
         self.assertEqual(t.emitted_above, {120, 150})
         self.assertEqual(t.cursor, 100)              # while the pin still legitimately holds
         self.assertTrue(t.pin_forced)
+
+    def test_a_pin_is_NOT_discharged_by_a_poll_that_could_not_DELIVER(self):
+        # ★ FOUND BY ADVERSARIALLY RE-READING MY OWN ROUND-7 WORK. Both release proofs answer "did the
+        # SERVER withhold anything" - neither says anything about whether WE handed the window over.
+        # Releasing on a poll whose delivery failed threw away the release floor AND state_corrupt while
+        # the watermark was still parked below the entire mailbox.
+        em = self.E2E.RecordingEmitter(fail_ids={150})
+        t = self._corrupt_target(em)
+        self.E2E()._run(t, self.E2E()._fetch([{"id": 150}, {"id": 200}], 0))
+        self.assertTrue(t.pin_forced, "a pin must not be discharged while we still owe someone mail")
+        self.assertEqual(t.pin_release_at, 150, "the release floor must survive a blocked delivery")
+        self.assertTrue(t.state_corrupt)
+        self.assertEqual(t.cursor, 149)
+        # ...and it self-clears the moment delivery recovers, so this is not a new permanent pin
+        em.fail_ids.clear()
+        self.E2E()._run(t, self.E2E()._fetch([{"id": 150}, {"id": 200}], 0))
+        self.assertFalse(t.pin_forced)
+        self.assertEqual(t.cursor, 200)
+        self.assertEqual(em.new_ids, [150, 200])
+
+    def test_the_WALK_proof_is_also_gated_on_delivery_not_only_the_window_proof(self):
+        # ⚠️ THE TWO PROOFS NEED SEPARATE TESTS. The test above reaches the release through the
+        # COMPLETE-WINDOW path (no gap, so `release_earned` is never even set), which left the WALK
+        # path's gate defending nothing - the mutation harness caught exactly that. This shape has a
+        # real gap, a walk that COMPLETES (so the walk proof is earned), and a delivery that fails.
+        em = self.E2E.RecordingEmitter(fail_ids={150})
+        t = self._corrupt_target(em)
+        self.E2E()._run(t, self.E2E()._fetch([{"id": 150}, {"id": 200}], 1,
+                                             walk={150: ([{"id": 149}], None)}))
+        self.assertTrue(t.pin_forced, "a COMPLETED WALK must not discharge a pin we could not deliver")
+        self.assertEqual(t.pin_release_at, 150)
+        em.fail_ids.clear()
+        self.E2E()._run(t, self.E2E()._fetch([{"id": 150}, {"id": 200}], 1,
+                                             walk={150: ([{"id": 149}], None)}))
+        self.assertFalse(t.pin_forced, "and it must clear once delivery recovers")
+
+    def test_LOOM7_a_blocked_delivery_does_not_leave_a_pin_that_can_NEVER_clear(self):
+        # THE FULL CHAIN, end to end and across a RESTART, because the harm only became visible there:
+        # release-while-blocked discarded the floor; the restart re-forced the pin from the surviving
+        # pin_evidence_intact=False, now with NO floor; and `reach <= cursor` is unsatisfiable when the
+        # cursor sits below the oldest message that exists. Measured before the fix: the watermark froze
+        # below the whole mailbox permanently, leaving emitted_above as the only thing preventing
+        # re-delivery - i.e. correctness resting on an unbounded set.
+        d = tempfile.mkdtemp()
+        base = os.path.join(d, "hive.json")
+        url = "http://x/api/inbox?persona=argus"
+        with open(km._state_path_for_persona(base, "argus"), "w") as f:
+            f.write("{garbled")
+
+        class A(BoundedWindowEndToEndTest.FullArgs):
+            state_file = base
+            seed_at = None
+            max_replay = 5
+        window = [{"id": 100 + i} for i in range(20)]
+
+        def poll(target, times=1):
+            orig, km.fetch = km.fetch, (lambda o, u, h: server_page(window, omitted=0))
+            try:
+                for _ in range(times):
+                    target.poll_once()
+            finally:
+                km.fetch = orig
+
+        buf, err = __import__("io").StringIO(), km.sys.stderr
+        km.sys.stderr = buf
+        try:
+            em = self.E2E.RecordingEmitter(fail_ids={100})       # delivery broken on the arming poll
+            t = km.WatchTarget("argus", url, None, {}, A(), em)
+            poll(t)
+            t.state_file.unlock()
+            saved = json.load(open(km._state_path_for_persona(base, "argus")))
+            self.assertEqual(saved.get("pin_release_at"), 100, "the floor must be persisted, not discarded")
+            self.assertTrue(saved.get("pin_forced"))
+
+            em2 = self.E2E.RecordingEmitter()                     # RESTART, delivery healthy again
+            t2 = km.WatchTarget("argus", url, None, {}, A(), em2)
+            self.addCleanup(t2.state_file.unlock)
+            self.assertEqual(t2.pin_release_at, 100)
+            poll(t2, 3)
+        finally:
+            km.sys.stderr = err
+        self.assertFalse(t2.pin_forced, "the pin must clear once delivery recovers")
+        self.assertEqual(t2.cursor, 119, "the watermark must reach the window max, not freeze below it")
+        self.assertEqual(sorted(set(em2.new_ids)), [m["id"] for m in window])
+        self.assertEqual(t2.emitted_above, set(), "nothing should still need per-id tracking")
 
     def test_BOTH_release_paths_clear_the_state_that_was_holding_the_pin(self):
         # ★ FOUND BY RUNNING THE REPRO AGAINST THE LIVE API AND READING WHAT WAS ACTUALLY WRITTEN BACK.

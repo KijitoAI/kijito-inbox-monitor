@@ -405,6 +405,28 @@ def _now_iso():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def _safe_text(s):
+    """Return `s` in a form that can ALWAYS be written to a UTF-8 file and put in a child's environment.
+
+    A CONTENT BYTE MUST NEVER BECOME A DELIVERY FAILURE. Two shapes arrive from real message bodies and
+    neither is our bug to have opinions about:
+      · a NUL, which cannot appear in an environment value at all (subprocess raises ValueError);
+      · a lone surrogate, which cannot be encoded to UTF-8 (json.dumps(ensure_ascii=False) passes it
+        straight through, and the file write then raises UnicodeEncodeError).
+    Both used to matter less because emit failures were swallowed. With the round-7 delivery gate they
+    would matter enormously: the exec path would report a permanent non-delivery and WEDGE THE WATERMARK
+    on that one message forever, and the file path would raise straight out of poll_once and crash the
+    producer - which under a KeepAlive supervisor is a crash LOOP, since the same message is refetched
+    every time. Trading a silent skip for a permanent stall is the failure this project keeps re-learning
+    (see the corruption pin), so the fix is to make the event REPRESENTABLE rather than to fail on it.
+    """
+    try:
+        s.encode("utf-8")
+    except UnicodeEncodeError:
+        s = s.encode("utf-8", "replace").decode("utf-8")
+    return s.replace("\x00", "") if "\x00" in s else s
+
+
 class RotatingFileSink:
     """Owns the events-log fd and rotates it by size IN-PROCESS, so the writer reopens after its OWN rename.
 
@@ -438,7 +460,10 @@ class RotatingFileSink:
         try:
             self._fh.write(line)
             self._fh.flush()
-        except OSError as e:
+        except (OSError, UnicodeError, ValueError) as e:
+            # UnicodeError/ValueError are belt-and-braces behind _safe_text(): an event that still cannot
+            # be encoded must be a FAILED DELIVERY (loud, retried, visible on stderr) and never an
+            # exception escaping poll_once, which under a KeepAlive supervisor is a silent crash loop.
             sys.stderr.write("kijito-inbox-monitor: WARNING event write FAILED, holding the cursor: %s\n" % e)
             return False
         self._pending = True
@@ -577,7 +602,9 @@ class Emitter:
         will be re-delivered rather than dropped, because a duplicate is recoverable and a skip is not.
         """
         if self.mode == "stdout-jsonl":
-            line = json.dumps(event, ensure_ascii=False) + "\n"
+            # Sanitised at the SERIALISED line, so one call covers every field an event can carry -
+            # content, `from`, an alarm `reason` built from server data - rather than each of them.
+            line = _safe_text(json.dumps(event, ensure_ascii=False)) + "\n"
             sink = self._sink_for(event.get("persona"))
             if sink is not None:
                 return sink.write(line)
@@ -607,7 +634,7 @@ class Emitter:
                     v = event[k]
                     # A list is comma-joined, not str()'d: a Python repr ("['a', 'b']") is unusable from a
                     # shell consumer, and exec-per-event is the portable primitive people reach for first.
-                    env[envname] = ",".join(str(x) for x in v) if isinstance(v, list) else str(v)
+                    env[envname] = _safe_text(",".join(str(x) for x in v) if isinstance(v, list) else str(v))
             try:
                 r = subprocess.run(self.exec_cmd, shell=True, env=env, timeout=EXEC_TIMEOUT, check=False)
             except subprocess.TimeoutExpired:
@@ -1271,6 +1298,15 @@ class WatchTarget:
         exactly when a bounded window starts hiding things.
         """
         declared, exact = poll.omitted, poll.omitted_exact
+        if not poll.continuation_ok:
+            # SILENCE IS NOT AN ANSWER HERE EITHER. A window whose `next_before_id` is ABSENT or
+            # MALFORMED has told us nothing about whether it withheld rows, so its "I omitted nothing"
+            # cannot be taken as an assertion - the two fields are one statement and half of it is
+            # unreadable. The WALK has refused to read that silence as exhaustion since Loom re-audit 5
+            # (HIGH 1); the gap check never got the same rule, so a server that garbled the field while
+            # declaring no omission advanced the watermark over anything it was hiding, silently and
+            # with no alert. Same defect, one layer over. (Found by re-reading round 7 adversarially.)
+            declared, exact = max(declared, 1), False
         if not poll.consistent:
             # A SELF-CONTRADICTORY WINDOW IS AN OMISSION WE CANNOT COUNT (Loom re-audit 7, HIGH 4). This
             # check used to read `poll.omitted` alone and never looked at the continuation at all, so a
@@ -1473,6 +1509,7 @@ class WatchTarget:
                 # be sitting in the uncovered gap - and advancing the cursor past it loses it forever.
                 gap = self._uncovered_gap(poll, items)
                 pinned = False
+                release_earned = False
                 if gap is not None:
                     cursor_at, window_floor, omitted, omitted_exact = gap
                     visible = {m["id"] for m in items}
@@ -1511,13 +1548,13 @@ class WatchTarget:
                     if closed and not self.pin_evidence_intact:
                         # An authoritative read re-establishes ground truth, so the span is knowable again.
                         self.pin_evidence_intact = True
-                    if closed:
-                        # AND RELEASE THE FORCED PIN (Loom re-audit 5, MEDIUM). A forced pin was held
-                        # because tracking was lost; a COMPLETED walk is the authoritative evidence that
-                        # replaces it. Leaving it set froze the watermark permanently, and because a
-                        # non-pinned poll never records emitted ids, every later window re-emitted the
-                        # same mail forever - the duplicate storm the pin exists to prevent.
-                        self._release_pin()
+                    # RELEASE THE FORCED PIN (Loom re-audit 5, MEDIUM) - but not here, and not yet. A
+                    # forced pin was held because tracking was lost, and a COMPLETED walk is the
+                    # authoritative evidence that replaces it; leaving it set froze the watermark
+                    # permanently. The DECISION is made here, where the evidence is; the ACT is deferred
+                    # until after delivery, because a pin must not be discharged on a poll that failed to
+                    # hand over what it was holding (see the release site below).
+                    release_earned = closed
                     pinned = not closed
                     # Alert identity is the PINNED WATERMARK, not the window floor. The floor drifts upward
                     # as new mail arrives, so keying on it re-fires for what is the same unresolved span;
@@ -1564,15 +1601,31 @@ class WatchTarget:
                 if blocked_at is None:
                     self._delivery_recovered()
 
+                # ★ A PIN IS NOT DISCHARGED ON A POLL THAT COULD NOT DELIVER (found by adversarially
+                # re-reading my own round-7 work, the way loom would). Both proofs answer "did the SERVER
+                # withhold anything" - neither says a word about whether WE handed the window over. On a
+                # corrupt-state arm the watermark sits at min(visible)-1, so releasing while delivery was
+                # blocked threw away the release floor AND the state_corrupt flag while the cursor was
+                # still parked below the whole mailbox. A restart then re-forced the pin from the
+                # surviving pin_evidence_intact=False - now with NO floor - and `reach <= cursor` is
+                # unsatisfiable when the cursor sits below the oldest message that exists. Measured: the
+                # watermark froze at 99 forever and correctness fell back entirely onto emitted_above
+                # growing without bound. Holding the pin one more poll costs nothing; the delivery gate
+                # already holds the cursor, and the pin self-clears the moment delivery recovers.
+                if release_earned and blocked_at is None:
+                    self._release_pin()
+
                 if not pinned:
                     # A COMPLETE window that reaches back past the watermark proves everything above it is
                     # visible, so a leftover pin can be released even when there is nothing NEW to emit.
                     # Gating this on `new_items` left a restored pin stuck forever whenever the window
                     # contained only ids we had already delivered - the exact state a restart lands in.
                     reach = min((m["id"] for m in items), default=None)
-                    complete = (poll.omitted == 0 and poll.consistent
+                    # `continuation_ok` belongs here for the same reason it belongs in the gap check:
+                    # a window that did not answer "is there more?" cannot be the PROOF that there is not.
+                    complete = (poll.omitted == 0 and poll.consistent and poll.continuation_ok
                                 and reach is not None and reach <= self._pin_release_floor())
-                    if self.pin_forced and complete:
+                    if self.pin_forced and complete and blocked_at is None:
                         # The other authoritative proof: nothing was withheld AND the window reaches back
                         # past the watermark, so there is no span left to be uncertain about. Without this
                         # a forced pin that never sees a gap again could never clear, and the watermark
