@@ -137,13 +137,15 @@ class Poll:
     window turns into permanent mail loss: items the server omitted are never emitted, and the cursor
     then advances past them. The truncation is not silent in the DATA - only in the handling of it.
     """
-    def __init__(self, ok, items=None, reason=None, status=None, redirected=False, omitted=0):
+    def __init__(self, ok, items=None, reason=None, status=None, redirected=False, omitted=0,
+                 omitted_exact=True):
         self.ok = ok
         self.items = items
         self.reason = reason
         self.status = status
         self.redirected = redirected
-        self.omitted = omitted   # >0 iff the server said this window is incomplete
+        self.omitted = omitted             # >0 iff the server said this window is incomplete
+        self.omitted_exact = omitted_exact  # False => `omitted` is only a LOWER BOUND, never closable by count
 
 
 def fetch(opener, url, headers):
@@ -172,29 +174,38 @@ def fetch(opener, url, headers):
     for m in items:
         if not isinstance(m, dict) or not isinstance(m.get("id"), int):
             return Poll(False, reason="shape-invalid: row missing integer id", status=status)
-    return Poll(True, items=items, status=status, omitted=_declared_omissions(data))
+    n, exact = _declared_omissions(data)
+    return Poll(True, items=items, status=status, omitted=n, omitted_exact=exact)
 
 
 def _declared_omissions(data):
     """How many messages the server says it left out of this window (0 if it says none).
 
+    Returns (count, exact). `exact` is False when the server signalled a truncation WITHOUT saying how
+    many rows it withheld - then `count` is only a LOWER BOUND, and no amount of recovered mail can prove
+    the span empty, because there is no number to reach. A gap with an inexact count must stay pinned
+    until an authoritative backward read can walk it; counting rows against a lower bound would let one
+    recovered message "close" an unbounded hole.
+
     An alarm that invents losses is as corrosive as one that hides them, so this must not round in
     either direction. THREE DISTINCT SIGNALS, and conflating them is wrong BOTH ways:
-      truncated=True                    -> rows withheld by the COUNT limit. Count unknown, so >= 1.
-      size_dropped=N>0                  -> N rows withheld by the content budget.
+      truncated=True                    -> rows withheld by the COUNT limit, quantity NOT stated -> inexact.
+      size_dropped=N                    -> exactly N rows withheld by the content budget -> exact.
       size_truncated=True, size_dropped=0 -> a lone oversized message had its BODY clipped. No row was
                                            withheld, so this contributes NOTHING. Verified live: a
                                            limit=3 request returns truncated=True with size_dropped=0
                                            and rows genuinely missing, while an oversized single message
                                            reports size_truncated with nothing dropped.
     """
-    n = 1 if data.get("truncated") is True else 0
+    n, exact = 0, True
+    if data.get("truncated") is True:
+        n, exact = n + 1, False        # count-limit truncation never states a quantity
     dropped = data.get("size_dropped")
     if isinstance(dropped, int):
         n += max(dropped, 0)
     elif data.get("size_truncated") is True:
-        n = max(n, 1)   # size truncation with no number at all: unquantified, so assume at least one
-    return n
+        n, exact = max(n, 1), False    # size truncation with no number at all
+    return (n, exact)
 
 
 # Memory count per persona, refreshed on every directory fetch. Used by the stranded-mail check to ask
@@ -523,11 +534,28 @@ class StateFile:
             return None
         # Ids already emitted ABOVE a pinned watermark. Absent in files written by older versions, which is
         # exactly the forward-compat case: an empty set just means "nothing pinned", the pre-pinning behaviour.
-        emitted = d.get("emitted_above")
-        emitted = set(emitted) if isinstance(emitted, list) and all(isinstance(i, int) for i in emitted) else set()
         alerted = d.get("gap_alerted")
         alerted = alerted if isinstance(alerted, int) else None
-        return (cursor, state, failures, emitted, alerted)
+        raw = d.get("emitted_above")
+        if raw is None:
+            emitted, intact = set(), True          # no pin was in force; the ordinary case
+        elif isinstance(raw, list) and all(isinstance(i, int) for i in raw):
+            emitted, intact = set(raw), True
+        else:
+            # CORRUPT PIN STATE MUST FAIL CLOSED. Loading it as an empty set silently UNPINS: the watcher
+            # would then think nothing was outstanding, let the replay cap jump the cursor over the very
+            # span the pin was protecting, and lose it. We cannot know which ids were delivered, so we
+            # keep the pin (empty tracking) and mark the evidence unusable - the gap can then only be
+            # closed by an authoritative read, never by counting.
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file 'emitted_above' is malformed; "
+                             "keeping the watermark PINNED with no delivery tracking rather than "
+                             "silently unpinning: %s\n" % self.path)
+            emitted, intact = set(), False
+        # A recorded gap alert with no pin tracking is itself inconsistent: something was pinned when the
+        # file was written. Treat it the same way - hold the pin rather than assume it resolved.
+        if alerted is not None and not emitted and intact and raw is None:
+            intact = False
+        return (cursor, state, failures, emitted, alerted, intact)
 
     def save(self, cursor, state, failures, emitted_above=None, gap_alerted=None):
         if not IS_POSIX:
@@ -755,7 +783,11 @@ class WatchTarget:
         # rather than stepping over them, and ids emitted above the pin are remembered here so liveness
         # (delivering what we can see) does not cost us duplicates. Both are persisted.
         self.emitted_above = set()
-        self.gap_alerted = None   # the pinned floor we have already alerted on, so pinning does not spam
+        self.gap_alerted = None   # the pinned watermark we have already alerted on, so pinning does not spam
+        # False once we can no longer reason about the pinned span - tracking overflowed, or the persisted
+        # pin state was corrupt. A gap can then only be closed by an authoritative read, never by counting.
+        self.pin_evidence_intact = True
+        self.pin_forced = False   # hold a pin whose tracking we lost, so nothing can jump the watermark
 
         self.count_url = NOTIFY_PENDING_URL
         cp = urllib.parse.urlsplit(url)
@@ -768,11 +800,14 @@ class WatchTarget:
                 self.state_file.lock()
                 loaded = self.state_file.load()
                 if loaded is not None:
-                    r_cursor, r_state, r_failures, r_emitted, r_alerted = loaded
+                    r_cursor, r_state, r_failures, r_emitted, r_alerted, r_intact = loaded
                     self.cursor = r_cursor
                     self.fsm_state, self.failures = r_state, r_failures
                     self.emitted_above = r_emitted
                     self.gap_alerted = r_alerted
+                    self.pin_evidence_intact = r_intact
+                    if not r_intact:
+                        self.pin_forced = True   # hold the pin even with nothing tracked
         if args.seed_at is not None:
             self.cursor = args.seed_at
 
@@ -818,7 +853,7 @@ class WatchTarget:
         floor = min(m["id"] for m in items)
         if floor <= self.cursor:
             return None
-        return (self.cursor, floor, poll.omitted)
+        return (self.cursor, floor, poll.omitted, poll.omitted_exact)
 
     def _reconcile_gap(self, args):
         """Re-fetch unread-only to recover mail the bounded window hid. Returns validated rows.
@@ -890,7 +925,9 @@ class WatchTarget:
                         # must respect it: the replay cap would otherwise jump the cursor straight over the
                         # gap on the first poll after a restart, silently erasing it, and the replay count
                         # would double-count mail we already delivered.
-                        pinned_on_load = bool(self.emitted_above)
+                        # `pin_forced` covers the case where the pin is real but its tracking was lost,
+                        # so an empty emitted_above must NOT read as "nothing was pinned".
+                        pinned_on_load = bool(self.emitted_above) or self.pin_forced
                         n = sum(1 for m in items if m["id"] > self.cursor)
                         if self.cursor > current_max:
                             diag = ("seed_ahead", {"seeded": self.cursor, "current_max": current_max})
@@ -925,7 +962,7 @@ class WatchTarget:
                 gap = self._uncovered_gap(poll, items)
                 pinned = False
                 if gap is not None:
-                    cursor_at, window_floor, omitted = gap
+                    cursor_at, window_floor, omitted, omitted_exact = gap
                     visible = {m["id"] for m in items}
                     # Count ONLY rows the visible window did not already contain and that sit above the
                     # watermark. Counting every returned row lets a retry that echoes the same suffix be
@@ -954,7 +991,14 @@ class WatchTarget:
                     # previously-unseen rows as the server said it withheld. Anything less pins the
                     # watermark: stepping over would make the next poll see floor<=cursor, declare itself
                     # safe, and bury the omission permanently.
-                    closed = rec_poll.ok and rec_poll.omitted == 0 and len(gap_recovered) >= omitted
+                    # An INEXACT omission count can never be closed by counting: the server said it
+                    # withheld rows without saying how many, so there is no number to reach and any
+                    # "recovered >= N" test is measuring against a guess. Such a gap pins until an
+                    # authoritative backward read can walk the span. `evidence_intact` is False once the
+                    # pin tracking has overflowed, because then a "recovered" row may simply be one we
+                    # already delivered and forgot - it cannot serve as evidence about the span.
+                    closed = (rec_poll.ok and rec_poll.omitted == 0 and omitted_exact
+                              and self.pin_evidence_intact and len(gap_recovered) >= omitted)
                     pinned = not closed
                     # Alert identity is the PINNED WATERMARK, not the window floor. The floor drifts upward
                     # as new mail arrives, so keying on it re-fires for what is the same unresolved span;
@@ -983,23 +1027,42 @@ class WatchTarget:
                     if len(self.emitted_above) > PIN_TRACKING_CAP:
                         # A pin that cannot clear would otherwise grow this set - and the state file -
                         # without bound. Keep the NEWEST ids (the ones a future window can still show us,
-                        # and therefore the ones that could be re-emitted) and say plainly that the pin has
-                        # outlived what we can track, rather than quietly dropping ids and re-delivering.
+                        # and therefore the ones that could be re-emitted) and drop the oldest.
                         keep = sorted(self.emitted_above)[-PIN_TRACKING_CAP:]
                         dropped = len(self.emitted_above) - len(keep)
                         self.emitted_above = set(keep)
-                        _warn_persona_once(self.persona or "?",
-                                           "pin at cursor %s has outlived its tracking budget: forgot %d "
-                                           "delivered id(s), so some may be re-emitted. The span still "
-                                           "cannot be read; this needs backward pagination to resolve"
-                                           % (self.cursor, dropped))
-                elif new_items:
-                    self.cursor = max(self.cursor if self.cursor is not None else 0,
-                                      max(m["id"] for m in new_items))
-                    # Watermark moved, so anything at or below it is confirmed and no longer needs tracking.
-                    if self.emitted_above:
+                        # ONCE WE HAVE FORGOTTEN A DELIVERED ID, WE CAN NO LONGER REASON ABOUT THIS SPAN.
+                        # A forgotten id reappearing in a reconcile looks "previously unseen", so it would
+                        # both re-emit AND be counted as recovery - manufacturing evidence out of our own
+                        # amnesia. From here the gap can only be closed by an authoritative read.
+                        if self.pin_evidence_intact:
+                            self.pin_evidence_intact = False
+                            # A durable event, not just stderr: this is a correctness degradation somebody
+                            # has to act on, and stderr is not something a consumer watches.
+                            self.lifecycle("alert",
+                                           reason=("bounded-window: pin at cursor %s outlived its tracking "
+                                                   "budget and forgot %d delivered id(s). Some mail may be "
+                                                   "re-emitted, and this span can no longer be closed by "
+                                                   "reconciliation - it needs an authoritative backward read"
+                                                   % (self.cursor, dropped)),
+                                           cursor_at=self.cursor, forgot=dropped,
+                                           pinned=True, evidence_lost=True)
+                elif not self.pin_forced:
+                    # A COMPLETE window that reaches back past the watermark proves everything above it is
+                    # visible, so a leftover pin can be released even when there is nothing NEW to emit.
+                    # Gating this on `new_items` left a restored pin stuck forever whenever the window
+                    # contained only ids we had already delivered - the exact state a restart lands in.
+                    reach = min((m["id"] for m in items), default=None)
+                    complete = poll.omitted == 0 and reach is not None and reach <= (self.cursor or 0)
+                    high = max([m["id"] for m in new_items] + ([max(m["id"] for m in items)] if complete else []),
+                               default=None)
+                    if high is not None and high > (self.cursor or 0):
+                        self.cursor = high
+                        # Watermark moved, so anything at or below it is confirmed and needs no tracking.
                         self.emitted_above = {i for i in self.emitted_above if i > self.cursor}
-                    self.gap_alerted = None
+                        if not self.emitted_above:
+                            self.gap_alerted = None
+                            self.pin_evidence_intact = True
 
             else:
                 self.failures += 1
@@ -1165,13 +1228,16 @@ def report_stranded_inboxes(directory, counts, targets, emitter):
     # is later re-stranded. Suppressing for the process lifetime made "reported once" mean "reported once
     # ever", which silently contradicted the documented self-clearing behaviour: an inbox that was rescued
     # and then stranded a second time would never be announced.
-    still = {p.casefold() for p in current}
-    _REPORTED_STRANDED.intersection_update(still)
-    fresh = [p for p in current if p.casefold() not in _REPORTED_STRANDED]
+    #
+    # Keyed EXACTLY, not casefolded - the same asymmetry as stranded_inboxes() itself. The server's inbox
+    # namespace is case-sensitive, so 'Claude-chat' and 'claude-chat' are DIFFERENT inboxes; sharing one
+    # suppression key between them lets either one hold the other's alarm down.
+    _REPORTED_STRANDED.intersection_update(current)
+    fresh = [p for p in current if p not in _REPORTED_STRANDED]
     if not fresh:
         return []
     for persona in fresh:
-        _REPORTED_STRANDED.add(persona.casefold())
+        _REPORTED_STRANDED.add(persona)
         sys.stderr.write(
             "kijito-inbox-monitor: ALERT stranded mail - %s is not a known persona, so no agent consumes its "
             "mail (further reports for %r suppressed)\n" % (_stranded_detail(persona, directory, counts), persona))
