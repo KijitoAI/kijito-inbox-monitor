@@ -167,6 +167,17 @@ holds the cursor back, per §7.0).
     The guarantee is **at-least-once, IN ORDER**; consumers must be idempotent on `id`.
   - A `--suppress-author` drop is a deliberate POLICY drop and counts as acknowledged (otherwise suppressing an
     author would pin the watermark on that author's next message forever).
+  - **LIFECYCLE events (`armed`, `alert`, `recovered`, `heartbeat`, diagnostics) are deliberately NOT
+    acknowledged and NOT gated.** The guarantee is about MESSAGES, which the cursor is a record of; a lifecycle
+    event carries no cursor obligation, and holding the watermark because a heartbeat failed to deliver would
+    freeze mail for an unrelated reason. They are best-effort, and an `--exec` consumer will see them re-run
+    only when the message beside them is re-delivered. Note this means a broken `--exec` produces a failed
+    `armed`/`heartbeat` too - that is expected, not a second defect.
+  - **A delivery failure is reported on stderr, never as an `alert` event.** The event channel is the thing that
+    just failed, so an alarm about it would be routed down the broken pipe (exec mode re-runs the same failing
+    command; sink mode writes to the file that just refused a write). Reporting a fault through the faulty
+    channel is how the fault stays invisible. It is keyed on the condition and self-clears, like every other
+    alarm here (§ALARM HONESTY).
   - **Durability ordering** (Loom re-audit 7, MEDIUM): the event is `fsync`ed BEFORE the cursor that acknowledges
     it is persisted, and the state-file's directory is `fsync`ed after `os.replace` so the rename itself is
     durable. Otherwise a power loss can leave a cursor that has forgotten an event no consumer ever received.
