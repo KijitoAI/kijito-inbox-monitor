@@ -138,6 +138,29 @@ reviewer originally assigned never read the request.
   the suite's two `ResourceWarning`s. `StateFile.unlock()` now exists and is called on shutdown.
 
 ### Added
+- **`--activity-file PATH`: publish who has been observed AUTHORING mail.** Refreshed each tick, it lets a
+  harness answer "has X been active since my message?" from data the watcher already collects.
+
+  Authorship was chosen over the two signals that look better and are both forgeable by accident. Inbox
+  read-state can be produced for any persona by any agent calling the inbox with the default
+  `mark_read=true`, and it fails the other way too, since a member consuming its own event stream reads its
+  mail without touching read-state. And a GET on the presence endpoint carrying a persona parameter beats
+  that persona into the active roster, so merely probing someone makes them look alive. Only B produces B's
+  outbound, and nobody else can manufacture or erase it.
+
+  It costs no request: all-personas mode already fetches every inbox each tick with `mark_read=false`, and
+  every row already carries its author. That matters, because the alternative - a client polling every
+  inbox on a timer to reconstruct this - puts a loop that reads everyone's mail on a schedule, where one
+  missing `mark_read=false` destroys read-state fleet-wide.
+
+  Both coverage limits are published, because a claim of silence is only as good as the watching.
+  `observed_since` bounds the process; `observation_floor_id` is the MAXIMUM of the per-inbox window floors,
+  deliberately not the minimum - a persona's mail lands in whichever inbox they wrote to, so a claim that
+  they authored nothing is only as strong as the worst-covered inbox. Queries below the floor answer NOT
+  OBSERVABLE rather than "silent". The rendered observation carries the wait count and last-evidence stamp
+  and is asserted by test to state no cause, since deadlocked, unreachable and still-working are
+  indistinguishable from this data and need opposite responses.
+
 - **Every event now carries a producer-owned `event_id`**, so a consumer can dedupe without hashing our NDJSON
   bytes. Byte-hashing works until it doesn't: it couples the consumer to our serialisation, so a change to key
   order, spacing or `--content-chars` silently changes the dedupe key and re-delivers old events. Prompted by a
