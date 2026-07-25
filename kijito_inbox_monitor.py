@@ -129,6 +129,13 @@ def build_opener(pinned_ip):
 # --------------------------------------------------------------------------------------------------------------------
 # §5 http-poll adapter - peek + shape-validate + classify healthy/failure
 # --------------------------------------------------------------------------------------------------------------------
+def _is_int(v):
+    """A REAL integer. `bool` is a subclass of int in Python, so True would otherwise satisfy every
+    isinstance(x, int) check in this file and then behave as 1 - a malformed row id, a malformed
+    size_dropped and a malformed persisted cursor all slipped through that way (Loom re-audit 6)."""
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
 _MISSING = object()   # "the server did not send this field at all", distinct from an explicit null
 
 
@@ -191,9 +198,16 @@ def fetch_from_payload(data, status=200):
     items = data.get("result")
     if not isinstance(items, list):
         return Poll(False, reason="shape-invalid: result is not a list", status=status)
+    seen_ids = set()
     for m in items:
-        if not isinstance(m, dict) or not isinstance(m.get("id"), int):
+        if not isinstance(m, dict) or not _is_int(m.get("id")):
+            # `bool` is a subclass of int, so an id of True would otherwise pass and then compare as 1.
             return Poll(False, reason="shape-invalid: row missing integer id", status=status)
+        if m["id"] in seen_ids:
+            # A page cannot legitimately carry the same id twice, and the cursor logic dedupes only
+            # against what it has ALREADY delivered - so a repeat inside one window is emitted twice.
+            return Poll(False, reason="shape-invalid: duplicate id %s in one page" % m["id"], status=status)
+        seen_ids.add(m["id"])
     n, exact = _declared_omissions(data)
     nb_raw = data.get("next_before_id", _MISSING)
     if nb_raw is None:
@@ -226,13 +240,22 @@ def _declared_omissions(data):
                                            reports size_truncated with nothing dropped.
     """
     n, exact = 0, True
-    if data.get("truncated") is True:
+    trunc = data.get("truncated", _MISSING)
+    if trunc is True:
         n, exact = n + 1, False        # count-limit truncation never states a quantity
+    elif trunc is not _MISSING and trunc is not False:
+        # A truncation flag that is neither true nor false is UNINTERPRETABLE, and reading it as "no
+        # omission" is the one direction that loses mail. Treat it as an unquantified withholding.
+        n, exact = max(n, 1), False
     dropped = data.get("size_dropped")
-    if isinstance(dropped, int):
+    if _is_int(dropped):
         n += max(dropped, 0)
-    elif data.get("size_truncated") is True:
-        n, exact = max(n, 1), False    # size truncation with no number at all
+    else:
+        st = data.get("size_truncated", _MISSING)
+        if st is True:
+            n, exact = max(n, 1), False    # size truncation with no number at all
+        elif st is not _MISSING and st is not False:
+            n, exact = max(n, 1), False    # same rule: an uninterpretable flag is not a denial
     return (n, exact)
 
 
@@ -559,7 +582,12 @@ class StateFile:
         except OSError as e:
             raise FatalConfig("state-file unreadable: %s" % e)
         if not raw.strip():
-            return None
+            # PRESENT BUT EMPTY IS NOT ABSENT (Loom re-audit 6, HIGH 4). A zero-byte file is still
+            # evidence that a cursor existed here; treating it as a first launch baselines over
+            # everything since. Same fail-open shape as an unparseable file, same answer.
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file is present but EMPTY; refusing to "
+                             "baseline over it: %s\n" % self.path)
+            return CORRUPT_STATE
         try:
             d = json.loads(raw)
             cursor = d["cursor"]
@@ -571,8 +599,8 @@ class StateFile:
                              "baseline over it (that would silently skip everything since the lost cursor): "
                              "%s\n" % self.path)
             return CORRUPT_STATE
-        if not ((cursor is None or isinstance(cursor, int)) and state in ("UP", "DOWN")
-                and isinstance(failures, int)):
+        if not ((cursor is None or _is_int(cursor)) and state in ("UP", "DOWN")
+                and _is_int(failures)):
             sys.stderr.write("kijito-inbox-monitor: WARNING state-file has a valid envelope but invalid "
                              "fields; refusing to baseline over it: %s\n" % self.path)
             return CORRUPT_STATE
@@ -603,9 +631,21 @@ class StateFile:
         # file was written. Treat it the same way - hold the pin rather than assume it resolved.
         if alerted is not None and not emitted and intact and raw is None:
             intact = False
-        return (cursor, state, failures, emitted, alerted, intact)
+        # THE PIN'S OWN STATE IS PERSISTED (Loom re-audit 6, HIGH 1). It used to be inferred from
+        # `emitted_above`, which is empty in exactly the case that matters - a corrupt-state pin, where
+        # nothing has been tracked yet. So a restart lost the pin, the replay cap was free again, and the
+        # very span the pin was protecting got crossed on the first poll. A pin that does not survive a
+        # restart is not a pin; the crash is when you need it.
+        d_intact = d.get("pin_evidence_intact")
+        if d_intact is False:
+            intact = False
+        return {"cursor": cursor, "state": state, "failures": failures, "emitted_above": emitted,
+                "gap_alerted": alerted, "pin_evidence_intact": intact,
+                "pin_forced": d.get("pin_forced") is True,
+                "state_corrupt": d.get("state_corrupt") is True}
 
-    def save(self, cursor, state, failures, emitted_above=None, gap_alerted=None):
+    def save(self, cursor, state, failures, emitted_above=None, gap_alerted=None,
+             pin_forced=False, pin_evidence_intact=True, state_corrupt=False):
         if not IS_POSIX:
             return  # best-effort; skip on Windows
         d = {"identity": self.identity, "cursor": cursor, "state": state, "consecutive_failures": failures}
@@ -616,6 +656,14 @@ class StateFile:
         # Persisted too, so a restart does not re-announce a gap it already announced.
         if gap_alerted is not None:
             d["gap_alerted"] = gap_alerted
+        # The pin's own state, persisted rather than inferred. `emitted_above` is EMPTY for a
+        # corrupt-state pin, so inferring from it silently dropped exactly the pin that matters.
+        if pin_forced:
+            d["pin_forced"] = True
+        if not pin_evidence_intact:
+            d["pin_evidence_intact"] = False
+        if state_corrupt:
+            d["state_corrupt"] = True
         dirn = os.path.dirname(os.path.abspath(self.path)) or "."
         os.makedirs(dirn, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=dirn, prefix=".kijmon-", suffix=".tmp")
@@ -858,14 +906,15 @@ class WatchTarget:
                     self.pin_forced = True
                     self.pin_evidence_intact = False
                 elif loaded is not None:
-                    r_cursor, r_state, r_failures, r_emitted, r_alerted, r_intact = loaded
-                    self.cursor = r_cursor
-                    self.fsm_state, self.failures = r_state, r_failures
-                    self.emitted_above = r_emitted
-                    self.gap_alerted = r_alerted
-                    self.pin_evidence_intact = r_intact
-                    if not r_intact:
-                        self.pin_forced = True   # hold the pin even with nothing tracked
+                    self.cursor = loaded["cursor"]
+                    self.fsm_state, self.failures = loaded["state"], loaded["failures"]
+                    self.emitted_above = loaded["emitted_above"]
+                    self.gap_alerted = loaded["gap_alerted"]
+                    self.pin_evidence_intact = loaded["pin_evidence_intact"]
+                    self.state_corrupt = loaded["state_corrupt"]
+                    # A persisted forced pin is authoritative; the inference from missing tracking is only
+                    # a fallback for files written before the flag existed.
+                    self.pin_forced = loaded["pin_forced"] or not loaded["pin_evidence_intact"]
         if args.seed_at is not None:
             self.cursor = args.seed_at
 
@@ -955,14 +1004,26 @@ class WatchTarget:
                 return (rows, False)
             batch = poll.items or []
             rows.extend(batch)
-            if batch:
-                oldest = min(m["id"] for m in batch)
-                if oldest <= stop_at:
-                    return (rows, True)       # walked back past the watermark: span fully seen
-                if poll.next_before_id is not None and poll.next_before_id != oldest:
-                    # The chain skips rows between `oldest` and the continuation. Following it would
-                    # walk over them and still report the span covered.
+            if poll.omitted and poll.next_before_id is None:
+                # SELF-CONTRADICTORY PAGE (Loom re-audit 6, HIGH 3): it declares that rows were withheld
+                # AND that nothing older exists. Both cannot be true, and believing the terminal half
+                # closes a span over the very rows the other half just admitted to hiding.
+                return (rows, False)
+            if not batch:
+                if poll.next_before_id is not None:
+                    # EMPTY PAGE CLAIMING THERE IS MORE (Loom re-audit 6, HIGH 2). It returned nothing
+                    # while pointing further back, so the range it covered is unobserved - and because
+                    # the oldest-row check has no row to check, following the pointer walks straight
+                    # over that range and still reports the span covered.
                     return (rows, False)
+                return (rows, True)           # empty AND affirmed terminal: the chain genuinely ends
+            oldest = min(m["id"] for m in batch)
+            if oldest <= stop_at:
+                return (rows, True)           # walked back past the watermark: span fully seen
+            if poll.next_before_id is not None and poll.next_before_id != oldest:
+                # The chain skips rows between `oldest` and the continuation. Following it would
+                # walk over them and still report the span covered.
+                return (rows, False)
             if poll.next_before_id is None:
                 return (rows, True)           # server AFFIRMS there is nothing older
             if poll.next_before_id >= cursor:
@@ -1197,7 +1258,10 @@ class WatchTarget:
 
         if self.state_file is not None:
             self.state_file.save(self.cursor, self.fsm_state, self.failures,
-                                 self.emitted_above, self.gap_alerted)
+                                 self.emitted_above, self.gap_alerted,
+                                 pin_forced=self.pin_forced,
+                                 pin_evidence_intact=self.pin_evidence_intact,
+                                 state_corrupt=self.state_corrupt)
 
         # §9 enable the fast-path once - on the first healthy poll where the count endpoint is available.
         # (Single enable point; the max-id cursor stays the source of truth for WHAT to emit, unread is only
