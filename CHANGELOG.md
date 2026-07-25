@@ -138,6 +138,24 @@ reviewer originally assigned never read the request.
   the suite's two `ResourceWarning`s. `StateFile.unlock()` now exists and is called on shutdown.
 
 ### Added
+- **Every event now carries a producer-owned `event_id`**, so a consumer can dedupe without hashing our NDJSON
+  bytes. Byte-hashing works until it doesn't: it couples the consumer to our serialisation, so a change to key
+  order, spacing or `--content-chars` silently changes the dedupe key and re-delivers old events. Prompted by a
+  real consumer deduping ID-less events on `event+ts` - unique only while two events never land inside one clock
+  tick, and the timestamp is stamped at emit time.
+
+  Two identities, because messages and signals need opposite guarantees. `new` events carry the message's
+  identity (`<persona>:new:<message id>`), so the same message always yields the same id - across a restart, a
+  re-delivery after state loss, and two watchers of one inbox; dedupe on it for exactly-once processing. Every
+  other event is a signal and gets an id unique to that emission (`<persona>:<event>:<run>-<n>`), because a
+  recurrence is a genuinely different event and a second outage is a second thing worth seeing. Repeated
+  announcements of an unchanged condition are suppressed at the source instead, where suppression belongs.
+
+  `<run>` is random per process. A bare in-process counter is specifically ruled out: it restarts at 1 and hands
+  ids a consumer has already seen to brand-new events, so a correct consumer drops live mail - a worse failure
+  than the duplicate the id was introduced to prevent. Ids are stamped at the single emit chokepoint, so a future
+  event kind cannot forget one, and are exported to `--exec` consumers as `$KIJITOMON_EVENT_ID`.
+
 - **Unread-mail-outside-the-window alarm.** The inbox endpoint reports `unread_not_shown` - unread messages
   it holds that this response did not return. Above zero, the watcher raises an `alert` carrying the count,
   the window floor, the cursor, and `above_watermark`. It is deliberately a cheap signal rather than a

@@ -648,6 +648,13 @@ class Emitter:
         # membership alone has no release condition, so removing a hostile symlink never recovered without
         # a restart. WHAT CLEARS THIS: the deadline expiring and the reopen SUCCEEDING (see _sink_for).
         self._broken_sinks = {}
+        # §6.3 event-id namespace. A BARE counter would restart at 1 on every process start and hand
+        # old ids to new events - a consumer that had already seen them would drop live mail, which is
+        # worse than the duplicate it was meant to prevent. Namespacing the counter with a per-run token
+        # makes ids unique across restarts by construction; 8 random bytes keep that true even for a
+        # supervisor restarting the producer thousands of times.
+        self._run = "%016x" % int.from_bytes(os.urandom(8), "big")
+        self._seq = 0
 
     def _sink_for(self, persona):
         """Route an event to its persona's sink (template mode), the single shared sink, or stdout (None).
@@ -724,6 +731,33 @@ class Emitter:
         s = "" if content is None else str(content)
         return s[: self.content_chars]
 
+    def _event_id(self, event):
+        """A producer-owned identity for this event (§6.3). Never derived from the serialised bytes.
+
+        TWO KINDS OF IDENTITY, because `new` and the signals need opposite things:
+
+        · `new` carries the MESSAGE's identity - persona plus the server's message id. The same message
+          therefore always gets the same event id: across a restart, across a re-delivery after state
+          loss, and across two watchers of the same inbox. That is what makes exactly-once processing
+          possible on the consumer side, and it is the case that matters, because a duplicated message
+          is duplicated WORK while a duplicated signal is only noise.
+
+        · everything else is a SIGNAL, and gets an id unique to this emission. A recurrence is a
+          genuinely different event - a second outage is a second thing you want to see - so signals
+          must NOT collapse into their earlier selves. Repeated announcements of an UNCHANGED condition
+          are suppressed at the source instead (the alarms are edge-triggered and self-clearing), which
+          is where that belongs.
+
+        Deliberately not a hash of the emitted line: byte-hashing couples the consumer to our
+        formatting, so a change to key order, spacing or content clipping silently changes the dedupe
+        key and re-delivers old events.
+        """
+        persona = event.get("persona") or "_"
+        if event.get("event") == "new" and isinstance(event.get("id"), int):
+            return "%s:new:%d" % (persona, event["id"])
+        self._seq += 1
+        return "%s:%s:%s-%d" % (persona, event.get("event") or "_", self._run, self._seq)
+
     def emit(self, event):
         """Deliver one event. Returns True IFF delivery was ACKNOWLEDGED.
 
@@ -733,7 +767,12 @@ class Emitter:
         the wake hook that is the entire point of exec mode - never saw that message again, and the
         watcher reported success. Anything other than True here means "not acknowledged": the message
         will be re-delivered rather than dropped, because a duplicate is recoverable and a skip is not.
+
+        `event` is a dict already containing event/source/ts and type-specific fields.
         """
+        # Stamped HERE, the single chokepoint every event passes through, rather than in the
+        # convenience constructors: a future event kind added elsewhere cannot forget to carry one.
+        event["event_id"] = self._event_id(event)
         if self.mode == "stdout-jsonl":
             # Sanitised at the SERIALISED line, so one call covers every field an event can carry -
             # content, `from`, an alarm `reason` built from server data - rather than each of them.
@@ -755,6 +794,7 @@ class Emitter:
             env["KIJITOMON_EVENT"] = str(event.get("event", ""))
             env["KIJITOMON_SOURCE"] = str(event.get("source", ""))
             env["KIJITOMON_TS"] = str(event.get("ts", ""))
+            env["KIJITOMON_EVENT_ID"] = str(event.get("event_id", ""))
             keymap = {
                 "id": "KIJITOMON_ID", "from": "KIJITOMON_FROM", "content": "KIJITOMON_CONTENT",
                 "created": "KIJITOMON_CREATED", "cursor": "KIJITOMON_CURSOR",
