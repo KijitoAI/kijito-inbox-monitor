@@ -43,6 +43,7 @@ HTTP_TIMEOUT = 5  # per-request timeout default (normal fetches)
 LONGPOLL_SLACK = 10  # client socket timeout = server hold (--wait) + this, so a half-open hold is always detected
 LONGPOLL_BACKOFF_CAP = 30  # cap (s) on exponential backoff between failed long-poll attempts
 PIN_TRACKING_CAP = 5000    # max delivered ids remembered above a pinned watermark (bounds the state file)
+WALK_BACK_MAX_PAGES = 50   # page budget for an authoritative backward walk over an omitted span
 IS_POSIX = os.name == "posix"
 
 
@@ -138,7 +139,7 @@ class Poll:
     then advances past them. The truncation is not silent in the DATA - only in the handling of it.
     """
     def __init__(self, ok, items=None, reason=None, status=None, redirected=False, omitted=0,
-                 omitted_exact=True):
+                 omitted_exact=True, next_before_id=None):
         self.ok = ok
         self.items = items
         self.reason = reason
@@ -146,6 +147,7 @@ class Poll:
         self.redirected = redirected
         self.omitted = omitted             # >0 iff the server said this window is incomplete
         self.omitted_exact = omitted_exact  # False => `omitted` is only a LOWER BOUND, never closable by count
+        self.next_before_id = next_before_id  # backward cursor; None when nothing older was withheld
 
 
 def fetch(opener, url, headers):
@@ -175,7 +177,9 @@ def fetch(opener, url, headers):
         if not isinstance(m, dict) or not isinstance(m.get("id"), int):
             return Poll(False, reason="shape-invalid: row missing integer id", status=status)
     n, exact = _declared_omissions(data)
-    return Poll(True, items=items, status=status, omitted=n, omitted_exact=exact)
+    nb = data.get("next_before_id")
+    return Poll(True, items=items, status=status, omitted=n, omitted_exact=exact,
+                next_before_id=nb if isinstance(nb, int) else None)
 
 
 def _declared_omissions(data):
@@ -855,23 +859,45 @@ class WatchTarget:
             return None
         return (self.cursor, floor, poll.omitted, poll.omitted_exact)
 
-    def _reconcile_gap(self, args):
-        """Re-fetch unread-only to recover mail the bounded window hid. Returns validated rows.
+    def _walk_back(self, from_id, stop_at):
+        """Page BACKWARD over (stop_at, from_id) and return (rows, covered).
 
-        Why unread_only: the endpoint has NO backward pagination (after_id/since_id/offset/order are
-        ignored, and a smaller limit just returns even NEWER messages), so the omitted span cannot be
-        requested directly. But unread-only is a far smaller window - it excludes everything already
-        read - so it is much less likely to truncate, and un-emitted mail that nobody has read yet is
-        precisely the set where a missed wake actually costs something.
-        Best-effort by design: a failure here must never turn a healthy poll into a liveness failure,
-        because the alert we emit alongside it is already carrying the bad news.
+        This is the AUTHORITATIVE way to read an omitted span, and it replaces the unread_only
+        heuristic entirely. Two properties the heuristic never had:
+          · it reaches messages someone has already READ - the exact rows unread_only structurally
+            cannot see, and the ones most likely to be hidden in an old span;
+          · it TERMINATES, so the span can be declared covered by exhaustion rather than by counting
+            recovered rows against a number the server may never have stated.
+        That is what makes an INEXACT omission count closable at all.
 
-        Returns the POLL, not just rows, because the caller must know whether this window was ITSELF
-        truncated. A reconciling window that was also cut short cannot be used as evidence that a gap
-        is closed, and silence from it means nothing.
+        Contract (river, api main @249e2b3): pass the OLDEST id you were returned as `before_id` and
+        repeat until the page is empty or `next_before_id` is null. OMIT the parameter for the newest
+        page - 0 is a REAL cursor, not "no cursor". A malformed cursor is a hard 400, so a bug here
+        fails loudly instead of silently re-serving the newest page.
+
+        `covered` is True only if the walk reached stop_at or ran out of older messages. A walk cut
+        short by the page budget returns False, and the caller must keep the watermark pinned: a
+        partial walk proves nothing, and claiming otherwise is the very failure this replaced.
         """
         sep = "&" if "?" in self.url else "?"
-        return fetch(self.opener, self.url + sep + "unread_only=true", self.headers)
+        rows, cursor, pages = [], from_id, 0
+        while pages < WALK_BACK_MAX_PAGES:
+            pages += 1
+            poll = fetch(self.opener, "%s%sbefore_id=%d" % (self.url, sep, cursor), self.headers)
+            if not poll.ok:
+                return (rows, False)          # transient failure: no claim either way
+            batch = poll.items or []
+            rows.extend(batch)
+            if batch:
+                oldest = min(m["id"] for m in batch)
+                if oldest <= stop_at:
+                    return (rows, True)       # walked back past the watermark: span fully seen
+            if poll.next_before_id is None:
+                return (rows, True)           # no older mail exists at all
+            if poll.next_before_id >= cursor:
+                return (rows, False)          # cursor not advancing; refuse to spin
+            cursor = poll.next_before_id
+        return (rows, False)                  # budget exhausted before reaching the watermark
 
     def poll_once(self, counts_available=False, unread_counts=None):
         args = self.args
@@ -967,15 +993,13 @@ class WatchTarget:
                     # Count ONLY rows the visible window did not already contain and that sit above the
                     # watermark. Counting every returned row lets a retry that echoes the same suffix be
                     # reported as a recovery that never happened - a false success, worse than a loud failure.
-                    rec_poll = self._reconcile_gap(args)
-                    unseen = [m for m in rec_poll.items or []
+                    # Walk the span BACKWARD from the window floor down to the watermark. Coverage is
+                    # proven by exhausting the chain, not by counting rows against a number - which is
+                    # why this closes an INEXACT omission count that no amount of counting could.
+                    walked, covered = self._walk_back(window_floor, cursor_at)
+                    unseen = [m for m in walked
                               if m["id"] > (self.cursor or 0) and m["id"] not in visible
                               and m["id"] not in self.emitted_above]
-                    # ONLY rows INSIDE the uncovered span count as recovering it. A row above the window
-                    # floor is a NEW ARRIVAL that landed between the two fetches - it is real mail and is
-                    # emitted, but it is not evidence about the OLD omission. Counting arrivals as recovery
-                    # lets a busy inbox "close" a gap it never read: two messages arriving during the
-                    # reconcile would satisfy a shortfall of two while the hidden span stayed hidden.
                     gap_recovered = [m for m in unseen if cursor_at < m["id"] < window_floor]
                     known = {m["id"] for m in new_items}
                     for m in unseen:
@@ -991,14 +1015,16 @@ class WatchTarget:
                     # previously-unseen rows as the server said it withheld. Anything less pins the
                     # watermark: stepping over would make the next poll see floor<=cursor, declare itself
                     # safe, and bury the omission permanently.
-                    # An INEXACT omission count can never be closed by counting: the server said it
-                    # withheld rows without saying how many, so there is no number to reach and any
-                    # "recovered >= N" test is measuring against a guess. Such a gap pins until an
-                    # authoritative backward read can walk the span. `evidence_intact` is False once the
-                    # pin tracking has overflowed, because then a "recovered" row may simply be one we
-                    # already delivered and forgot - it cannot serve as evidence about the span.
-                    closed = (rec_poll.ok and rec_poll.omitted == 0 and omitted_exact
-                              and self.pin_evidence_intact and len(gap_recovered) >= omitted)
+                    # CLOSURE BY EXHAUSTION, not by arithmetic. A completed backward walk has SEEN the
+                    # whole span, so the omission count - exact or not - stops mattering. A walk cut
+                    # short proves nothing and keeps the watermark pinned.
+                    # `pin_evidence_intact` still gates: once tracking has overflowed we cannot tell a
+                    # recovered row from one we delivered and forgot, so we do not trust our own view of
+                    # what is new until the walk itself re-establishes it.
+                    closed = covered and (self.pin_evidence_intact or bool(walked))
+                    if closed and not self.pin_evidence_intact:
+                        # An authoritative read re-establishes ground truth, so the span is knowable again.
+                        self.pin_evidence_intact = True
                     pinned = not closed
                     # Alert identity is the PINNED WATERMARK, not the window floor. The floor drifts upward
                     # as new mail arrives, so keying on it re-fires for what is the same unresolved span;
@@ -1008,9 +1034,9 @@ class WatchTarget:
                         self.gap_alerted = cursor_at
                         self.lifecycle("alert",
                                        reason=("bounded-window: server omitted %d message(s) and the window "
-                                               "started at id %s above cursor %s; recovered %d from inside "
-                                               "the span, watermark PINNED at %s until it can be read "
-                                               "authoritatively"
+                                               "started at id %s above cursor %s; a backward walk recovered %d "
+                                               "from inside the span but did not reach the watermark, so "
+                                               "it stays PINNED at %s"
                                                % (omitted, window_floor, cursor_at, len(gap_recovered),
                                                   cursor_at)),
                                        omitted=omitted, window_floor=window_floor, cursor_at=cursor_at,
