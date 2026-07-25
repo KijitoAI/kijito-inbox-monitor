@@ -477,6 +477,246 @@ class DeclaredOmissionsTest(unittest.TestCase):
         self.assertEqual(poll.omitted, 3)
 
 
+class UnreadNotShownParseTest(unittest.TestCase):
+    """`unread_not_shown` must arrive as a tri-state: a count, or NO STATEMENT. Never coerced to 0."""
+
+    def _poll(self, payload):
+        return km.fetch(FakeOpener(FakeResponse(200, payload)), "http://x/api/inbox", {})
+
+    def test_a_count_is_carried_onto_the_poll(self):
+        self.assertEqual(self._poll({"result": [{"id": 1}], "unread_not_shown": 4}).unread_not_shown, 4)
+
+    def test_a_stated_zero_is_kept_as_zero_not_as_silence(self):
+        # 0 and "the server said nothing" are DIFFERENT answers and drive different branches.
+        self.assertEqual(self._poll({"result": [{"id": 1}], "unread_not_shown": 0}).unread_not_shown, 0)
+
+    def test_an_absent_field_is_no_statement(self):
+        # An older API that has never heard of the field must not read as "nothing is hidden".
+        self.assertIsNone(self._poll({"result": [{"id": 1}]}).unread_not_shown)
+
+    def test_junk_is_no_statement_rather_than_a_guess(self):
+        for junk in (None, "4", 1.5, [], {}, -1):
+            self.assertIsNone(self._poll({"result": [{"id": 1}], "unread_not_shown": junk}).unread_not_shown,
+                              "%r must not be read as a count" % (junk,))
+
+    def test_a_bool_is_not_a_count(self):
+        # bool is a subclass of int in Python, so True would otherwise sail through as the count 1
+        # and manufacture an alarm out of a field the server never populated numerically.
+        self.assertIsNone(self._poll({"result": [{"id": 1}], "unread_not_shown": True}).unread_not_shown)
+
+
+class UnreadNotShownAlarmTest(unittest.TestCase):
+    """§5.2 the cheap alarm: is there unread mail this window did not show us?
+
+    THE TRAP THIS DEFENDS, verified live against api.kijito.ai on an inbox holding 4 unread messages:
+    the server computes the field ONLY when it withheld something, so the LAST page of a backward walk
+    reports `unread_not_shown=0` while four unread messages sit above it. A zero is therefore not
+    self-justifying, and this suite asserts both directions - that a real positive fires, and that no
+    shape of zero is ever read as a clear it cannot support.
+    """
+
+    def _target(self, cursor=100, emitter=None, directory_backed=True):
+        t = BoundedWindowEndToEndTest()._target(cursor, emitter)
+        t.directory_backed = directory_backed
+        return t
+
+    def _fetch(self, unread_not_shown=None, next_before_id=1, omitted=0, items=None,
+               walk_unread=None):
+        """Newest-page poll; `walk_unread` puts a count on the BACKWARD-WALK pages instead."""
+        items = [{"id": 200}] if items is None else items
+
+        def f(opener, url, headers):
+            if "before_id=" in url:
+                return km.Poll(True, items=[{"id": 150}, {"id": 100}], next_before_id=None,
+                               unread_not_shown=walk_unread)
+            return km.Poll(True, items=items, omitted=omitted, next_before_id=next_before_id,
+                           unread_not_shown=unread_not_shown)
+        return f
+
+    def _run(self, t, fetch_fn, times=1):
+        orig, km.fetch = km.fetch, fetch_fn
+        try:
+            for _ in range(times):
+                t.poll_once()
+        finally:
+            km.fetch = orig
+
+    def _alerts(self, em):
+        return [f for e, f in em.events if e == "alert"]
+
+    # ---- fires -----------------------------------------------------------------------------------
+    def test_a_positive_count_alerts(self):
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = self._target(emitter=em)
+        self._run(t, self._fetch(unread_not_shown=3))
+        alerts = self._alerts(em)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["unread_not_shown"], 3)
+
+    def test_it_alerts_once_per_episode_not_once_per_poll(self):
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = self._target(emitter=em)
+        self._run(t, self._fetch(unread_not_shown=3), times=5)
+        self.assertEqual(len(self._alerts(em)), 1)
+
+    def test_it_self_clears_and_announces_a_recurrence(self):
+        # Keyed on the CONDITION, so no ack is needed - and an ack would let someone silence a
+        # still-true "there is mail you are not being shown".
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = self._target(emitter=em)
+        self._run(t, self._fetch(unread_not_shown=3))
+        self._run(t, self._fetch(unread_not_shown=0))       # computed zero -> condition cleared
+        self.assertFalse(t.unread_hidden)
+        self._run(t, self._fetch(unread_not_shown=3))       # happens again -> announced again
+        self.assertEqual(len(self._alerts(em)), 2)
+
+    def test_the_event_carries_the_observation_and_not_a_diagnosis(self):
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = self._target(cursor=100, emitter=em)
+        self._run(t, self._fetch(unread_not_shown=2, items=[{"id": 300}]))
+        a = self._alerts(em)[0]
+        self.assertIn("OBSERVATION", a["reason"])
+        self.assertNotIn("lost", a["reason"])
+        # The discriminating FACT is reported for the reader to interpret, not resolved into a verdict.
+        self.assertEqual((a["window_floor"], a["cursor_at"], a["above_watermark"]), (300, 100, True))
+
+    def test_above_watermark_is_false_when_the_window_reaches_back(self):
+        # Window floor at/below the watermark means everything above it is visible, so the unseen
+        # unread can only be mail already delivered. Reported, never diagnosed.
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = self._target(cursor=100, emitter=em)
+        self._run(t, self._fetch(unread_not_shown=2, items=[{"id": 90}, {"id": 100}]))
+        self.assertIs(self._alerts(em)[0]["above_watermark"], False)
+
+    # ---- stays quiet -----------------------------------------------------------------------------
+    def test_a_computed_zero_does_not_alert(self):
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = self._target(emitter=em)
+        self._run(t, self._fetch(unread_not_shown=0, next_before_id=50))
+        self.assertEqual(self._alerts(em), [])
+
+    def test_a_complete_window_does_not_alert(self):
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = self._target(emitter=em)
+        self._run(t, self._fetch(unread_not_shown=0, next_before_id=None, omitted=0))
+        self.assertEqual(self._alerts(em), [])
+
+    def test_silence_from_the_server_makes_no_claim_in_EITHER_direction(self):
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = self._target(emitter=em)
+        self._run(t, self._fetch(unread_not_shown=None))
+        self.assertEqual(self._alerts(em), [])              # does not invent an alarm
+        t.unread_hidden = True
+        self._run(t, self._fetch(unread_not_shown=None))
+        self.assertTrue(t.unread_hidden)                    # nor silently clears a live one
+
+    def test_an_unexplained_zero_does_not_clear_a_live_alarm(self):
+        # Rows declared omitted, yet no cursor leads to them: the zero is contradictory, so no claim.
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = self._target(emitter=em)
+        t.unread_hidden = True
+        self._run(t, self._fetch(unread_not_shown=0, next_before_id=None, omitted=2))
+        self.assertTrue(t.unread_hidden)
+
+    # ---- THE TRAP --------------------------------------------------------------------------------
+    def test_a_backward_walk_page_can_NEVER_drive_the_alarm(self):
+        # Live shapes: mid-walk pages report the WHOLE inbox's unread count (not this window's), and the
+        # terminal page reports 0 with unread mail sitting above it. Either one, read as the alarm
+        # signal, is wrong - one invents an alarm, the other clears a real one. The newest-page poll is
+        # the only page whose count answers the question being asked.
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = self._target(cursor=100, emitter=em)
+        # A real backward walk runs here (the window floor is above the watermark and rows were omitted),
+        # and its pages carry a fat count that must be ignored.
+        self._run(t, self._fetch(unread_not_shown=0, next_before_id=50, omitted=1,
+                                 items=[{"id": 300}], walk_unread=9))
+        self.assertEqual(self._alerts(em), [])
+        self.assertFalse(t.unread_hidden)
+
+    # ---- routing ---------------------------------------------------------------------------------
+    def test_it_is_not_written_into_an_inbox_the_directory_does_not_know(self):
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = self._target(emitter=em, directory_backed=False)
+        self._run(t, self._fetch(unread_not_shown=3))
+        self.assertEqual(self._alerts(em), [])
+        # Left UNSET on purpose: if that inbox later becomes directory-backed the alarm must still be
+        # able to announce itself, which a "suppressed" flag would prevent forever.
+        self.assertFalse(t.unread_hidden)
+
+    def test_it_announces_once_the_inbox_becomes_directory_backed(self):
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = self._target(emitter=em, directory_backed=False)
+        self._run(t, self._fetch(unread_not_shown=3))
+        t.directory_backed = True
+        self._run(t, self._fetch(unread_not_shown=3))
+        self.assertEqual(len(self._alerts(em)), 1)
+
+
+class DirectoryBackingTest(unittest.TestCase):
+    """Who may receive the §5.2 alarm - refreshed every tick, never stamped at creation."""
+
+    def _t(self, persona):
+        t = km.WatchTarget.__new__(km.WatchTarget)
+        t.persona, t.directory_backed = persona, True
+        return t
+
+    def test_a_directory_persona_stays_backed(self):
+        t = self._t("argus")
+        km.refresh_directory_backing(Args(all_personas=True), ["argus", "river"], [t])
+        self.assertTrue(t.directory_backed)
+
+    def test_an_inbox_the_directory_does_not_know_is_unbacked(self):
+        t = self._t("all")
+        km.refresh_directory_backing(Args(all_personas=True), ["argus", "river"], [t])
+        self.assertFalse(t.directory_backed)
+
+    def test_a_case_variant_does_not_inherit_the_real_personas_backing(self):
+        # The server's inbox namespace is case-SENSITIVE: 'Argus' is a DIFFERENT inbox from 'argus'.
+        t = self._t("Argus")
+        km.refresh_directory_backing(Args(all_personas=True), ["argus"], [t])
+        self.assertFalse(t.directory_backed)
+
+    def test_a_persona_added_from_counts_is_backed_once_the_directory_catches_up(self):
+        # THE REASON THIS IS NOT A CREATION-TIME FLAG. A new persona's first mail arrives via
+        # discover_from_counts before the periodic /api/personas rescan lists it; rediscovery then
+        # skips it (already watched), so a stamped flag would leave a real persona unbacked forever.
+        t = self._t("newbie")
+        km.refresh_directory_backing(Args(all_personas=True), ["argus"], [t])
+        self.assertFalse(t.directory_backed)
+        km.refresh_directory_backing(Args(all_personas=True), ["argus", "newbie"], [t])
+        self.assertTrue(t.directory_backed)
+
+    def test_an_empty_directory_is_missing_data_not_evidence_of_absence(self):
+        t = self._t("argus")
+        km.refresh_directory_backing(Args(all_personas=True), [], [t])
+        self.assertTrue(t.directory_backed)
+
+    def test_an_explicit_persona_subset_is_never_downgraded(self):
+        # Hand-picked by an operator who is by definition consuming that stream.
+        t = self._t("argus")
+        km.refresh_directory_backing(Args(persona=["argus"]), ["river"], [t])
+        self.assertTrue(t.directory_backed)
+
+
+class UnreadHiddenPersistenceTest(unittest.TestCase):
+    """A KeepAlive restart loop must not become a wake storm on a condition that is still just true."""
+
+    def _path(self):
+        return os.path.join(tempfile.mkdtemp(), "hive.json")
+
+    def test_an_announced_alarm_survives_a_restart(self):
+        p = self._path()
+        km.StateFile(p, "idx").save(100, "UP", 0, unread_hidden=True)
+        self.assertTrue(km.StateFile(p, "idx").load()["unread_hidden"])
+
+    def test_a_cleared_alarm_does_not_linger(self):
+        p = self._path()
+        km.StateFile(p, "idx").save(100, "UP", 0, unread_hidden=False)
+        self.assertFalse(km.StateFile(p, "idx").load()["unread_hidden"])
+        with open(p) as f:
+            self.assertNotIn("unread_hidden", json.load(f))
+
+
 class BoundedWindowGapTest(unittest.TestCase):
     """A bounded window must never let the cursor silently cross mail the server admits it dropped."""
 
@@ -490,6 +730,7 @@ class BoundedWindowGapTest(unittest.TestCase):
         t.pin_release_at = None
         t.delivery_blocked = False
         t.state_not_durable = False
+        t.unread_hidden, t.directory_backed = False, True
         return t
 
     def test_window_reaching_back_past_the_cursor_is_safe(self):
@@ -530,6 +771,7 @@ class WalkBackTest(unittest.TestCase):
         t.pin_release_at = None
         t.delivery_blocked = False
         t.state_not_durable = False
+        t.unread_hidden, t.directory_backed = False, True
         return t
 
     def _pages(self, mapping, calls=None):
@@ -684,6 +926,7 @@ class BoundedWindowEndToEndTest(unittest.TestCase):
         t.pin_release_at = None
         t.delivery_blocked = False
         t.state_not_durable = False
+        t.unread_hidden, t.directory_backed = False, True
         return t
 
     def _fetch(self, main_items, omitted, walk=None, exact=True, walk_fail=False):
@@ -912,7 +1155,9 @@ class CorruptPinStateTest(unittest.TestCase):
         loaded = km.StateFile(p, "idx").load()
         emitted, alerted, intact = (loaded["emitted_above"], loaded["gap_alerted"],
                                     loaded["pin_evidence_intact"])
+        hidden = loaded["unread_hidden"]
         self.assertEqual((emitted, alerted, intact), (set(), None, True))
+        self.assertFalse(hidden)     # absent unread_hidden reads as "not announced", never as announced
 
     def test_a_forced_pin_survives_arming_so_replay_cap_cannot_cross_it(self):
         # Loom's repro: corrupt emitted_above + gap_alerted 100 + max_replay 1 => cursor jumped to 201.
@@ -933,6 +1178,7 @@ class CorruptPinStateTest(unittest.TestCase):
         t.pin_release_at = None
         t.delivery_blocked = False
         t.state_not_durable = False
+        t.unread_hidden, t.directory_backed = False, True
 
         # The walk must NOT succeed here, or it would legitimately close the span and release the pin -
         # which is a DIFFERENT property, tested separately below. Isolating them keeps this test about

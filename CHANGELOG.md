@@ -138,6 +138,31 @@ reviewer originally assigned never read the request.
   the suite's two `ResourceWarning`s. `StateFile.unlock()` now exists and is called on shutdown.
 
 ### Added
+- **Unread-mail-outside-the-window alarm.** The inbox endpoint reports `unread_not_shown` - unread messages
+  it holds that this response did not return. Above zero, the watcher raises an `alert` carrying the count,
+  the window floor, the cursor, and `above_watermark`. It is deliberately a cheap signal rather than a
+  coverage mechanism: the count has no cursor of its own, so it can say THAT mail is out of view but never
+  WHICH rows, and coverage still comes from the backward walk that terminates.
+
+  The event states an observation, not a diagnosis. The count includes unread mail anywhere in the inbox -
+  among it messages this watcher already delivered that the agent simply has not read - so it is not on its
+  own evidence that anything was missed. `above_watermark` is the fact that separates the two cases, and is
+  reported rather than resolved.
+
+  A zero is not self-justifying, and this is the trap the implementation is built around: the server computes
+  the field only when it withheld something, so it is `0` **by construction** on a page with nothing older.
+  The negative answer therefore requires positive evidence - the zero was genuinely computed, or the window
+  is structurally complete - and a field the server never sent is a third state that asserts nothing either
+  way. For the same reason the check runs on the newest-page poll only. Measured against a live inbox holding
+  four unread messages: the newest page reported `0` (correctly), a mid-walk page reported `4` (the whole
+  inbox's unread, not that window's), and the terminal page of the walk reported `0` while all four sat above
+  it - so feeding walk pages to the check would both invent alarms and clear real ones.
+
+  Routed like the stranded-mail alarm (an `alert` rather than a new event name, no ack, self-clearing) but
+  failing the opposite way when the persona directory is unknown: that alarm withholds because it would
+  otherwise flag every persona, while this one concerns the target's own inbox, where firing needlessly costs
+  a line in a stream nobody reads and withholding costs the silent wake gap this tool exists to prevent.
+
 - **Stranded-mail alarm.** The watcher reports mail sitting in an inbox that nothing consumes. Such mail
   is undeliverable and nothing else reports it: the sender gets a success and a message id, the recipient
   gets no signal, and there is no bounce. Two real cases prompted it - a case-variant of a live persona,
