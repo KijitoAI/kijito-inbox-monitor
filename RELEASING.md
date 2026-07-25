@@ -44,6 +44,25 @@ anywhere. Pushing a version tag publishes to both PyPI and npm, with provenance 
    ```
    That `sed` range is INCLUSIVE, so it trails the next version's heading into the notes. Strip the
    last line, or check the rendered release before you walk away.
+8. ⚠️ **PUBLISHING DOES NOT UPDATE THE FLEET. THE RELEASE IS NOT DEPLOYED UNTIL THE PRODUCER RESTARTS.**
+   The supervised producer on this machine (`com.kijito.inbox-monitor`) does not run the published
+   package - its plist `ProgramArguments` point straight at the working tree:
+   ```sh
+   plutil -p ~/Library/LaunchAgents/com.kijito.inbox-monitor.plist   # see for yourself; do not assume
+   ```
+   So the RUNNING process is executing whatever that file held when it STARTED, which can be many
+   commits behind (`ps -o lstart= -p "$(pgrep -f 'kijito_inbox_monitor.py --token-file')"`). Two
+   consequences worth stating separately, because they pull opposite ways:
+   - a green PyPI/npm publish tells you NOTHING about what the fleet is running; and
+   - because KeepAlive restarts it from the tree, any crash mid-edit picks up whatever is on disk
+     at that instant.
+   After releasing, restart the producer deliberately and RE-VERIFY the health block (exactly one
+   process, launchd status 0, no PINNED/CORRUPT state files, zero `bounded-window` alerts, a
+   heartbeat inside ~2 min) rather than assuming the restart was clean - `launchctl bootstrap` is
+   not atomic, and a producer that fails to come back is a silent fleet-wide wake gap.
+   ★ THE STANDING FIX, not yet done: point the plist at an INSTALLED released artifact so the fleet
+   stops executing a live working tree. That is a deployment change on Jason's machine and needs his
+   go-ahead, so it is flagged rather than done.
 
 ## One-time setup (already done for 0.1.0)
 
