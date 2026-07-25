@@ -217,12 +217,19 @@ fields and advances its cursor to the highest id it saw will step over anything 
 This watcher reads the declaration. When the returned window reaches back past its cursor, the omitted
 messages are older than everything it still owes you, so it proceeds normally - the ordinary case, since
 long-polling keeps the backlog small. When the window *starts above* the cursor and the server admits it
-dropped messages, the gap may contain mail you have never seen: the watcher re-fetches `unread_only` to
-recover what it can, and raises an `alert` for anything left over rather than advancing in silence.
+dropped messages, the gap may contain mail you have never seen: the watcher walks that span backward with
+`before_id` until it reaches the cursor or the chain ends, and only then advances. A walk that cannot
+complete leaves the cursor **pinned** and raises an `alert`, rather than advancing in silence.
 
-If you consume the inbox API yourself for reconciliation, apply the same care - a default read can come back
-"nothing unread" while older unread mail sits below the budget line. `unread_only=true` is the smaller,
-safer window.
+Coverage comes from exhausting the chain, not from counting recovered messages - `truncated` says rows were
+withheld without saying how many, so no count can prove a span empty. The backward walk also reaches mail
+someone has already **read**, which an unread-only reconcile cannot see.
+
+If you page the inbox API yourself: pass the **oldest** id you were returned as `before_id` and repeat until
+`next_before_id` is null; omit the parameter for the newest page, since `0` is a real cursor rather than "no
+cursor". A backward walk only covers what is older than where it began, so re-poll the newest page
+afterwards. And order by **`id`**, not `created` - two messages can carry timestamps in the opposite order
+from their ids.
 
 ### Stranded mail
 

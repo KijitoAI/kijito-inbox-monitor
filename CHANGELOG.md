@@ -43,36 +43,35 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
   The cursor is now a **confirmed-contiguous watermark**. When the window reaches back past it, every
   omitted message is older than anything still owed and nothing changes - the steady state, since
   long-polling keeps the backlog small. When the window starts *above* the watermark while the server
-  admits it withheld rows, the watcher reconciles with an `unread_only` re-fetch and then advances **only**
-  on positive evidence the span is accounted for: that re-fetch must itself have been complete, and must
-  yield at least as many previously-unseen rows as the server said it withheld. Anything less **pins** the
-  watermark and raises an `alert` naming the cursor, the window floor and the shortfall.
+  admits it withheld rows, the watcher **walks the span backward** with `before_id`, paging until it
+  reaches the watermark or the chain ends, and advances only then. A walk that fails, stalls, or exhausts
+  its page budget proves nothing, so the watermark **pins** and an `alert` names the cursor, the window
+  floor and the shortfall.
+
+  Coverage is established by **exhausting the chain, not by counting rows**. That distinction is what
+  makes an unquantified truncation resolvable at all: `truncated` states that rows were withheld without
+  saying how many, so no arithmetic can ever prove the span empty. It also reaches messages someone has
+  already **read** - precisely the rows most likely to be hiding in an old span, and the ones an
+  unread-only reconcile structurally cannot see.
 
   Pinning is the point: advancing past an unresolved span makes the next poll see the window reaching back
   past the cursor, declare itself safe, and bury the omission forever. The pin is persisted, so a restart
   neither re-emits what was already delivered nor forgets the gap, and visible mail is still delivered
-  while pinned - failing closed costs no liveness. Recovery via `unread_only` is a heuristic, not an
-  authoritative backward page; it is the best available until the endpoint offers one, and it is never
-  treated as proof.
+  while pinned - failing closed costs no liveness. Pin tracking is bounded; on overflow the watcher says
+  plainly that it can no longer reason about the span rather than quietly dropping ids, and only an
+  authoritative walk can restore that ground truth.
 
-  Two accounting rules keep the alarm honest. Only rows genuinely absent from the visible window count as
-  recovered - the watcher peeks without marking read, so an immediate retry commonly echoes the same
-  messages, and counting those would report a recovery that never happened. And a lone oversized message
+  Two accounting rules keep it honest. Mail arriving *between* the two reads is delivered but never counted
+  as recovery - new arrivals prove nothing about old omissions. And a lone oversized message
   (`size_truncated` with `size_dropped: 0`) had its body clipped rather than being withheld, so it is not
   an omission; count-limit truncation, size-budget drops and body clipping are accounted separately.
 
+  Corrupt pin state fails **closed**: a malformed record holds the pin with no tracking rather than
+  silently unpinning, because loading it as "nothing outstanding" would let the replay cap jump the cursor
+  over the very span the pin was protecting.
+
   No mail was lost in practice before this: polling cadence kept every observed window reaching back past
   the cursor. That was luck, not correctness - roughly eight typical messages in one gap exhausts the budget.
-
-  Four further defects in that machinery, all found by Loom's third re-audit and all real:
-  **new arrivals cannot prove an old omission was recovered** - a message landing between the two fetches
-  used to satisfy the shortfall while the hidden span stayed hidden, so only rows falling strictly INSIDE
-  the uncovered span now count; **a restart must respect a restored pin** - the arming path selected every
-  id above the cursor without consulting what a previous run had already delivered, re-emitting it, and
-  the replay cap moved the cursor to the newest id before any gap check, erasing the pin entirely;
-  **pin tracking is bounded** so a gap that can never close cannot grow the state file without end; and
-  **the gap alert is keyed on the pinned watermark, not the window floor**, because the floor drifts
-  upward with every new message and re-announced the same unresolved span. The alert key is persisted too.
 - **Case-variant personas no longer self-deadlock the watcher (silent wake gap).** A persona name was
   mapped to its state file verbatim, but macOS (APFS) and Windows are case-**insensitive**, so
   `Claude-chat` and `claude-chat` name the *same* file. Discovering a case-variant of an already-watched

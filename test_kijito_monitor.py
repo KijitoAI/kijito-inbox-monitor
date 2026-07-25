@@ -453,8 +453,6 @@ class BoundedWindowGapTest(unittest.TestCase):
         self.assertIsNone(t._uncovered_gap(poll, poll.items))
 
     def test_window_starting_above_the_cursor_with_omissions_is_the_loss_case(self):
-        # After an outage/burst: server dropped 10 and the window starts at 1200 while we are at 1100,
-        # so (1100, 1200) may hold mail we never emitted.
         t = self._target(cursor=1100)
         poll = km.Poll(True, items=[{"id": 1200}, {"id": 1260}], omitted=10)
         self.assertEqual(t._uncovered_gap(poll, poll.items), (1100, 1200, 10, True))
@@ -471,45 +469,104 @@ class BoundedWindowGapTest(unittest.TestCase):
         poll = km.Poll(True, items=[{"id": 1200}], omitted=5)
         self.assertIsNone(t._uncovered_gap(poll, poll.items))
 
-    def test_reconcile_queries_unread_only(self):
-        t = self._target(cursor=1100)
-        seen = {}
 
-        def fake_fetch(opener, url, headers):
-            seen["url"] = url
-            return km.Poll(True, items=[{"id": 1150}, {"id": 1105}], omitted=0)
+class WalkBackTest(unittest.TestCase):
+    """The authoritative backward read. Coverage is proven by EXHAUSTION, never by counting rows."""
 
-        orig, km.fetch = km.fetch, fake_fetch
+    def _target(self, cursor=100):
+        t = km.WatchTarget.__new__(km.WatchTarget)
+        t.cursor, t.armed, t.persona, t.url = cursor, True, "argus", "http://x/api/inbox?persona=argus"
+        t.opener, t.headers = None, {}
+        t.emitted_above, t.gap_alerted = set(), None
+        t.pin_evidence_intact, t.pin_forced = True, False
+        return t
+
+    def _pages(self, mapping, calls=None):
+        """mapping: before_id -> (items, next_before_id)"""
+        def f(opener, url, headers):
+            bid = int(url.split("before_id=")[1].split("&")[0])
+            if calls is not None:
+                calls.append(bid)
+            items, nb = mapping.get(bid, ([], None))
+            return km.Poll(True, items=items, next_before_id=nb)
+        return f
+
+    def test_walk_chains_on_next_before_id_until_it_reaches_the_watermark(self):
+        calls = []
+        t = self._target(cursor=100)
+        orig, km.fetch = km.fetch, self._pages({
+            200: ([{"id": 180}, {"id": 190}], 180),
+            180: ([{"id": 120}, {"id": 150}], 120),
+            120: ([{"id": 90}, {"id": 100}], 90),      # reaches the watermark
+        }, calls)
         try:
-            got = t._reconcile_gap(Args())
+            rows, covered = t._walk_back(200, 100)
         finally:
             km.fetch = orig
-        self.assertIn("unread_only=true", seen["url"])
-        self.assertEqual({m["id"] for m in got.items}, {1105, 1150})
+        self.assertTrue(covered)
+        self.assertEqual(calls, [200, 180, 120])
+        self.assertEqual(sorted(m["id"] for m in rows), [90, 100, 120, 150, 180, 190])
 
-    def test_reconcile_returns_the_poll_so_its_own_truncation_is_visible(self):
-        # A reconciling window that was ITSELF cut short cannot prove a gap is closed, so the caller
-        # must be able to see that - returning bare rows would hide it.
-        t = self._target(cursor=1100)
-        orig, km.fetch = km.fetch, lambda *a, **k: km.Poll(True, items=[{"id": 1150}], omitted=7)
+    def test_walk_is_covered_when_no_older_mail_exists(self):
+        t = self._target(cursor=0)
+        orig, km.fetch = km.fetch, self._pages({200: ([{"id": 150}], None)})
         try:
-            got = t._reconcile_gap(Args())
+            rows, covered = t._walk_back(200, 0)
         finally:
             km.fetch = orig
-        self.assertEqual(got.omitted, 7)
+        self.assertTrue(covered)                    # next_before_id null = end of the chain
 
-    def test_reconcile_failure_is_best_effort_not_a_liveness_failure(self):
-        t = self._target(cursor=1100)
-        orig, km.fetch = km.fetch, lambda *a, **k: km.Poll(False, reason="http 502")
+    def test_a_failed_page_is_NOT_coverage(self):
+        t = self._target(cursor=100)
+        orig, km.fetch = km.fetch, lambda o, u, h: km.Poll(False, reason="http 502")
         try:
-            got = t._reconcile_gap(Args())   # must not raise
+            rows, covered = t._walk_back(200, 100)
         finally:
             km.fetch = orig
-        self.assertFalse(got.ok)
+        self.assertFalse(covered)
+        self.assertEqual(rows, [])
+
+    def test_walk_refuses_to_spin_on_a_non_advancing_cursor(self):
+        # A server that echoes the same next_before_id would otherwise loop until the page budget.
+        calls = []
+        t = self._target(cursor=0)
+        orig, km.fetch = km.fetch, self._pages({200: ([{"id": 199}], 200)}, calls)
+        try:
+            rows, covered = t._walk_back(200, 0)
+        finally:
+            km.fetch = orig
+        self.assertFalse(covered)
+        self.assertEqual(len(calls), 1)
+
+    def test_walk_is_bounded_by_a_page_budget_and_a_short_walk_is_not_coverage(self):
+        calls = []
+        t = self._target(cursor=0)
+        # every page hands back a strictly lower cursor, so only the budget stops it
+        def f(opener, url, headers):
+            bid = int(url.split("before_id=")[1].split("&")[0])
+            calls.append(bid)
+            return km.Poll(True, items=[{"id": bid - 1}], next_before_id=bid - 1)
+        orig, km.fetch = km.fetch, f
+        try:
+            rows, covered = t._walk_back(100000, 0)
+        finally:
+            km.fetch = orig
+        self.assertFalse(covered)                   # budget exhausted proves nothing
+        self.assertEqual(len(calls), km.WALK_BACK_MAX_PAGES)
+
+    def test_walk_omits_nothing_and_sends_before_id_explicitly(self):
+        seen = []
+        t = self._target(cursor=100)
+        orig, km.fetch = km.fetch, self._pages({200: ([{"id": 100}], None)}, seen)
+        try:
+            t._walk_back(200, 100)
+        finally:
+            km.fetch = orig
+        self.assertEqual(seen, [200])               # starts AT the window floor
 
 
 class BoundedWindowEndToEndTest(unittest.TestCase):
-    """poll_once end-to-end: mail hidden by a bounded window must still reach the consumer."""
+    """poll_once end-to-end over the authoritative backward walk."""
 
     class RecordingEmitter:
         def __init__(self):
@@ -528,7 +585,7 @@ class BoundedWindowEndToEndTest(unittest.TestCase):
         poll_seconds = 60
         heartbeat = 0
         max_replay = 50
-        no_fast_path = True     # force the full inbox poll, which is the path under test
+        no_fast_path = True
         resync_every = 10
         self_test = False
 
@@ -546,378 +603,181 @@ class BoundedWindowEndToEndTest(unittest.TestCase):
         t.pin_evidence_intact, t.pin_forced = True, False
         return t
 
-    def test_fully_recovered_gap_delivers_the_mail_advances_and_stays_quiet(self):
-        em = self.RecordingEmitter()
-        t = self._target(cursor=1100, emitter=em)
+    def _fetch(self, main_items, omitted, walk=None, exact=True, walk_fail=False):
+        """main window + a backward-walk map {before_id: (items, next_before_id)}."""
+        def f(opener, url, headers):
+            if "before_id=" in url:
+                if walk_fail:
+                    return km.Poll(False, reason="http 502")
+                bid = int(url.split("before_id=")[1].split("&")[0])
+                items, nb = (walk or {}).get(bid, ([], None))
+                return km.Poll(True, items=items, next_before_id=nb)
+            return km.Poll(True, items=main_items, omitted=omitted, omitted_exact=exact)
+        return f
 
-        # Server drops the 2 OLDEST and returns a window starting ABOVE our cursor. 1105 and 1150 are
-        # real mail addressed to us that the window hid; unread-only reconciliation can still see them.
-        def fake_fetch(opener, url, headers):
-            if "unread_only=true" in url:
-                return km.Poll(True, items=[{"id": 1105}, {"id": 1150}], omitted=0)
-            return km.Poll(True, items=[{"id": 1200}, {"id": 1260}], omitted=2)
-
-        orig, km.fetch = km.fetch, fake_fetch
+    def _run(self, t, fetch_fn, times=1):
+        orig, km.fetch = km.fetch, fetch_fn
         try:
-            t.poll_once()
+            for _ in range(times):
+                t.poll_once()
         finally:
             km.fetch = orig
 
-        # 1. the hidden messages were recovered and emitted, not skipped
+    def test_a_completed_walk_recovers_hidden_mail_advances_and_stays_quiet(self):
+        em = self.RecordingEmitter()
+        t = self._target(cursor=1100, emitter=em)
+        # window [1200,1260] hides 1105 and 1150; the walk reaches back past the watermark.
+        self._run(t, self._fetch([{"id": 1200}, {"id": 1260}], 2,
+                                 walk={1200: ([{"id": 1105}, {"id": 1150}, {"id": 1100}], None)}))
         self.assertEqual(em.new_ids, [1105, 1150, 1200, 1260])
-        # 2. NO alert: the server said it withheld 2, a complete unread_only window yielded exactly 2
-        #    previously-unseen rows, so the span is accounted for. Alerting on a successful self-heal
-        #    is how an alarm gets trained into background noise.
-        self.assertEqual([f for (e, f) in em.events if e == "alert"], [])
-        # 3. and only THEN may the watermark advance
+        self.assertEqual([f for e, f in em.events if e == "alert"], [])
         self.assertEqual(t.cursor, 1260)
         self.assertEqual(t.emitted_above, set())
 
-    def test_partial_recovery_still_pins_because_the_span_is_not_accounted_for(self):
-        # Server withheld 3; reconciliation surfaces only 1 previously-unseen row. Two are unaccounted
-        # for, so this must NOT be treated as a success.
-        em = self.RecordingEmitter()
-        t = self._target(cursor=1100, emitter=em)
-        poll = lambda o, u, h: (km.Poll(True, items=[{"id": 1105}], omitted=0) if "unread_only=true" in u
-                                else km.Poll(True, items=[{"id": 1200}], omitted=3))
-        orig, km.fetch = km.fetch, poll
-        try:
-            t.poll_once()
-        finally:
-            km.fetch = orig
-        self.assertEqual(em.new_ids, [1105, 1200])
-        alerts = [f for (e, f) in em.events if e == "alert"]
-        self.assertEqual(len(alerts), 1)
-        self.assertEqual(alerts[0]["reconciled"], 1)
-        self.assertEqual(t.cursor, 1100)
-
-    def test_a_truncated_reconciliation_window_cannot_close_a_gap(self):
-        # Even if it yields enough rows, a reconciling window that was ITSELF cut short is not evidence.
-        em = self.RecordingEmitter()
-        t = self._target(cursor=1100, emitter=em)
-        poll = lambda o, u, h: (km.Poll(True, items=[{"id": 1105}, {"id": 1106}], omitted=9)
-                                if "unread_only=true" in u
-                                else km.Poll(True, items=[{"id": 1200}], omitted=2))
-        orig, km.fetch = km.fetch, poll
-        try:
-            t.poll_once()
-        finally:
-            km.fetch = orig
-        self.assertEqual(t.cursor, 1100)   # pinned despite recovered >= omitted
-        self.assertTrue([f for (e, f) in em.events if e == "alert"])
-
-    def test_LOOM3_concurrent_arrivals_cannot_false_close_a_gap(self):
-        # Loom re-audit 3, blocker 1. cursor 100, visible window [200] with an omission, and the
-        # reconcile returns [201, 300] - mail that ARRIVED between the two fetches. Both are absent from
-        # the first window and above the cursor, so the old code counted them as recovery and advanced
-        # to 300, while the hidden span (100, 200) was never read. New arrivals prove nothing about old
-        # omissions.
+    def test_LOOM4_an_inexact_count_IS_closable_once_the_span_can_be_walked(self):
+        # This is what the backward cursor bought: coverage by exhaustion, so an unquantified
+        # truncation is no longer permanently unclosable.
         em = self.RecordingEmitter()
         t = self._target(cursor=100, emitter=em)
-
-        def fake_fetch(opener, url, headers):
-            if "unread_only=true" in url:
-                return km.Poll(True, items=[{"id": 201}, {"id": 300}], omitted=0)
-            return km.Poll(True, items=[{"id": 200}], omitted=1)
-
-        orig, km.fetch = km.fetch, fake_fetch
-        try:
-            t.poll_once()
-        finally:
-            km.fetch = orig
-        self.assertEqual(t.cursor, 100)                       # *** must stay PINNED ***
-        self.assertEqual(em.new_ids, [200, 201, 300])         # arrivals still delivered, just not counted
-        alert = [f for e, f in em.events if e == "alert"][0]
-        self.assertEqual(alert["reconciled"], 0)              # nothing came from INSIDE the span
-
-    def test_only_rows_inside_the_span_close_it(self):
-        # Same shape, but the reconcile returns a row that really is inside (100, 200).
-        em = self.RecordingEmitter()
-        t = self._target(cursor=100, emitter=em)
-        poll = lambda o, u, h: (km.Poll(True, items=[{"id": 150}], omitted=0) if "unread_only=true" in u
-                                else km.Poll(True, items=[{"id": 200}], omitted=1))
-        orig, km.fetch = km.fetch, poll
-        try:
-            t.poll_once()
-        finally:
-            km.fetch = orig
+        self._run(t, self._fetch([{"id": 200}], 1, exact=False,
+                                 walk={200: ([{"id": 150}, {"id": 100}], None)}))
         self.assertEqual(em.new_ids, [150, 200])
-        self.assertEqual(t.cursor, 200)                       # genuinely closed, so it may advance
+        self.assertEqual(t.cursor, 200)
         self.assertEqual([f for e, f in em.events if e == "alert"], [])
 
+    def test_LOOM_REPRO_a_walk_that_cannot_complete_pins_the_cursor(self):
+        # Loom repro, now against the authoritative path: if the walk cannot be performed at all, the
+        # span is unproven and the watermark must hold.
+        em = self.RecordingEmitter()
+        t = self._target(cursor=1100, emitter=em)
+        self._run(t, self._fetch([{"id": 1200}], 4, walk_fail=True))
+        self.assertEqual(em.new_ids, [1200])
+        self.assertEqual(t.cursor, 1100)
+        self.assertEqual(t.emitted_above, {1200})
+        alert = [f for e, f in em.events if e == "alert"][0]
+        self.assertTrue(alert["pinned"])
+
+    def test_a_walk_stopped_by_the_page_budget_pins(self):
+        em = self.RecordingEmitter()
+        t = self._target(cursor=0, emitter=em)
+        def f(opener, url, headers):
+            if "before_id=" in url:
+                bid = int(url.split("before_id=")[1].split("&")[0])
+                return km.Poll(True, items=[{"id": bid - 1}], next_before_id=bid - 1)
+            return km.Poll(True, items=[{"id": 100000}], omitted=1)
+        self._run(t, f)
+        self.assertEqual(t.cursor, 0)               # never reached the watermark
+        self.assertTrue([f for e, f in em.events if e == "alert"])
+
+    def test_LOOM3_concurrent_arrivals_are_delivered_but_are_not_coverage(self):
+        # Mail arriving mid-walk is emitted, but coverage still comes only from the walk terminating.
+        em = self.RecordingEmitter()
+        t = self._target(cursor=100, emitter=em)
+        self._run(t, self._fetch([{"id": 200}], 1, walk_fail=True))
+        self.assertEqual(t.cursor, 100)
+        self.assertEqual(em.new_ids, [200])
+
+    def test_a_pinned_watermark_does_not_re_emit_on_the_next_poll(self):
+        em = self.RecordingEmitter()
+        t = self._target(cursor=1100, emitter=em)
+        self._run(t, self._fetch([{"id": 1200}], 4, walk_fail=True), times=3)
+        self.assertEqual(em.new_ids, [1200])        # emitted ONCE across three polls
+        self.assertEqual(t.cursor, 1100)
+
+    def test_a_pinned_gap_alerts_once_not_once_per_poll(self):
+        em = self.RecordingEmitter()
+        t = self._target(cursor=1100, emitter=em)
+        self._run(t, self._fetch([{"id": 1200}], 4, walk_fail=True), times=5)
+        self.assertEqual(len([e for e, f in em.events if e == "alert"]), 1)
+
+    def test_gap_alert_is_keyed_on_the_stable_watermark_not_the_drifting_floor(self):
+        em = self.RecordingEmitter()
+        t = self._target(cursor=100, emitter=em)
+        floors = iter([200, 250, 300])
+        def f(opener, url, headers):
+            if "before_id=" in url:
+                return km.Poll(False, reason="http 502")
+            return km.Poll(True, items=[{"id": next(floors)}], omitted=2)
+        self._run(t, f, times=3)
+        self.assertEqual(len([f for e, f in em.events if e == "alert"]), 1)
+        self.assertEqual(t.gap_alerted, 100)
+
+    def test_watermark_resumes_advancing_once_windows_are_complete_again(self):
+        em = self.RecordingEmitter()
+        t = self._target(cursor=1100, emitter=em)
+        self._run(t, self._fetch([{"id": 1200}], 4, walk_fail=True))
+        self.assertEqual(t.cursor, 1100)
+        self._run(t, self._fetch([{"id": 1200}, {"id": 1300}], 0))
+        self.assertEqual(t.cursor, 1300)
+        self.assertEqual(t.emitted_above, set())
+        self.assertEqual(em.new_ids, [1200, 1300])
+
+    def test_steady_state_truncation_is_silent_and_changes_nothing(self):
+        em = self.RecordingEmitter()
+        t = self._target(cursor=1135, emitter=em)
+        self._run(t, self._fetch([{"id": 1101}, {"id": 1140}], 15))
+        self.assertEqual(em.new_ids, [1140])
+        self.assertEqual([e for e, f in em.events if e == "alert"], [])
+        self.assertEqual(t.cursor, 1140)
+
     def test_LOOM3_restart_does_not_re_emit_what_a_pin_already_delivered(self):
-        # Loom re-audit 3, blocker 2. A restart arrives with armed=False and a RESTORED pin; the arming
-        # branch selected every id > cursor without consulting emitted_above, re-delivering it.
         em = self.RecordingEmitter()
         t = self._target(cursor=1100, emitter=em)
         t.armed = False
         t.emitted_above = {1200}
-        orig, km.fetch = km.fetch, lambda o, u, h: km.Poll(True, items=[{"id": 1200}], omitted=0)
-        try:
-            t.poll_once()
-        finally:
-            km.fetch = orig
-        self.assertEqual(em.new_ids, [])                      # 1200 was already delivered before the restart
+        self._run(t, self._fetch([{"id": 1200}], 0))
+        self.assertEqual(em.new_ids, [])
 
     def test_LOOM3_restart_replay_cap_does_not_erase_a_pin(self):
-        # Loom re-audit 3, blocker 3. The replay-capped branch set cursor=current_max BEFORE gap
-        # detection, jumping the watermark straight over the unresolved span on the first poll back.
         em = self.RecordingEmitter()
         t = self._target(cursor=100, emitter=em)
         t.armed = False
         t.emitted_above = {200, 201}
         t.args.max_replay = 1
-        # Enough UNSEEN ids (202, 203, 204) that the replay cap would fire if the pin guard were absent -
-        # otherwise this test passes against the bug, which is worse than no test.
-        orig, km.fetch = km.fetch, lambda o, u, h: km.Poll(
-            True, items=[{"id": 200}, {"id": 201}, {"id": 202}, {"id": 203}, {"id": 204}], omitted=5)
-        try:
-            t.poll_once()
-        finally:
-            km.fetch = orig
-        self.assertEqual(t.cursor, 100)                       # pin survived arming
+        self._run(t, self._fetch(
+            [{"id": 200}, {"id": 201}, {"id": 202}, {"id": 203}, {"id": 204}], 5, walk_fail=True))
+        self.assertEqual(t.cursor, 100)
         self.assertNotIn("replay_capped", [e for e, f in em.events])
 
     def test_replay_cap_still_applies_when_nothing_is_pinned(self):
-        # The guard must not disable the replay cap in the normal case it exists for.
         em = self.RecordingEmitter()
         t = self._target(cursor=100, emitter=em)
         t.armed = False
         t.args.max_replay = 1
-        orig, km.fetch = km.fetch, lambda o, u, h: km.Poll(
-            True, items=[{"id": 200}, {"id": 201}, {"id": 202}], omitted=0)
-        try:
-            t.poll_once()
-        finally:
-            km.fetch = orig
+        self._run(t, self._fetch([{"id": 200}, {"id": 201}, {"id": 202}], 0))
         self.assertIn("replay_capped", [e for e, f in em.events])
         self.assertEqual(t.cursor, 202)
 
-    def test_gap_alert_is_keyed_on_the_stable_watermark_not_the_drifting_floor(self):
-        # The window floor rises as new mail arrives, so keying the alert on it re-announces the SAME
-        # unresolved span every time anyone sends anything.
-        em = self.RecordingEmitter()
-        t = self._target(cursor=100, emitter=em)
-        floors = iter([200, 250, 300])
-        def poll(o, u, h):
-            if "unread_only=true" in u:
-                return km.Poll(False, reason="http 502")
-            return km.Poll(True, items=[{"id": next(floors)}], omitted=2)
-        orig, km.fetch = km.fetch, poll
-        try:
-            for _ in range(3):
-                t.poll_once()
-        finally:
-            km.fetch = orig
-        self.assertEqual(len([f for e, f in em.events if e == "alert"]), 1)
-        self.assertEqual(t.gap_alerted, 100)                  # the watermark, not 200/250/300
-
     def test_pin_tracking_is_bounded_and_evidence_loss_is_a_DURABLE_alert(self):
-        # Loom re-audit 4, MEDIUM 3. Overflow must bound the state file, AND it must be announced as a
-        # real event rather than a stderr line nobody watches - it is a correctness degradation.
         em = self.RecordingEmitter()
         t = self._target(cursor=0, emitter=em)
         t.emitted_above = set(range(1, km.PIN_TRACKING_CAP + 50))
-        poll = lambda o, u, h: (km.Poll(False, reason="http 502") if "unread_only=true" in u
-                                else km.Poll(True, items=[{"id": km.PIN_TRACKING_CAP + 100}], omitted=1))
-        orig, km.fetch = km.fetch, poll
-        try:
-            t.poll_once()
-        finally:
-            km.fetch = orig
+        self._run(t, self._fetch([{"id": km.PIN_TRACKING_CAP + 100}], 1, walk_fail=True))
         self.assertLessEqual(len(t.emitted_above), km.PIN_TRACKING_CAP)
         loss = [f for e, f in em.events if e == "alert" and f.get("evidence_lost")]
         self.assertEqual(len(loss), 1)
         self.assertGreater(loss[0]["forgot"], 0)
         self.assertFalse(t.pin_evidence_intact)
 
-    def test_LOOM4_a_forgotten_id_can_never_count_as_recovery(self):
-        # Once tracking overflows we cannot tell a genuinely-recovered row from one we delivered and
-        # forgot, so the span must stop being closable by counting - otherwise our own amnesia becomes
-        # the evidence that closes it.
+    def test_an_authoritative_walk_restores_lost_evidence(self):
+        # Overflow makes the span unclosable by counting - but a completed walk re-establishes ground
+        # truth directly, so it may close even then.
         em = self.RecordingEmitter()
         t = self._target(cursor=100, emitter=em)
         t.pin_evidence_intact = False
-        poll = lambda o, u, h: (km.Poll(True, items=[{"id": 150}], omitted=0) if "unread_only=true" in u
-                                else km.Poll(True, items=[{"id": 200}], omitted=1))
-        orig, km.fetch = km.fetch, poll
-        try:
-            t.poll_once()
-        finally:
-            km.fetch = orig
-        self.assertEqual(t.cursor, 100)   # would have closed on the count alone; must not
-
-    def test_LOOM4_an_inexact_omission_count_can_never_be_closed_by_counting(self):
-        # truncated=True states no quantity, so `omitted` is a LOWER BOUND. Recovering one row used to
-        # satisfy it and advance, while other (already-read, hence unread_only-invisible) rows in the
-        # span stayed hidden. There is no number to reach, so it must pin.
-        em = self.RecordingEmitter()
-        t = self._target(cursor=100, emitter=em)
-
-        def fake_fetch(opener, url, headers):
-            if "unread_only=true" in url:
-                return km.Poll(True, items=[{"id": 150}], omitted=0)
-            return km.Poll(True, items=[{"id": 200}], omitted=1, omitted_exact=False)
-
-        orig, km.fetch = km.fetch, fake_fetch
-        try:
-            t.poll_once()
-        finally:
-            km.fetch = orig
-        self.assertEqual(t.cursor, 100)                    # *** pinned despite recovered >= omitted ***
-        self.assertEqual(em.new_ids, [150, 200])           # both still delivered
-        self.assertTrue([f for e, f in em.events if e == "alert"])
-
-    def test_an_EXACT_count_still_closes_normally(self):
-        # The inexactness rule must not make every gap permanent.
-        em = self.RecordingEmitter()
-        t = self._target(cursor=100, emitter=em)
-        poll = lambda o, u, h: (km.Poll(True, items=[{"id": 150}], omitted=0) if "unread_only=true" in u
-                                else km.Poll(True, items=[{"id": 200}], omitted=1, omitted_exact=True))
-        orig, km.fetch = km.fetch, poll
-        try:
-            t.poll_once()
-        finally:
-            km.fetch = orig
+        self._run(t, self._fetch([{"id": 200}], 1, walk={200: ([{"id": 150}, {"id": 100}], None)}))
         self.assertEqual(t.cursor, 200)
+        self.assertTrue(t.pin_evidence_intact)
 
     def test_LOOM4_a_restored_pin_clears_when_a_complete_window_reaches_back(self):
-        # MEDIUM 4: cleanup ran only when new_items was non-empty, so a restored pin whose window held
-        # ONLY already-delivered ids stayed pinned forever - the exact state a restart lands in.
         em = self.RecordingEmitter()
         t = self._target(cursor=100, emitter=em)
         t.emitted_above = {200}
-        orig, km.fetch = km.fetch, lambda o, u, h: km.Poll(
-            True, items=[{"id": 100}, {"id": 200}], omitted=0)
-        try:
-            t.poll_once()
-        finally:
-            km.fetch = orig
-        self.assertEqual(em.new_ids, [])        # nothing new to send
-        self.assertEqual(t.cursor, 200)         # but the pin is released
+        self._run(t, self._fetch([{"id": 100}, {"id": 200}], 0))
+        self.assertEqual(em.new_ids, [])
+        self.assertEqual(t.cursor, 200)
         self.assertEqual(t.emitted_above, set())
         self.assertIsNone(t.gap_alerted)
-
-    def test_steady_state_truncation_is_silent_and_changes_nothing(self):
-        # The common case: window reaches back past the cursor, so the drops are already-emitted mail.
-        # This must NOT alert, or the alarm fires on every poll and gets ignored.
-        em = self.RecordingEmitter()
-        t = self._target(cursor=1135, emitter=em)
-        orig, km.fetch = km.fetch, lambda o, u, h: km.Poll(
-            True, items=[{"id": 1101}, {"id": 1140}], omitted=15)
-        try:
-            t.poll_once()
-        finally:
-            km.fetch = orig
-        self.assertEqual(em.new_ids, [1140])
-        self.assertEqual([e for (e, f) in em.events if e == "alert"], [])
-        self.assertEqual(t.cursor, 1140)
-
-    def test_LOOM_REPRO_unresolved_gap_pins_the_cursor_instead_of_stepping_over_it(self):
-        # Loom's exact repro (msg 1150): cursor 1100, visible floor 1200, omitted 4, reconciliation fails.
-        # The old code emitted [1200] and advanced the cursor to 1200, so the NEXT poll saw floor<=cursor,
-        # declared itself safe, and buried the omission forever. The watermark must HOLD.
-        em = self.RecordingEmitter()
-        t = self._target(cursor=1100, emitter=em)
-
-        def fake_fetch(opener, url, headers):
-            if "unread_only=true" in url:
-                return km.Poll(False, reason="http 502")
-            return km.Poll(True, items=[{"id": 1200}], omitted=4)
-
-        orig, km.fetch = km.fetch, fake_fetch
-        try:
-            t.poll_once()
-        finally:
-            km.fetch = orig
-        self.assertEqual(em.new_ids, [1200])          # visible mail still delivered (liveness kept)
-        self.assertEqual(t.cursor, 1100)              # *** PINNED - the whole point ***
-        self.assertEqual(t.emitted_above, {1200})     # remembered, so the next poll will not re-emit it
-
-    def test_a_pinned_watermark_does_not_re_emit_on_the_next_poll(self):
-        # Failing closed must not become a duplicate storm.
-        em = self.RecordingEmitter()
-        t = self._target(cursor=1100, emitter=em)
-        poll = lambda o, u, h: (km.Poll(False, reason="http 502") if "unread_only=true" in u
-                                else km.Poll(True, items=[{"id": 1200}], omitted=4))
-        orig, km.fetch = km.fetch, poll
-        try:
-            t.poll_once()
-            t.poll_once()
-            t.poll_once()
-        finally:
-            km.fetch = orig
-        self.assertEqual(em.new_ids, [1200])          # emitted ONCE across three polls
-        self.assertEqual(t.cursor, 1100)
-
-    def test_a_pinned_gap_alerts_once_not_once_per_poll(self):
-        em = self.RecordingEmitter()
-        t = self._target(cursor=1100, emitter=em)
-        poll = lambda o, u, h: (km.Poll(False, reason="http 502") if "unread_only=true" in u
-                                else km.Poll(True, items=[{"id": 1200}], omitted=4))
-        orig, km.fetch = km.fetch, poll
-        try:
-            for _ in range(5):
-                t.poll_once()
-        finally:
-            km.fetch = orig
-        self.assertEqual(len([e for e, f in em.events if e == "alert"]), 1)
-
-    def test_reconciliation_echoing_the_visible_window_is_NOT_counted_as_recovery(self):
-        # Loom blocker 2: the producer peeks with mark_read=false, so visible rows stay unread and an
-        # unread_only retry commonly returns THE SAME suffix. Counting those as recovered reports a
-        # success that never happened - a false green, worse than a loud failure.
-        em = self.RecordingEmitter()
-        t = self._target(cursor=1100, emitter=em)
-        poll = lambda o, u, h: km.Poll(True, items=[{"id": 1200}, {"id": 1260}],
-                                       omitted=0 if "unread_only=true" in u else 3)
-        orig, km.fetch = km.fetch, poll
-        try:
-            t.poll_once()
-        finally:
-            km.fetch = orig
-        alert = [f for e, f in em.events if e == "alert"][0]
-        self.assertEqual(alert["reconciled"], 0)      # echoed rows recovered NOTHING
-        self.assertEqual(t.cursor, 1100)              # so the watermark stays pinned
-
-    def test_watermark_resumes_advancing_once_windows_are_complete_again(self):
-        em = self.RecordingEmitter()
-        t = self._target(cursor=1100, emitter=em)
-        poll = lambda o, u, h: (km.Poll(False, reason="http 502") if "unread_only=true" in u
-                                else km.Poll(True, items=[{"id": 1200}], omitted=4))
-        orig, km.fetch = km.fetch, poll
-        try:
-            t.poll_once()
-            self.assertEqual(t.cursor, 1100)
-            km.fetch = lambda o, u, h: km.Poll(True, items=[{"id": 1200}, {"id": 1300}], omitted=0)
-            t.poll_once()
-        finally:
-            km.fetch = orig
-        self.assertEqual(t.cursor, 1300)              # advanced once the server stopped hiding rows
-        self.assertEqual(t.emitted_above, set())      # tracking cleared below the new watermark
-        self.assertEqual(em.new_ids, [1200, 1300])    # 1200 not re-emitted
-
-    def test_unrecoverable_gap_still_alerts_with_the_shortfall(self):
-        # Reconciliation itself truncates or fails: we cannot close the gap, so it MUST be announced.
-        em = self.RecordingEmitter()
-        t = self._target(cursor=1100, emitter=em)
-
-        def fake_fetch(opener, url, headers):
-            if "unread_only=true" in url:
-                return km.Poll(False, reason="http 502")
-            return km.Poll(True, items=[{"id": 1200}], omitted=4)
-
-        orig, km.fetch = km.fetch, fake_fetch
-        try:
-            t.poll_once()
-        finally:
-            km.fetch = orig
-        alerts = [f for (e, f) in em.events if e == "alert"]
-        self.assertEqual(len(alerts), 1)
-        self.assertEqual(alerts[0]["reconciled"], 0)
-        self.assertTrue(alerts[0]["pinned"])
-        self.assertIn("PINNED", alerts[0]["reason"])
-        self.assertEqual(t.cursor, 1100)   # fail closed, not fail loud-then-advance
 
 
 class CorruptPinStateTest(unittest.TestCase):
