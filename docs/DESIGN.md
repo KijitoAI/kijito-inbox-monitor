@@ -195,6 +195,21 @@ destroys read-state fleet-wide, on a schedule.
 So `activity_since()` is a TRI-STATE - active / no-activity-in-a-span-we-covered / **NOT OBSERVABLE** - the
 same discipline as §5.2. Absence of evidence is evidence of absence only if you were actually watching.
 
+**Evaluating it: `--check-activity PERSONA --since-id N [--waits K]`.** A one-shot read of a published
+report, with no token, no network and no watch loop, so a shell heartbeat can call it. The exit codes are the
+contract, and 1 and 2 are distinct on purpose:
+
+| exit | meaning |
+|------|---------|
+| 0 | evidence of activity - nothing to report |
+| 1 | no activity in a span this report actually covered; the observation is printed |
+| 2 | NOT OBSERVABLE, or the report is missing/corrupt - no claim in either direction |
+
+Collapsing 2 into 1 would turn "I was not watching" into "they were silent", which is the false assertion the
+whole signal exists to refuse. Both the running watcher and the one-shot go through the same
+`evaluate_activity()`, because a second implementation of a tri-state this subtle is a second chance to get
+it wrong.
+
 **The observation states what was seen, never why.** `activity_observation()` renders the finding with the
 wait count and the last-evidence stamp alongside it, and a test asserts the text contains none of
 `FORBIDDEN_DIAGNOSES` - deadlocked, unreachable and still-working are indistinguishable from this data and

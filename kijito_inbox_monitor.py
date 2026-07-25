@@ -2452,23 +2452,39 @@ def observation_floor_id():
     return max(_INBOX_FLOORS.values()) if _INBOX_FLOORS else None
 
 
-def activity_since(persona, floor_id):
-    """Has `persona` authored anything after `floor_id`? True / False / None (NOT OBSERVABLE).
+def evaluate_activity(report, persona, floor_id):
+    """Answer the question from a PUBLISHED report (§5.4). True / False / None (NOT OBSERVABLE).
 
-    The tri-state is the point, and it is the same discipline as `unread_not_shown` (§5.2): absence of
-    evidence is only evidence of absence if you were actually watching. If this process was not running
-    when `floor_id` was current, it cannot have seen what happened next, so it says None and the caller
-    must not read that as silence.
+    Takes the report rather than reading module state, so the identical logic serves the running watcher
+    and a one-shot `--check-activity` in a separate process. A second implementation of a tri-state this
+    subtle is a second chance to get it wrong.
+
+    The tri-state is the whole point, and it is the same discipline as §5.2: absence of evidence is
+    evidence of absence only if you were actually watching.
     """
-    if _OBSERVED_SINCE is None:
-        return None                       # the watch loop has not started; nothing has been observed at all
-    seen = _LAST_AUTHORED.get(persona)
-    if seen is not None and seen[0] > floor_id:
+    if not isinstance(report, dict) or not report.get("observed_since"):
+        return None                       # nothing has been observed at all
+    seen = (report.get("last_authored") or {}).get(persona)
+    if isinstance(seen, dict) and isinstance(seen.get("id"), int) and seen["id"] > floor_id:
         return True                       # positive evidence, and positive evidence needs no floor
-    floor = observation_floor_id()
-    if floor is None or floor_id < floor:
-        return None                       # the question predates what we can speak for
+    floor = report.get("observation_floor_id")
+    if not isinstance(floor, int) or floor_id < floor:
+        return None                       # the question predates what this report can speak for
     return False
+
+
+def current_activity_report():
+    """The in-process view, in the same shape write_activity_file() publishes."""
+    return {
+        "observed_since": _OBSERVED_SINCE,
+        "observation_floor_id": observation_floor_id(),
+        "last_authored": {p: {"id": i, "created": c} for p, (i, c) in _LAST_AUTHORED.items()},
+    }
+
+
+def activity_since(persona, floor_id):
+    """Has `persona` authored anything after `floor_id`? True / False / None (NOT OBSERVABLE)."""
+    return evaluate_activity(current_activity_report(), persona, floor_id)
 
 
 # Words that assert a CAUSE this data cannot distinguish. Deadlocked, unreachable and thinking-hard all look
@@ -2478,14 +2494,16 @@ def activity_since(persona, floor_id):
 FORBIDDEN_DIAGNOSES = ("deadlock", "stuck", "wedged", "dead", "down", "offline", "crashed", "hung")
 
 
-def activity_observation(persona, floor_id, waits, last_evidence=None):
+def activity_observation(persona, floor_id, waits, last_evidence=None, report=None):
     """The exact text a waiter emits about the member it is waiting on (§5.4). OBSERVATION ONLY.
 
     Carries the wait count and the last-evidence stamp alongside the finding, so a reader can judge
     magnitude without a second query - a bare "no activity" invites the reader to supply the diagnosis
     themselves, which is the failure this wording exists to prevent.
     """
-    seen = _LAST_AUTHORED.get(persona)
+    rep = report if report is not None else current_activity_report()
+    row = (rep.get("last_authored") or {}).get(persona)
+    seen = (row.get("id"), row.get("created")) if isinstance(row, dict) else None
     evidence = last_evidence if last_evidence is not None else (seen[1] if seen else None)
     tail = ("; %s's last observed message was %s" % (persona, evidence)) if evidence else (
         "; no message from %s has been observed at all" % persona)
@@ -2493,6 +2511,38 @@ def activity_observation(persona, floor_id, waits, last_evidence=None):
             "(checked: authored mail. This states what was OBSERVED, not why: not-yet-read, unable to "
             "receive, and still working are indistinguishable from here and need different responses.)"
             % (persona, floor_id, waits, tail))
+
+
+def check_activity(path, persona, floor_id, waits):
+    """One-shot `--check-activity`: read a published report and answer for ONE persona (§5.4).
+
+    Exit codes are the contract, because this is meant to be called from a shell heartbeat:
+        0  evidence of activity        (nothing to report)
+        1  no activity in a span we actually covered   -> the observation is printed
+        2  NOT OBSERVABLE / unusable report            -> print why; assert nothing
+    2 is deliberately distinct from 1. Collapsing them would turn "I was not watching" into "they were
+    silent", which is the false assertion this whole signal is built to refuse.
+    """
+    try:
+        with open(path) as f:
+            report = json.load(f)
+    except (OSError, ValueError) as e:
+        sys.stderr.write("kijito-inbox-monitor: activity report unreadable (%s): %s\n" % (path, e))
+        return 2
+    verdict = evaluate_activity(report, persona, floor_id)
+    if verdict is True:
+        row = (report.get("last_authored") or {}).get(persona) or {}
+        sys.stdout.write("active: %s authored id %s at %s\n"
+                         % (persona, row.get("id"), row.get("created")))
+        return 0
+    if verdict is None:
+        sys.stdout.write("not observable: this report cannot speak about id %s for %s "
+                         "(observed since %s, floor id %s). No claim either way.\n"
+                         % (floor_id, persona, report.get("observed_since"),
+                            report.get("observation_floor_id")))
+        return 2
+    sys.stdout.write(activity_observation(persona, floor_id, waits, report=report) + "\n")
+    return 1
 
 
 def write_activity_file(path, now_iso=None):
@@ -2783,6 +2833,15 @@ def build_parser():
                    help="Publish who AUTHORED mail most recently, as JSON, refreshed each tick. Lets a "
                         "harness answer 'has X been active since my message?' from data this watcher "
                         "already collects, instead of polling every inbox itself. Off by default.")
+    p.add_argument("--check-activity", metavar="PERSONA",
+                   help="One-shot: read --activity-file and report whether PERSONA has authored anything "
+                        "since --since-id. Exits 0 active, 1 no activity in a covered span (prints the "
+                        "observation), 2 NOT OBSERVABLE. Reads only; no token or network needed.")
+    p.add_argument("--since-id", type=int,
+                   help="With --check-activity: the message id you are awaiting a reply to.")
+    p.add_argument("--waits", type=int, default=1,
+                   help="With --check-activity: how many of your own heartbeats you have waited "
+                        "(reported verbatim, so a reader can judge magnitude). Default 1.")
     p.add_argument("--auth-header", help="Header NAME for the token (default Authorization: Bearer).")
     p.add_argument("--token-file", help="File holding the auth token (wins over $KIJITOMON_TOKEN).")
     p.add_argument("--no-fast-path", action="store_true",
@@ -2835,6 +2894,17 @@ def validate_args(args):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    # A pure read of an existing report: no token, no network, no state file, no watch loop. Placed
+    # before validate_args so a heartbeat can call it without satisfying the watcher's own config.
+    if args.check_activity:
+        if not args.activity_file:
+            sys.stderr.write("kijito-inbox-monitor: FATAL --check-activity requires --activity-file\n")
+            return 2
+        if args.since_id is None:
+            sys.stderr.write("kijito-inbox-monitor: FATAL --check-activity requires --since-id "
+                             "(the message id you are waiting on a reply to)\n")
+            return 2
+        return check_activity(args.activity_file, args.check_activity, args.since_id, args.waits)
     try:
         validate_args(args)
         return run(args)
