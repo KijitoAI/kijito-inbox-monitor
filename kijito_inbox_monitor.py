@@ -442,12 +442,19 @@ class RotatingFileSink:
         self._fh = None
         self._pending = False      # bytes written that are not known to be on stable storage yet
         self._sync_failed = False  # an fsync we can never retry (the fd was rotated away) failed
+        self._dir_pending = False  # a directory ENTRY changed (create/rotate) and is not durable yet
         self._open()
 
     def _open(self):
         dirn = os.path.dirname(os.path.abspath(self.path)) or "."
-        os.makedirs(dirn, exist_ok=True)
-        self._fh = open(self.path, "a", encoding="utf-8")
+        _makedirs_private(dirn)
+        existed = os.path.exists(self.path)
+        self._fh = _open_private(self.path, "a", encoding="utf-8")
+        if not existed:
+            # A NEW FILE NEEDS ITS DIRECTORY ENTRY SYNCED, NOT JUST ITS BYTES (Loom re-audit 8, HIGH 2).
+            # fsync on the fd makes the CONTENT durable; the NAME lives in the directory. Deferred to
+            # sync() so it lands before the cursor that acknowledges these events is persisted.
+            self._dir_pending = True
 
     def write(self, line):
         """Append one event line. Returns True IFF the line reached the file.
@@ -481,6 +488,17 @@ class RotatingFileSink:
         """
         failed_earlier, self._sync_failed = self._sync_failed, False
         ok = True
+        if self._dir_pending:
+            # THE NAME AS WELL AS THE BYTES. Syncing only the fd leaves a cursor that can outlive the
+            # PATHNAME of the events it acknowledges - and the state file may live in a DIFFERENT
+            # directory (--state-file and --events-file-template are independent), so syncing the state
+            # directory proves nothing about this one.
+            if _fsync_dir(os.path.dirname(os.path.abspath(self.path)) or "."):
+                self._dir_pending = False
+            else:
+                sys.stderr.write("kijito-inbox-monitor: WARNING could not fsync the events directory; "
+                                 "holding the cursor\n")
+                ok = False
         if self._pending:
             try:
                 self._fh.flush()
@@ -519,6 +537,9 @@ class RotatingFileSink:
         except OSError as e:
             sys.stderr.write("kijito-inbox-monitor: WARNING log rotation failed (non-fatal): %s\n" % e)
         finally:
+            # Every rename above rewrote directory ENTRIES; none of them is durable until the directory
+            # itself is synced (Loom re-audit 8, HIGH 2).
+            self._dir_pending = True
             self._open()  # always reopen by NAME - a tail -F consumer follows us onto the fresh file
 
     def close(self):
@@ -682,6 +703,42 @@ class Emitter:
 CORRUPT_STATE = object()
 
 
+PRIVATE_FILE_MODE = 0o600   # event streams and lock sidecars carry/guard message content
+PRIVATE_DIR_MODE = 0o700
+
+
+def _open_private(path, mode="a", encoding=None):
+    """Open a file that must never be world-readable, and REPAIR an existing one that already is.
+
+    THE EVENT STREAM CARRIES MESSAGE BODIES (Loom re-audit 8, HIGH 1). A plain open() takes the process
+    umask, which is 022 on this machine and on most defaults, so every events.<persona>.ndjson was created
+    0644 - world-readable private hive mail, verified live. The token file (0600) and the state file (0600
+    via mkstemp) were already right, which is what made the gap easy to miss: the ONE file nobody had
+    thought about is the one with the plaintext in it.
+    The mode argument to os.open applies ONLY at creation, so a fix that stops there leaves every ALREADY
+    LEAKED file exactly as permissive as it was - which is why the existing mode is checked and tightened
+    too. Repair is best-effort: a file we do not own must not crash the watcher, but it must be reported.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, PRIVATE_FILE_MODE)
+    try:
+        st = os.fstat(fd)
+        if st.st_mode & 0o077:
+            os.fchmod(fd, PRIVATE_FILE_MODE)
+            sys.stderr.write("kijito-inbox-monitor: tightened %s from %o to 0600 (it carries message "
+                             "content and was readable by other local users)\n" % (path, st.st_mode & 0o777))
+    except OSError as e:
+        sys.stderr.write("kijito-inbox-monitor: WARNING could not tighten permissions on %s (%s); it may be "
+                         "readable by other local users\n" % (path, e))
+    return os.fdopen(fd, mode, encoding=encoding) if encoding else os.fdopen(fd, mode)
+
+
+def _makedirs_private(path):
+    """Create a directory 0700 when WE create it. An existing directory is left alone deliberately -
+    silently re-permissioning a path the operator already owns is not ours to do, and the 0600 files
+    inside it are what actually protects the content."""
+    os.makedirs(path, mode=PRIVATE_DIR_MODE, exist_ok=True)
+
+
 def _fsync_dir(path):
     """fsync a DIRECTORY so a rename inside it is durable. Returns True on success.
 
@@ -750,12 +807,12 @@ class StateFile:
         if not IS_POSIX or fcntl is None:
             return  # Windows: no lock (documented; run a single instance)
         dirn = os.path.dirname(os.path.abspath(self.path)) or "."
-        os.makedirs(dirn, exist_ok=True)
+        _makedirs_private(dirn)
         # Lock a DEDICATED .lock SIDECAR, never the state-file itself: save() replaces the state-file's inode
         # (mkstemp + os.replace) on every poll, which would orphan a flock held on it and let a second watcher
         # lock the new inode freely. The sidecar is never replaced, so the flock persists for the process
         # lifetime. flock is advisory + auto-released by the OS on exit (no stale lockfile to clean).
-        self._lockf = open(self.path + ".lock", "a+")
+        self._lockf = _open_private(self.path + ".lock", "a+")
         try:
             fcntl.flock(self._lockf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
@@ -921,8 +978,16 @@ class StateFile:
 
     def save(self, cursor, state, failures, emitted_above=None, gap_alerted=None,
              pin_forced=False, pin_evidence_intact=True, state_corrupt=False, pin_release_at=None):
+        """Persist the cursor. Returns True IFF the write is DURABLE (Loom re-audit 8, HIGH 3).
+
+        The directory fsync used to be called and its answer thrown away, so a failure returned success
+        with no diagnostic: the cursor was written and its durability merely assumed. The failure
+        direction is re-delivery rather than loss - a reverted state file replays mail - but a watcher
+        that cannot tell you it failed to persist will keep not telling you, and a disk failing this way
+        is exactly the condition nobody notices.
+        """
         if not IS_POSIX:
-            return  # best-effort; skip on Windows
+            return True  # best-effort; skip on Windows
         d = {"identity": self.identity, "cursor": cursor, "state": state, "consecutive_failures": failures}
         # Persisted so a RESTART cannot re-emit what we already delivered above a pinned watermark.
         # Without this, failing closed would trade silent loss for a duplicate storm on every restart.
@@ -944,7 +1009,7 @@ class StateFile:
         if pin_release_at is not None:
             d["pin_release_at"] = pin_release_at
         dirn = os.path.dirname(os.path.abspath(self.path)) or "."
-        os.makedirs(dirn, exist_ok=True)
+        _makedirs_private(dirn)
         fd, tmp = tempfile.mkstemp(dir=dirn, prefix=".kijmon-", suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as f:
@@ -953,14 +1018,21 @@ class StateFile:
                 os.fsync(f.fileno())
             os.replace(tmp, self.path)
             # The rename needs its own sync - see _fsync_dir(). Without it the cursor's DURABILITY story
-            # stops one level short of the thing that makes it visible.
-            _fsync_dir(dirn)
+            # stops one level short of the thing that makes it visible. ITS ANSWER IS RETURNED, not
+            # discarded: a check whose result nobody reads is not a check.
+            if not _fsync_dir(dirn):
+                sys.stderr.write("kijito-inbox-monitor: WARNING state-file directory fsync FAILED for %s; "
+                                 "the cursor is written but its durability is UNPROVEN (a crash may replay "
+                                 "mail from an older cursor)\n" % dirn)
+                return False
+            return True
         except OSError as e:
             sys.stderr.write("kijito-inbox-monitor: WARNING state-file write failed (non-fatal): %s\n" % e)
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
+            return False
 
 
 # --------------------------------------------------------------------------------------------------------------------

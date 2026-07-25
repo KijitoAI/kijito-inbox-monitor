@@ -1953,6 +1953,21 @@ class Loom7DurabilityOrderingTest(unittest.TestCase):
         self.assertEqual(t.cursor, 100)              # ...but never acknowledged
         self.assertEqual(t.emitted_above, set())
 
+    @staticmethod
+    def _fsync_spy(calls):
+        """Record fsyncs, separating FILE from DIRECTORY - a directory sync is a different guarantee
+        (the NAME is durable) from a file sync (the BYTES are), and a test that lumps them together
+        cannot tell which one it lost."""
+        import stat as _stat
+        real = km.os.fsync
+        def spy(fd):
+            try:
+                calls.append("dir" if _stat.S_ISDIR(os.fstat(fd).st_mode) else "file")
+            except OSError:
+                calls.append("file")
+            return real(fd)
+        return spy, real
+
     def test_the_barrier_syncs_only_THIS_persona_s_sink(self):
         # The Emitter is shared by every watch target, so an unscoped sync would let ONE persona's
         # failing sink retract every OTHER persona's deliveries - a directory-wide duplicate storm
@@ -1970,13 +1985,13 @@ class Loom7DurabilityOrderingTest(unittest.TestCase):
         em.new({"id": 1, "from": "river", "_persona": "argus"})
         em.new({"id": 2, "from": "river", "_persona": "loom"})
         calls = []
-        real = km.os.fsync
-        km.os.fsync = lambda fd: (calls.append(fd), real(fd))[1]
+        spy, real = self._fsync_spy(calls)
+        km.os.fsync = spy
         try:
             self.assertTrue(em.sync("argus"))
-            self.assertEqual(len(calls), 1, "only argus's sink should have been synced")
+            self.assertEqual(calls.count("file"), 1, "only argus's sink bytes should have been synced")
             self.assertTrue(em.sync("loom"))
-            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls.count("file"), 2)
         finally:
             km.os.fsync = real
 
@@ -2015,18 +2030,245 @@ class Loom7DurabilityOrderingTest(unittest.TestCase):
         sink = km.RotatingFileSink(os.path.join(d, "events.ndjson"), 0, 5)
         self.addCleanup(sink.close)
         calls = []
-        real = km.os.fsync
-        km.os.fsync = lambda fd: (calls.append(fd), real(fd))[1]
+        spy, real = self._fsync_spy(calls)
+        km.os.fsync = spy
         try:
-            self.assertTrue(sink.sync())            # nothing written yet
-            self.assertEqual(calls, [])
+            self.assertTrue(sink.sync())            # the NEW file's directory entry is synced once...
+            self.assertEqual(calls.count("file"), 0, "no bytes were written, so nothing to sync")
+            self.assertEqual(calls.count("dir"), 1, "a newly CREATED file needs its directory entry durable")
             sink.write("{}\n")
             self.assertTrue(sink.sync())
-            self.assertEqual(len(calls), 1)
-            self.assertTrue(sink.sync())            # already durable
-            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls.count("file"), 1)
+            self.assertTrue(sink.sync())            # already durable: neither is repeated
+            self.assertEqual(calls.count("file"), 1)
+            self.assertEqual(calls.count("dir"), 1)
         finally:
             km.os.fsync = real
+
+
+class Loom8FilePermissionsTest(unittest.TestCase):
+    """Loom re-audit 8, HIGH 1. THE EVENT STREAM CARRIES MESSAGE BODIES AND WAS WORLD-READABLE.
+
+    A plain open() takes the process umask - 022 here and on most defaults - so every
+    events.<persona>.ndjson was created 0644. Confirmed on the LIVE deployment before fixing: the argus
+    stream was 0644 with message content in it, alongside a 0600 token and a 0600 state file. The one
+    file nobody had thought about is the one with the plaintext.
+    """
+    def _mode(self, path):
+        return os.stat(path).st_mode & 0o777
+
+    def test_a_NEW_event_file_is_created_0600(self):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "events.ndjson")
+        sink = km.RotatingFileSink(p, 0, 5)
+        self.addCleanup(sink.close)
+        sink.write('{"event":"new","content":"private mail"}\n')
+        self.assertEqual(self._mode(p), 0o600, "the event stream must not be readable by other users")
+
+    def test_an_EXISTING_world_readable_file_is_REPAIRED(self):
+        # The mode argument to os.open applies only at CREATION, so a fix that stops there leaves every
+        # already-leaked file exactly as permissive as it was. loom asked for exactly this: "verify
+        # existing modes after restart".
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "events.ndjson")
+        with open(p, "w") as f:
+            f.write('{"event":"new","content":"leaked earlier"}\n')
+        os.chmod(p, 0o644)
+        buf, err = __import__("io").StringIO(), km.sys.stderr
+        km.sys.stderr = buf
+        try:
+            sink = km.RotatingFileSink(p, 0, 5)
+            self.addCleanup(sink.close)
+        finally:
+            km.sys.stderr = err
+        self.assertEqual(self._mode(p), 0o600)
+        self.assertIn("tightened", buf.getvalue())
+
+    def test_the_LOCK_sidecar_is_also_0600(self):
+        d = tempfile.mkdtemp()
+        sf = km.StateFile(os.path.join(d, "hive.json"), "idx")
+        sf.lock()
+        self.addCleanup(sf.unlock)
+        self.assertEqual(self._mode(os.path.join(d, "hive.json.lock")), 0o600)
+
+    def test_the_STATE_file_stays_0600(self):
+        # It already was, via mkstemp - this is the regression guard, since the fix touched save()'s
+        # neighbourhood and a state file is exactly as sensitive as the stream.
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "hive.json")
+        km.StateFile(p, "idx").save(200, "UP", 0)
+        self.assertEqual(self._mode(p), 0o600)
+
+    def test_a_ROTATED_archive_does_not_leak_what_the_live_file_protects(self):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "events.ndjson")
+        sink = km.RotatingFileSink(p, 120, 3)
+        self.addCleanup(sink.close)
+        for i in range(6):
+            sink.write('{"event":"new","content":"private %d"}\n' % i)
+        archives = [os.path.join(d, f) for f in os.listdir(d) if f.startswith("events.ndjson.")]
+        self.assertTrue(archives, "precondition: rotation happened")
+        for a in archives:
+            self.assertEqual(self._mode(a), 0o600, "%s leaks what the live file protects" % a)
+
+    def test_a_directory_WE_create_is_0700(self):
+        d = tempfile.mkdtemp()
+        nested = os.path.join(d, "made", "by", "us")
+        sink = km.RotatingFileSink(os.path.join(nested, "events.ndjson"), 0, 5)
+        self.addCleanup(sink.close)
+        self.assertEqual(os.stat(nested).st_mode & 0o777, 0o700)
+
+
+class Loom8DurableDirectoryEntryTest(unittest.TestCase):
+    """Loom re-audit 8, HIGH 2 and HIGH 3. The NAME must be durable, and a failed sync must be REPORTED."""
+
+    def test_a_NEW_event_file_syncs_its_DIRECTORY_before_the_cursor_can_advance(self):
+        # fsync on the fd makes the BYTES durable; the NAME lives in the directory. Without this the
+        # state directory can persist an advanced cursor while the event pathname is lost - and the two
+        # directories can legitimately DIFFER, since --state-file and --events-file-template are
+        # independent, so syncing one proves nothing about the other.
+        import stat as _stat
+        d = tempfile.mkdtemp()
+        kinds = []
+        real = km.os.fsync
+        def spy(fd):
+            try:
+                kinds.append("dir" if _stat.S_ISDIR(os.fstat(fd).st_mode) else "file")
+            except OSError:
+                kinds.append("file")
+            return real(fd)
+        km.os.fsync = spy
+        try:
+            sink = km.RotatingFileSink(os.path.join(d, "events.ndjson"), 0, 5)
+            self.addCleanup(sink.close)
+            sink.write("{}\n")
+            self.assertTrue(sink.sync())
+        finally:
+            km.os.fsync = real
+        self.assertIn("dir", kinds, "a newly created event file needs its DIRECTORY entry synced")
+        self.assertIn("file", kinds)
+
+    def test_a_ROTATION_syncs_the_directory_again(self):
+        import stat as _stat
+        d = tempfile.mkdtemp()
+        sink = km.RotatingFileSink(os.path.join(d, "events.ndjson"), 80, 3)
+        self.addCleanup(sink.close)
+        sink.write('{"pad":"%s"}\n' % ("x" * 100))     # forces a rotation
+        sink.sync()
+        kinds = []
+        real = km.os.fsync
+        def spy(fd):
+            try:
+                kinds.append("dir" if _stat.S_ISDIR(os.fstat(fd).st_mode) else "file")
+            except OSError:
+                kinds.append("file")
+            return real(fd)
+        km.os.fsync = spy
+        try:
+            sink.write('{"pad":"%s"}\n' % ("y" * 100))  # rotates again: directory entries rewritten
+            self.assertTrue(sink.sync())
+        finally:
+            km.os.fsync = real
+        self.assertIn("dir", kinds, "every rename rewrites directory entries and none is durable until synced")
+
+    def test_a_PARTIALLY_FAILED_rotation_still_syncs_the_entries_it_DID_rewrite(self):
+        # ⚠️ THE MUTATION HARNESS FOUND THIS ONE. On a normal rotation the live file is renamed away, so
+        # the reopen sees a NEW file and flags the directory itself - which makes rotation's own flag look
+        # redundant, and a test using a healthy rotation passes with it deleted. The case where it is NOT
+        # redundant is a rotation that fails PARTWAY: the archive renames already rewrote directory
+        # entries, but the live file survives, so the reopen sees an existing file and flags nothing.
+        # Without rotation's own flag those rewritten entries are never made durable.
+        import stat as _stat
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "events.ndjson")
+        with open(p + ".1", "w") as f:              # an archive exists, so rotation has renames to do
+            f.write("old\n")
+        sink = km.RotatingFileSink(p, 60, 3)
+        self.addCleanup(sink.close)
+        sink.write('{"pad":"%s"}\n' % ("x" * 80))
+        self.assertTrue(sink.sync())                # clear the create-time flag
+
+        real_replace = km.os.replace
+        def fail_only_the_live_rename(src, dst):
+            if os.path.abspath(src) == os.path.abspath(p):
+                raise OSError("simulated: archives rotated, live rename failed")
+            return real_replace(src, dst)
+        kinds = []
+        real_fsync = km.os.fsync
+        def spy(fd):
+            try:
+                kinds.append("dir" if _stat.S_ISDIR(os.fstat(fd).st_mode) else "file")
+            except OSError:
+                kinds.append("file")
+            return real_fsync(fd)
+        km.os.replace, km.os.fsync = fail_only_the_live_rename, spy
+        buf, err = __import__("io").StringIO(), km.sys.stderr
+        km.sys.stderr = buf
+        try:
+            sink.write('{"pad":"%s"}\n' % ("y" * 80))   # triggers the partial rotation
+            sink.sync()
+        finally:
+            km.os.replace, km.os.fsync, km.sys.stderr = real_replace, real_fsync, err
+        self.assertTrue(os.path.exists(p), "precondition: the live file survived, so the reopen sees it")
+        self.assertIn("dir", kinds,
+                      "entries were rewritten before the failure and must still be made durable")
+
+    def test_a_FAILED_directory_sync_holds_the_cursor(self):
+        d = tempfile.mkdtemp()
+        sink = km.RotatingFileSink(os.path.join(d, "events.ndjson"), 0, 5)
+        self.addCleanup(sink.close)
+        import stat as _stat
+        real = km.os.fsync
+        def only_dirs_fail(fd):
+            if _stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError("simulated directory fsync failure")
+            return real(fd)
+        km.os.fsync = only_dirs_fail
+        buf, err = __import__("io").StringIO(), km.sys.stderr
+        km.sys.stderr = buf
+        try:
+            sink.write("{}\n")
+            self.assertFalse(sink.sync(), "an unsynced directory entry is not durable delivery")
+        finally:
+            km.os.fsync, km.sys.stderr = real, err
+        self.assertIn("events directory", buf.getvalue())
+
+    # ---- HIGH 3: the RESULT must be honoured, not merely the call present ----
+    def test_save_returns_TRUE_when_the_write_is_durable(self):
+        d = tempfile.mkdtemp()
+        self.assertIs(km.StateFile(os.path.join(d, "hive.json"), "idx").save(200, "UP", 0), True)
+
+    def test_save_returns_FALSE_and_SAYS_SO_when_the_directory_cannot_be_synced(self):
+        # ★ loom's sharpest point this round: the existing mutation proved the CALL was present, never
+        # that its ANSWER was read. `_fsync_dir` returned False and save() discarded it, reporting
+        # success with the cursor written and its durability merely assumed.
+        import stat as _stat
+        d = tempfile.mkdtemp()
+        real = km.os.fsync
+        def only_dirs_fail(fd):
+            if _stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError("simulated directory fsync failure")
+            return real(fd)
+        km.os.fsync = only_dirs_fail
+        buf, err = __import__("io").StringIO(), km.sys.stderr
+        km.sys.stderr = buf
+        try:
+            ok = km.StateFile(os.path.join(d, "hive.json"), "idx").save(200, "UP", 0)
+        finally:
+            km.os.fsync, km.sys.stderr = real, err
+        self.assertIs(ok, False, "durability must not be reported as proven when it is not")
+        self.assertIn("UNPROVEN", buf.getvalue(), "and it must SAY so - silence is the actual defect")
+
+    def test_save_returns_FALSE_when_the_write_itself_fails(self):
+        sf = km.StateFile(os.path.join(tempfile.mkdtemp(), "nested-missing", "hive.json"), "idx")
+        real = km.os.replace
+        km.os.replace = lambda *a: (_ for _ in ()).throw(OSError("simulated replace failure"))
+        buf, err = __import__("io").StringIO(), km.sys.stderr
+        km.sys.stderr = buf
+        try:
+            self.assertIs(sf.save(200, "UP", 0), False)
+        finally:
+            km.os.replace, km.sys.stderr = real, err
 
 
 class Loom7StrictPersistedSchemaTest(unittest.TestCase):
