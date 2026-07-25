@@ -161,6 +161,46 @@ because alarming with no directory would flag every persona; this one concerns t
 the worst case of firing is a line in a stream nobody reads and the worst case of withholding is the silent
 wake gap the tool exists to prevent.
 
+### 5.4 Authorship: an attributable liveness signal, collected for free
+
+`--activity-file PATH` publishes, refreshed each tick, the newest message id each persona has been observed
+to have AUTHORED. It exists so a harness can answer "has X been active since my message?" without inventing
+its own scan.
+
+**Why authorship and not the obvious signals.** Two seemingly better sources are both forgeable by accident:
+
+- **inbox read-state** - any agent calling the inbox with the default `mark_read=true` produces X's read
+  bit, so "X read their mail" only means "somebody read X's mail". It also fails the other way: a member
+  consuming its `events.<persona>.ndjson` stream reads its mail without ever touching read-state.
+- **`/api/presence`** - a GET carrying `?persona=X` BEATS X into the active roster, so any observer probing
+  X makes X look alive. A diagnostic read that writes the state being diagnosed.
+
+Only B produces B's outbound, and no third party can manufacture or erase it. That is the whole selection
+criterion: a liveness check built on a bit any observer can flip is not a check.
+
+**It costs nothing.** All-personas mode already fetches every inbox every tick, the URL already hardcodes
+`mark_read=false`, and every row already carries `from`. The alternative - a client polling every inbox on a
+timer to reconstruct this - is not merely wasteful but dangerous: one missing `mark_read=false` in that loop
+destroys read-state fleet-wide, on a schedule.
+
+**Two coverage limits, both published, because a claim of silence is only as good as the watching.**
+
+- `observed_since` - this process saw nothing before it started.
+- `observation_floor_id` - the **MAXIMUM** of the per-inbox window floors, deliberately not the minimum. A
+  persona's outbound lands in whichever inbox they wrote to, so "they authored nothing" is only as strong as
+  the WORST-covered inbox; between the lowest and highest floor there are inboxes we have not seen into.
+  Measured live: the watcher had seen ids down to 1160 in one inbox while another reached only 1179, which
+  made a question about id 1165 look answerable when it was not.
+
+So `activity_since()` is a TRI-STATE - active / no-activity-in-a-span-we-covered / **NOT OBSERVABLE** - the
+same discipline as §5.2. Absence of evidence is evidence of absence only if you were actually watching.
+
+**The observation states what was seen, never why.** `activity_observation()` renders the finding with the
+wait count and the last-evidence stamp alongside it, and a test asserts the text contains none of
+`FORBIDDEN_DIAGNOSES` - deadlocked, unreachable and still-working are indistinguishable from this data and
+need opposite responses (one wants a ping, one wants a human to restart a bridge). That rule lives in the
+code, not only here, because a rule that lives only in prose does not run.
+
 ## 6. Emit modes (portability)
 
 "NDJSON-on-stdout is universal" is false on ingestion: Claude Code ingests per-event (hooks: JSON-on-stdin,

@@ -478,6 +478,154 @@ class DeclaredOmissionsTest(unittest.TestCase):
         self.assertEqual(poll.omitted, 3)
 
 
+class AuthorshipSignalTest(unittest.TestCase):
+    """The attributable liveness signal: who AUTHORED mail, observed for free from windows we already fetch.
+
+    Chosen over inbox-read and over `/api/presence` because both of those can be produced for a persona by
+    ANY other agent - inbox-read via a default `mark_read=true`, presence via a GET carrying `?persona=X`.
+    Only B produces B's outbound.
+    """
+
+    def setUp(self):
+        km._LAST_AUTHORED.clear()
+        km._INBOX_FLOORS.clear()
+        km._OBSERVED_SINCE = None
+
+    tearDown = setUp
+
+    def _observe(self, items, inbox="argus", since="2026-07-25T02:00:00+00:00"):
+        km._OBSERVED_SINCE = since
+        km.note_authorship(items)
+        km.note_observation_floor(inbox, items)
+
+    def test_it_records_the_newest_id_per_author(self):
+        self._observe([{"id": 10, "from": "river", "created": "a"},
+                       {"id": 14, "from": "river", "created": "b"},
+                       {"id": 12, "from": "loom", "created": "c"}])
+        self.assertEqual(km._LAST_AUTHORED["river"], (14, "b"))
+        self.assertEqual(km._LAST_AUTHORED["loom"], (12, "c"))
+
+    def test_it_orders_by_id_not_created(self):
+        # Timestamps are stamped pre-lock while ids are assigned under it, so concurrent senders invert.
+        # Trusting `created` here would record the OLDER message as the newest evidence.
+        self._observe([{"id": 20, "from": "river", "created": "2026-07-25T09:00:00Z"},
+                       {"id": 21, "from": "river", "created": "2026-07-25T08:00:00Z"}])
+        self.assertEqual(km._LAST_AUTHORED["river"][0], 21)
+
+    def test_authors_are_matched_EXACTLY_not_casefolded(self):
+        # The server's persona namespace is case-SENSITIVE, so these are different identities. Merging them
+        # would let one persona's activity vouch for another's.
+        self._observe([{"id": 5, "from": "loom", "created": "a"},
+                       {"id": 9, "from": "Loom", "created": "b"}])
+        self.assertEqual(km._LAST_AUTHORED["loom"][0], 5)
+        self.assertEqual(km._LAST_AUTHORED["Loom"][0], 9)
+
+    def test_malformed_rows_are_ignored(self):
+        self._observe([{"id": 5}, {"from": "river"}, {"id": "x", "from": "river"},
+                       {"id": 7, "from": "", "created": "a"}, {"id": 8, "from": "river", "created": "ok"}])
+        self.assertEqual(list(km._LAST_AUTHORED), ["river"])
+        self.assertEqual(km._LAST_AUTHORED["river"][0], 8)
+
+    # ---- the tri-state ---------------------------------------------------------------------------
+    def test_positive_evidence_is_reported(self):
+        self._observe([{"id": 100, "from": "loom", "created": "a"}])
+        self.assertIs(km.activity_since("loom", 50), True)
+
+    def test_no_evidence_INSIDE_the_observed_window_is_a_real_negative(self):
+        self._observe([{"id": 100, "from": "river", "created": "a"}])
+        self.assertIs(km.activity_since("loom", 150), False)
+
+    def test_a_question_predating_our_observation_window_is_NOT_OBSERVABLE(self):
+        # THE POINT. Absence of evidence is evidence of absence only if you were watching. A producer that
+        # started a minute ago must not report a persona silent since yesterday - it never saw yesterday.
+        self._observe([{"id": 100, "from": "river", "created": "a"}])
+        self.assertIsNone(km.activity_since("loom", 5))
+
+    def test_nothing_observed_at_all_is_NOT_OBSERVABLE(self):
+        self.assertIsNone(km.activity_since("loom", 100))
+
+    def test_the_floor_is_the_WORST_covered_inbox_not_the_best(self):
+        # THE BUG THIS DEFENDS, found on live data. A persona's outbound lands in whichever inbox they
+        # wrote to, so "they authored nothing since X" is only as good as the LEAST-covered inbox. Taking
+        # the minimum floor (the oldest id seen ANYWHERE) claims coverage over a span where other inboxes
+        # were never read - and then reports a silence nobody observed.
+        km._OBSERVED_SINCE = "2026-07-25T02:00:00+00:00"
+        km.note_observation_floor("loom", [{"id": 1160, "from": "argus", "created": "a"}])
+        km.note_observation_floor("argus", [{"id": 1179, "from": "river", "created": "b"}])
+        self.assertEqual(km.observation_floor_id(), 1179)      # the MAX, not 1160
+        # id 1165 sits in the span argus's window never reached, so it is not answerable.
+        self.assertIsNone(km.activity_since("loom", 1165))
+        self.assertIs(km.activity_since("loom", 1200), False)  # above every floor: a real negative
+
+    def test_coverage_extends_as_windows_reach_further_back(self):
+        km._OBSERVED_SINCE = "2026-07-25T02:00:00+00:00"
+        km.note_observation_floor("argus", [{"id": 500, "from": "r", "created": "a"}])
+        self.assertEqual(km.observation_floor_id(), 500)
+        km.note_observation_floor("argus", [{"id": 400, "from": "r", "created": "a"}])
+        self.assertEqual(km.observation_floor_id(), 400)   # a deeper window improves what we can answer
+
+    def test_positive_evidence_beats_the_floor(self):
+        # Evidence needs no window: if we SAW loom author id 900, that is true regardless of how far back
+        # the question reaches.
+        self._observe([{"id": 900, "from": "loom", "created": "a"}])
+        self.assertIs(km.activity_since("loom", 1), True)
+
+    # ---- the observation text --------------------------------------------------------------------
+    def test_the_observation_never_states_a_cause(self):
+        # river's note 3: this is a hard rule in the CODE, not a line in the spec. Deadlocked, unreachable
+        # and thinking-hard are indistinguishable from this data and need opposite remedies.
+        self._observe([{"id": 100, "from": "loom", "created": "2026-07-24T23:24:43Z"}])
+        text = km.activity_observation("loom", 176, waits=2)
+        for word in km.FORBIDDEN_DIAGNOSES:
+            self.assertNotIn(word, text.lower(), "observation must not assert %r" % word)
+
+    def test_the_observation_carries_the_wait_count_and_last_evidence(self):
+        self._observe([{"id": 100, "from": "loom", "created": "2026-07-24T23:24:43Z"}])
+        text = km.activity_observation("loom", 176, waits=2)
+        self.assertIn("2 heartbeat(s)", text)
+        self.assertIn("2026-07-24T23:24:43Z", text)
+        self.assertIn("id 176", text)
+
+    def test_the_observation_says_so_when_nothing_was_ever_seen(self):
+        self._observe([{"id": 100, "from": "river", "created": "a"}])
+        self.assertIn("has been observed at all", km.activity_observation("loom", 50, waits=3))
+
+    # ---- publication -----------------------------------------------------------------------------
+    def test_the_activity_file_publishes_the_table_and_its_limits(self):
+        self._observe([{"id": 100, "from": "loom", "created": "t1"},
+                       {"id": 101, "from": "river", "created": "t2"}])
+        path = os.path.join(tempfile.mkdtemp(), "activity.json")
+        km.write_activity_file(path, now_iso="2026-07-25T03:00:00+00:00")
+        with open(path) as f:
+            d = json.load(f)
+        self.assertEqual(d["last_authored"]["loom"], {"id": 100, "created": "t1"})
+        self.assertEqual(d["last_authored"]["river"], {"id": 101, "created": "t2"})
+        # Both limits must be published, or a reader cannot tell a real silence from an unwatched span.
+        self.assertEqual(d["observed_since"], "2026-07-25T02:00:00+00:00")
+        self.assertEqual(d["observation_floor_id"], 100)
+
+    def test_the_activity_file_write_is_atomic(self):
+        self._observe([{"id": 1, "from": "river", "created": "t"}])
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "activity.json")
+        km.write_activity_file(path)
+        km.write_activity_file(path)
+        # No stray temp files left behind, and the result is a complete parseable document.
+        self.assertEqual([f for f in os.listdir(d) if f.startswith(".kijmon-act-")], [])
+        with open(path) as f:
+            json.load(f)
+
+    def test_a_bad_activity_path_is_non_fatal(self):
+        self._observe([{"id": 1, "from": "river", "created": "t"}])
+        buf, err = __import__("io").StringIO(), km.sys.stderr
+        km.sys.stderr = buf
+        try:
+            km.write_activity_file("/nonexistent-root-dir-kijmon/activity.json")
+        finally:
+            km.sys.stderr = err
+        self.assertIn("WARNING", buf.getvalue())   # warned, did not raise
+
+
 class EventIdTest(unittest.TestCase):
     """Every event carries a producer-owned id, so a consumer never has to hash our NDJSON bytes."""
 

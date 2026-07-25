@@ -1945,6 +1945,12 @@ class WatchTarget:
                 self.failures = 0
 
                 items = poll.items
+                # §5.4 Record who AUTHORED what, from the window we already have. Done before any cursor
+                # or dedup logic: authorship is evidence about the SENDER and is worth collecting whether
+                # or not the message is new to US - a message we have already delivered still proves its
+                # author was alive when they sent it.
+                note_authorship(items)
+                note_observation_floor(self.persona, items)
                 diag = None
                 new_items = []
                 do_arm = not self.armed
@@ -2380,6 +2386,140 @@ def refresh_directory_backing(args, directory, targets):
             target.directory_backed = target.persona in known
 
 
+# §5.4 Attributable authorship, observed for free. Every inbox window the watcher already fetches carries a
+# `from` on every row, so watching all personas means seeing who AUTHORED what without a single extra request.
+# {persona: (highest message id it authored, that message's created stamp)}.
+_LAST_AUTHORED = {}
+
+
+def note_authorship(items):
+    """Record the newest message id seen from each AUTHOR (§5.4).
+
+    Attributable in the way inbox-read and `/api/presence` are not: only B produces B's outbound, and no
+    third party can manufacture or erase it by reading something. That is the whole reason this signal is
+    worth collecting - a liveness check built on a bit any observer can flip is not a check.
+
+    Keyed EXACTLY, never casefolded: the server's persona namespace is case-SENSITIVE, so `Loom` and `loom`
+    are different identities and must not merge (the identity half of the case asymmetry, §5.3).
+
+    Only the newest window is needed. Backward-walk rows are always OLDER than the window floor they were
+    reached from, so they cannot raise a maximum; skipping them costs no evidence.
+    """
+    for m in items or []:
+        who = m.get("from")
+        mid = m.get("id")
+        if not isinstance(who, str) or not who or not isinstance(mid, int):
+            continue
+        prev = _LAST_AUTHORED.get(who)
+        # Compare by `id`, NEVER by `created`: timestamps are stamped pre-lock while ids are assigned under
+        # it, so two concurrent senders can carry timestamps in the opposite order from their ids.
+        if prev is None or mid > prev[0]:
+            _LAST_AUTHORED[who] = (mid, m.get("created"))
+
+
+# Set once, when the watch loop starts. Everything before it is INVISIBLE to this process: the table is built
+# from windows observed since then, so a question about earlier activity must answer UNKNOWN rather than
+# "none". Without this floor a fresh producer would report every persona as inactive for one tick.
+_OBSERVED_SINCE = None
+
+# Per-inbox coverage: {persona: the lowest id ever seen in THAT inbox's window}. A persona's outbound can
+# land in ANY inbox, so a claim that they have authored nothing is only as good as the WORST-covered inbox.
+_INBOX_FLOORS = {}
+
+
+def note_observation_floor(persona, items):
+    ids = [m["id"] for m in (items or []) if isinstance(m.get("id"), int)]
+    if not ids:
+        return
+    low = min(ids)
+    cur = _INBOX_FLOORS.get(persona)
+    if cur is None or low < cur:
+        _INBOX_FLOORS[persona] = low
+
+
+def observation_floor_id():
+    """The id below which "nobody authored anything" CANNOT be asserted. MAXIMUM, deliberately.
+
+    The tempting version is the minimum - the oldest message we have laid eyes on anywhere - and it is
+    WRONG in the dangerous direction. Each inbox window reaches back only as far as its own floor, so
+    between the lowest and highest floor there are inboxes we have NOT seen into. A message authored in
+    that span, addressed to a poorly-covered inbox, is invisible to us; reporting "no activity" there is
+    a silence we did not observe.
+    Caught on live data: the watcher had seen ids down to 1160 (in one inbox) while another inbox's window
+    only reached 1179, so a question about id 1165 looked answerable and was not.
+    Taking the maximum can only make us answer NOT-OBSERVABLE more often, which is the safe direction.
+    """
+    return max(_INBOX_FLOORS.values()) if _INBOX_FLOORS else None
+
+
+def activity_since(persona, floor_id):
+    """Has `persona` authored anything after `floor_id`? True / False / None (NOT OBSERVABLE).
+
+    The tri-state is the point, and it is the same discipline as `unread_not_shown` (§5.2): absence of
+    evidence is only evidence of absence if you were actually watching. If this process was not running
+    when `floor_id` was current, it cannot have seen what happened next, so it says None and the caller
+    must not read that as silence.
+    """
+    if _OBSERVED_SINCE is None:
+        return None                       # the watch loop has not started; nothing has been observed at all
+    seen = _LAST_AUTHORED.get(persona)
+    if seen is not None and seen[0] > floor_id:
+        return True                       # positive evidence, and positive evidence needs no floor
+    floor = observation_floor_id()
+    if floor is None or floor_id < floor:
+        return None                       # the question predates what we can speak for
+    return False
+
+
+# Words that assert a CAUSE this data cannot distinguish. Deadlocked, unreachable and thinking-hard all look
+# identical here and need opposite remedies - a deadlock wants a ping, an unreachable member wants a human to
+# restart its bridge. Enforced by a test, not just documented, because a rule that lives only in prose does
+# not run.
+FORBIDDEN_DIAGNOSES = ("deadlock", "stuck", "wedged", "dead", "down", "offline", "crashed", "hung")
+
+
+def activity_observation(persona, floor_id, waits, last_evidence=None):
+    """The exact text a waiter emits about the member it is waiting on (§5.4). OBSERVATION ONLY.
+
+    Carries the wait count and the last-evidence stamp alongside the finding, so a reader can judge
+    magnitude without a second query - a bare "no activity" invites the reader to supply the diagnosis
+    themselves, which is the failure this wording exists to prevent.
+    """
+    seen = _LAST_AUTHORED.get(persona)
+    evidence = last_evidence if last_evidence is not None else (seen[1] if seen else None)
+    tail = ("; %s's last observed message was %s" % (persona, evidence)) if evidence else (
+        "; no message from %s has been observed at all" % persona)
+    return ("no activity from %s since your message at id %s; you have waited %d heartbeat(s)%s "
+            "(checked: authored mail. This states what was OBSERVED, not why: not-yet-read, unable to "
+            "receive, and still working are indistinguishable from here and need different responses.)"
+            % (persona, floor_id, waits, tail))
+
+
+def write_activity_file(path, now_iso=None):
+    """Publish the authorship table so any harness can evaluate the predicate without inventing a scan.
+
+    This exists to keep consumers OUT of the dangerous shape. Answering "has B sent anything" from a client
+    otherwise means polling every persona's inbox on a timer, where one missing `mark_read=false` destroys
+    read-state fleet-wide. The watcher already holds the answer, gathered safely.
+    """
+    d = {
+        "observed_since": _OBSERVED_SINCE,
+        "observation_floor_id": observation_floor_id(),
+        "updated": now_iso or _now_iso(),
+        # A question about anything at or below observation_floor_id is NOT ANSWERABLE from this file.
+        "last_authored": {p: {"id": i, "created": c} for p, (i, c) in sorted(_LAST_AUTHORED.items())},
+    }
+    dirn = os.path.dirname(os.path.abspath(path)) or "."
+    try:
+        os.makedirs(dirn, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=dirn, prefix=".kijmon-act-", suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, path)             # atomic: a reader never sees a half-written table
+    except OSError as e:
+        sys.stderr.write("kijito-inbox-monitor: WARNING activity-file write failed (non-fatal): %s\n" % e)
+
+
 _REPORTED_STRANDED = set()
 
 
@@ -2518,6 +2658,8 @@ def run(args):
 
     seam = WakeSeam()
     seam.install()
+    global _OBSERVED_SINCE
+    _OBSERVED_SINCE = _now_iso()   # §5.4 nothing before this instant is observable to this process
     rediscover_at = _monotonic() + args.rediscover_every
     cursor = None    # opaque long-poll cursor (the server's max-message-id token) echoed on each call
     lp_backoff = 0   # exponential backoff (s) between FAILED long-poll attempts; 0 while healthy
@@ -2563,6 +2705,8 @@ def run(args):
         refresh_directory_backing(args, directory_personas, targets)
         for target in targets:
             target.poll_once(counts_available, unread_counts)
+        if args.activity_file:
+            write_activity_file(args.activity_file)
         if seam.stop:
             break
         if held:
@@ -2635,6 +2779,10 @@ def build_parser():
                    help="Persist+resume cursor/FSM; single-writer locked. Kijito persona targets derive one "
                         "file per persona from this base path. Recommended w/ a supervisor.")
     p.add_argument("--heartbeat", type=int, help="Emit a heartbeat event every N seconds (external dead-man's-switch).")
+    p.add_argument("--activity-file",
+                   help="Publish who AUTHORED mail most recently, as JSON, refreshed each tick. Lets a "
+                        "harness answer 'has X been active since my message?' from data this watcher "
+                        "already collects, instead of polling every inbox itself. Off by default.")
     p.add_argument("--auth-header", help="Header NAME for the token (default Authorization: Bearer).")
     p.add_argument("--token-file", help="File holding the auth token (wins over $KIJITOMON_TOKEN).")
     p.add_argument("--no-fast-path", action="store_true",
