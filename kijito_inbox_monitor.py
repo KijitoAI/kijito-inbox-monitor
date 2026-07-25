@@ -2592,6 +2592,42 @@ def write_activity_file(path, now_iso=None):
         sys.stderr.write("kijito-inbox-monitor: WARNING activity-file write failed (non-fatal): %s\n" % e)
 
 
+def has_consumer_evidence(persona):
+    """POSITIVE evidence that a real agent stands behind this persona name (§5.6).
+
+    Deliberately the SAME shape as the stranded-mail ownership predicate and river's broadcast eligibility
+    rule, because the three answer one question - "is anyone actually there?" - and two predicates for one
+    question drift apart and then disagree about the same inbox.
+
+    Evidence is positive: authorship we OBSERVED, or memories the directory says they own. A count of NONE
+    is not reported rather than reported-zero, and no data is not evidence of absence, so an unreported
+    count leaves the persona eligible. Only a positively-stated zero with no observed authorship excludes.
+    """
+    if persona in _LAST_AUTHORED:
+        return True                                  # we watched them write something
+    n = _PERSONA_MEMORY_COUNTS.get(persona)
+    if n is None:
+        return True                                  # the server said nothing; do not infer absence
+    return n > 0
+
+
+def deliverable_watchers(directory, targets):
+    """Which watchers should receive an account-level alarm (§5.6).
+
+    Directory membership alone routes alarms into the streams of long-dead test personas - the same defect
+    as a broadcast amplifying phantoms - so eligibility needs evidence of a consumer, not just a name.
+
+    FAILS OPEN, and that matters more than the filtering: if the predicate would leave NOBODY, every
+    directory watcher is used instead. An alarm delivered to a stream nobody reads costs one line; an alarm
+    delivered to NOBODY is the silent failure this tool exists to prevent, and a filter that can silence
+    every recipient at once is a worse bug than the noise it removes.
+    """
+    known = {p for p in (directory or ()) if p}
+    candidates = sorted({t.persona for t in targets if t.persona and t.persona in known})
+    live = [p for p in candidates if has_consumer_evidence(p)]
+    return live or candidates
+
+
 _REPORTED_URGENT_QUIET = set()
 
 
@@ -2646,10 +2682,10 @@ def report_urgent_unanswered(directory, targets, emitter):
         detail.append("%s (%d urgent unread; %s)" % (
             persona, n,
             ("last observed message %s" % seen[1]) if seen else "no message from them observed at all"))
-    known = {p for p in directory if p}
     # One summarising event per watcher, exactly as the stranded alarm does - discovering several at once
-    # must not become a wake storm.
-    for watcher in sorted({t.persona for t in targets if t.persona and t.persona in known}):
+    # must not become a wake storm. Routed by evidence of a consumer (§5.6), not by directory membership
+    # alone, so the alert does not land in long-dead test personas' streams.
+    for watcher in deliverable_watchers(directory, targets):
         emitter.lifecycle(
             "alert", persona=watcher,
             reason=("urgent-unanswered: %d member(s) hold mail a sender marked URGENT while no activity "
@@ -2757,8 +2793,9 @@ def report_stranded_inboxes(directory, counts, targets, emitter):
             "kijito-inbox-monitor: ALERT stranded mail - %s is not a known persona, so no agent consumes its "
             "mail (further reports for %r suppressed)\n" % (_stranded_detail(persona, directory, counts), persona))
     detail = ", ".join(_stranded_detail(p, directory, counts) for p in fresh)
-    known = {p for p in directory if p}
-    for watcher in sorted({t.persona for t in targets if t.persona and t.persona in known}):
+    # Same routing rule as the urgent-unanswered alarm (§5.6) - one predicate for "is anyone there",
+    # because two would drift apart and disagree about the same inbox.
+    for watcher in deliverable_watchers(directory, targets):
         emitter.lifecycle("alert", persona=watcher,
                           reason="stranded-mail: %d inbox(es) receiving mail nobody watches: %s" % (len(fresh), detail),
                           stranded_inboxes=list(fresh))

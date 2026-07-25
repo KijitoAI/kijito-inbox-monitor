@@ -138,6 +138,17 @@ reviewer originally assigned never read the request.
   the suite's two `ResourceWarning`s. `StateFile.unlock()` now exists and is called on shutdown.
 
 ### Added
+- **Alarm routing now requires evidence of a consumer.** Account-level alarms went to every directory
+  persona, which meant long-dead test personas kept receiving alerts into streams nobody reads. Eligibility
+  is now positive - observed authorship, or memories the directory says they own - and it mirrors the
+  stranded-mail ownership test on purpose, since two predicates for one question drift apart and then
+  disagree. Authorship alone suffices so first contact is not broken, and an unreported memory count leaves
+  a persona eligible because no data is not evidence of absence.
+
+  It fails open: if the predicate would leave nobody, every directory watcher is used instead. An alarm
+  delivered to a dead stream costs a line; one delivered to nobody is the silent failure the tool exists to
+  prevent. Measured live, recipients fell from 25 to 18.
+
 - **Urgent-unanswered alarm.** The watcher reports members holding mail a sender marked **urgent** while no
   activity from them has been observed.
 

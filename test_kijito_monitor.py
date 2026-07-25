@@ -872,6 +872,73 @@ class UrgentUnansweredAlarmTest(unittest.TestCase):
         self.assertEqual(self._run(directory=())[0], [])
 
 
+class DeliverableWatchersTest(unittest.TestCase):
+    """§5.6 - route account-level alarms by EVIDENCE OF A CONSUMER, not by directory membership alone.
+    One predicate shared with the stranded-mail ownership test, because two would drift apart."""
+
+    class Target:
+        def __init__(self, persona):
+            self.persona = persona
+
+    def setUp(self):
+        km._LAST_AUTHORED.clear()
+        km._PERSONA_MEMORY_COUNTS.clear()
+
+    tearDown = setUp
+
+    def test_a_persona_that_owns_memories_is_deliverable(self):
+        km._PERSONA_MEMORY_COUNTS.update({"argus": 40, "robtest": 0})
+        self.assertEqual(km.deliverable_watchers(["argus", "robtest"],
+                                                 [self.Target("argus"), self.Target("robtest")]), ["argus"])
+
+    def test_observed_authorship_alone_is_enough(self):
+        # A brand-new persona that has written mail but owns no memories yet is REAL - excluding it would
+        # break first contact, the exact onboarding path the permissive core protects.
+        # A second, independently-deliverable persona is present ON PURPOSE: with only `newbie` in the
+        # set, the fail-open fallback would return it anyway and the test would pass without testing
+        # anything. It has to be possible for the filter to exclude someone for this to mean something.
+        km._PERSONA_MEMORY_COUNTS.update({"newbie": 0, "argus": 40})
+        km._LAST_AUTHORED["newbie"] = (12, "t")
+        self.assertEqual(km.deliverable_watchers(["newbie", "argus"],
+                                                 [self.Target("newbie"), self.Target("argus")]),
+                         ["argus", "newbie"])
+
+    def test_an_unreported_count_leaves_a_persona_eligible(self):
+        # No data is not evidence of absence - the same rule the ownership check already follows.
+        self.assertEqual(km.deliverable_watchers(["mystery"], [self.Target("mystery")]), ["mystery"])
+
+    def test_it_FAILS_OPEN_rather_than_silencing_every_recipient(self):
+        # THE PROPERTY THAT MATTERS MOST. A filter that can leave nobody is worse than the noise it
+        # removes: an alarm delivered to a dead stream costs a line, one delivered to NOBODY is the
+        # silent failure this tool exists to prevent.
+        km._PERSONA_MEMORY_COUNTS.update({"a": 0, "b": 0})
+        self.assertEqual(km.deliverable_watchers(["a", "b"], [self.Target("a"), self.Target("b")]),
+                         ["a", "b"])
+
+    def test_non_directory_targets_are_still_excluded(self):
+        km._PERSONA_MEMORY_COUNTS.update({"argus": 5, "phantom": 5})
+        self.assertEqual(km.deliverable_watchers(["argus"], [self.Target("argus"), self.Target("phantom")]),
+                         ["argus"])
+
+    def test_both_alarms_route_through_it(self):
+        # Proven by behaviour, not by reading: a zero-memory test persona receives NEITHER alarm while a
+        # real one receives BOTH.
+        km._PERSONA_MEMORY_COUNTS.update({"argus": 40, "robtest": 0})
+        km._URGENT_UNREAD.clear(); km._URGENT_UNREAD.update({"loom": 1})
+        km._INBOX_FLOORS.clear(); km._REPORTED_URGENT_QUIET.clear()
+        km._OBSERVED_SINCE = "2026-07-25T07:00:00+00:00"
+        km.note_authorship([{"id": 100, "from": "river", "created": "t"}])
+        km.note_observation_floor("argus", [{"id": 100, "from": "river", "created": "t"}])
+        em = UrgentUnansweredAlarmTest.Emitter()
+        try:
+            km.report_urgent_unanswered(["argus", "robtest", "loom"],
+                                        [self.Target("argus"), self.Target("robtest")], em)
+        finally:
+            km._OBSERVED_SINCE = None
+        got = sorted(f["persona"] for e, f in em.events if e == "alert")
+        self.assertEqual(got, ["argus"])
+
+
 class EventIdTest(unittest.TestCase):
     """Every event carries a producer-owned id, so a consumer never has to hash our NDJSON bytes."""
 

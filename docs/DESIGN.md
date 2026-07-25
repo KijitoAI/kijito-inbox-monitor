@@ -253,6 +253,28 @@ no ack, since an ack would let someone silence "nobody is answering escalated ma
 > benign and self-correcting: a member who authored mail during the same tick could be reported quiet once,
 > and the next tick clears it.
 
+### 5.6 Alarm routing: evidence of a consumer, not just a name
+
+Account-level alarms (stranded-mail, urgent-unanswered) go to watchers, and "every directory persona" is the
+wrong list: a directory accumulates names, and long-dead test personas keep receiving alerts into streams
+nobody reads. That is the same defect as a broadcast amplifying phantoms, so it is fixed ONCE here rather
+than separately in each alarm - two predicates for one question drift apart and then disagree.
+
+`has_consumer_evidence(persona)` is POSITIVE and mirrors the stranded-mail ownership test deliberately:
+observed authorship, or memories the directory says they own. Authorship alone suffices, because a brand-new
+persona that has written mail but owns no memories yet is real - excluding it would break first contact. An
+unreported memory count leaves a persona eligible: no data is not evidence of absence.
+
+**It fails open, and that matters more than the filtering.** If the predicate would leave NOBODY, every
+directory watcher is used instead. An alarm delivered to a stream nobody reads costs one line; an alarm
+delivered to nobody is the silent failure this tool exists to prevent, and a filter that can silence every
+recipient at once is a worse bug than the noise it removes.
+
+Measured on a live account: recipients fell from 25 to 18. The seven dropped own zero memories and were
+never observed authoring; two remaining test personas own two memories each, so they carry positive evidence
+someone worked under those names and the same predicate keeps them - consistent with the ownership rule that
+decides whether an inbox is stranded.
+
 ## 6. Emit modes (portability)
 
 "NDJSON-on-stdout is universal" is false on ingestion: Claude Code ingests per-event (hooks: JSON-on-stdin,
