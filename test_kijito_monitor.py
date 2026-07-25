@@ -401,31 +401,31 @@ class DeclaredOmissionsTest(unittest.TestCase):
     """The server declares an incomplete window; the parser must not throw the declaration away."""
 
     def test_size_dropped_is_read(self):
-        self.assertEqual(km._declared_omissions({"result": [], "size_dropped": 15}), 15)
+        self.assertEqual(km._declared_omissions({"result": [], "size_dropped": 15}), (15, True))
 
     def test_boolean_truncation_without_a_count_still_counts_as_incomplete(self):
         # "incomplete but unquantified" must never round down to "nothing missing".
-        self.assertEqual(km._declared_omissions({"result": [], "truncated": True}), 1)
-        self.assertEqual(km._declared_omissions({"result": [], "size_truncated": True}), 1)
+        self.assertEqual(km._declared_omissions({"result": [], "truncated": True}), (1, False))
+        self.assertEqual(km._declared_omissions({"result": [], "size_truncated": True}), (1, False))
 
     def test_a_lone_oversized_message_is_NOT_an_omission(self):
         # size_truncated with size_dropped=0 means one message's BODY was clipped, not that a row was
         # withheld. Counting it invents a gap and alarms about mail that was never missing.
         self.assertEqual(km._declared_omissions(
-            {"result": [{"id": 1}], "size_truncated": True, "size_dropped": 0}), 0)
+            {"result": [{"id": 1}], "size_truncated": True, "size_dropped": 0}), (0, True))
 
     def test_count_truncation_with_zero_size_drops_is_still_an_omission(self):
         # Measured live: limit=3 returns truncated=True, size_dropped=0, and rows ARE missing.
         # These are different mechanisms and must not cancel each other out.
         self.assertEqual(km._declared_omissions(
-            {"result": [], "truncated": True, "size_truncated": False, "size_dropped": 0}), 1)
+            {"result": [], "truncated": True, "size_truncated": False, "size_dropped": 0}), (1, False))
 
     def test_count_and_size_truncation_accumulate(self):
-        self.assertEqual(km._declared_omissions({"result": [], "truncated": True, "size_dropped": 4}), 5)
+        self.assertEqual(km._declared_omissions({"result": [], "truncated": True, "size_dropped": 4}), (5, False))
 
     def test_a_complete_window_declares_nothing(self):
         self.assertEqual(km._declared_omissions({"result": [], "truncated": False,
-                                                 "size_truncated": False, "size_dropped": 0}), 0)
+                                                 "size_truncated": False, "size_dropped": 0}), (0, True))
 
     def test_fetch_carries_the_declaration_onto_the_poll(self):
         body = json.dumps({"result": [{"id": 5}], "size_truncated": True, "size_dropped": 3}).encode()
@@ -442,6 +442,7 @@ class BoundedWindowGapTest(unittest.TestCase):
         t.cursor, t.armed, t.persona, t.url = cursor, armed, "argus", "http://x/api/inbox?persona=argus"
         t.opener, t.headers = None, {}
         t.emitted_above, t.gap_alerted = set(), None
+        t.pin_evidence_intact, t.pin_forced = True, False
         return t
 
     def test_window_reaching_back_past_the_cursor_is_safe(self):
@@ -456,7 +457,7 @@ class BoundedWindowGapTest(unittest.TestCase):
         # so (1100, 1200) may hold mail we never emitted.
         t = self._target(cursor=1100)
         poll = km.Poll(True, items=[{"id": 1200}, {"id": 1260}], omitted=10)
-        self.assertEqual(t._uncovered_gap(poll, poll.items), (1100, 1200, 10))
+        self.assertEqual(t._uncovered_gap(poll, poll.items), (1100, 1200, 10, True))
 
     def test_no_declared_omissions_means_no_gap_however_high_the_window_starts(self):
         # ids are account-global, so a window starting above the cursor is NORMAL when the server
@@ -542,6 +543,7 @@ class BoundedWindowEndToEndTest(unittest.TestCase):
         t.last_heartbeat = km._monotonic()
         t.count_url, t.unread_persona = km.NOTIFY_PENDING_URL, "argus"
         t.emitted_above, t.gap_alerted = set(), None
+        t.pin_evidence_intact, t.pin_forced = True, False
         return t
 
     def test_fully_recovered_gap_delivers_the_mail_advances_and_stays_quiet(self):
@@ -710,21 +712,91 @@ class BoundedWindowEndToEndTest(unittest.TestCase):
         self.assertEqual(len([f for e, f in em.events if e == "alert"]), 1)
         self.assertEqual(t.gap_alerted, 100)                  # the watermark, not 200/250/300
 
-    def test_pin_tracking_is_bounded(self):
+    def test_pin_tracking_is_bounded_and_evidence_loss_is_a_DURABLE_alert(self):
+        # Loom re-audit 4, MEDIUM 3. Overflow must bound the state file, AND it must be announced as a
+        # real event rather than a stderr line nobody watches - it is a correctness degradation.
         em = self.RecordingEmitter()
         t = self._target(cursor=0, emitter=em)
         t.emitted_above = set(range(1, km.PIN_TRACKING_CAP + 50))
         poll = lambda o, u, h: (km.Poll(False, reason="http 502") if "unread_only=true" in u
                                 else km.Poll(True, items=[{"id": km.PIN_TRACKING_CAP + 100}], omitted=1))
         orig, km.fetch = km.fetch, poll
-        buf, err = __import__("io").StringIO(), km.sys.stderr
-        km.sys.stderr = buf
         try:
             t.poll_once()
         finally:
-            km.fetch, km.sys.stderr = orig, err
+            km.fetch = orig
         self.assertLessEqual(len(t.emitted_above), km.PIN_TRACKING_CAP)
-        self.assertIn("outlived its tracking budget", buf.getvalue())
+        loss = [f for e, f in em.events if e == "alert" and f.get("evidence_lost")]
+        self.assertEqual(len(loss), 1)
+        self.assertGreater(loss[0]["forgot"], 0)
+        self.assertFalse(t.pin_evidence_intact)
+
+    def test_LOOM4_a_forgotten_id_can_never_count_as_recovery(self):
+        # Once tracking overflows we cannot tell a genuinely-recovered row from one we delivered and
+        # forgot, so the span must stop being closable by counting - otherwise our own amnesia becomes
+        # the evidence that closes it.
+        em = self.RecordingEmitter()
+        t = self._target(cursor=100, emitter=em)
+        t.pin_evidence_intact = False
+        poll = lambda o, u, h: (km.Poll(True, items=[{"id": 150}], omitted=0) if "unread_only=true" in u
+                                else km.Poll(True, items=[{"id": 200}], omitted=1))
+        orig, km.fetch = km.fetch, poll
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertEqual(t.cursor, 100)   # would have closed on the count alone; must not
+
+    def test_LOOM4_an_inexact_omission_count_can_never_be_closed_by_counting(self):
+        # truncated=True states no quantity, so `omitted` is a LOWER BOUND. Recovering one row used to
+        # satisfy it and advance, while other (already-read, hence unread_only-invisible) rows in the
+        # span stayed hidden. There is no number to reach, so it must pin.
+        em = self.RecordingEmitter()
+        t = self._target(cursor=100, emitter=em)
+
+        def fake_fetch(opener, url, headers):
+            if "unread_only=true" in url:
+                return km.Poll(True, items=[{"id": 150}], omitted=0)
+            return km.Poll(True, items=[{"id": 200}], omitted=1, omitted_exact=False)
+
+        orig, km.fetch = km.fetch, fake_fetch
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertEqual(t.cursor, 100)                    # *** pinned despite recovered >= omitted ***
+        self.assertEqual(em.new_ids, [150, 200])           # both still delivered
+        self.assertTrue([f for e, f in em.events if e == "alert"])
+
+    def test_an_EXACT_count_still_closes_normally(self):
+        # The inexactness rule must not make every gap permanent.
+        em = self.RecordingEmitter()
+        t = self._target(cursor=100, emitter=em)
+        poll = lambda o, u, h: (km.Poll(True, items=[{"id": 150}], omitted=0) if "unread_only=true" in u
+                                else km.Poll(True, items=[{"id": 200}], omitted=1, omitted_exact=True))
+        orig, km.fetch = km.fetch, poll
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertEqual(t.cursor, 200)
+
+    def test_LOOM4_a_restored_pin_clears_when_a_complete_window_reaches_back(self):
+        # MEDIUM 4: cleanup ran only when new_items was non-empty, so a restored pin whose window held
+        # ONLY already-delivered ids stayed pinned forever - the exact state a restart lands in.
+        em = self.RecordingEmitter()
+        t = self._target(cursor=100, emitter=em)
+        t.emitted_above = {200}
+        orig, km.fetch = km.fetch, lambda o, u, h: km.Poll(
+            True, items=[{"id": 100}, {"id": 200}], omitted=0)
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertEqual(em.new_ids, [])        # nothing new to send
+        self.assertEqual(t.cursor, 200)         # but the pin is released
+        self.assertEqual(t.emitted_above, set())
+        self.assertIsNone(t.gap_alerted)
 
     def test_steady_state_truncation_is_silent_and_changes_nothing(self):
         # The common case: window reaches back past the cursor, so the drops are already-emitted mail.
@@ -848,6 +920,71 @@ class BoundedWindowEndToEndTest(unittest.TestCase):
         self.assertEqual(t.cursor, 1100)   # fail closed, not fail loud-then-advance
 
 
+class CorruptPinStateTest(unittest.TestCase):
+    """Loom re-audit 4, HIGH 2. Corrupt pin state must fail CLOSED, never silently unpin."""
+
+    def _write(self, payload):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "hive.json")
+        with open(p, "w") as f:
+            json.dump(payload, f)
+        return p
+
+    def test_malformed_emitted_above_keeps_the_pin_and_marks_evidence_unusable(self):
+        # Loading it as an empty set silently UNPINS: the watcher then thinks nothing is outstanding and
+        # the replay cap can jump the cursor over the very span the pin was protecting.
+        p = self._write({"identity": "idx", "cursor": 100, "state": "UP",
+                         "consecutive_failures": 0, "gap_alerted": 100,
+                         "emitted_above": ["not", "ints"]})
+        buf, err = __import__("io").StringIO(), km.sys.stderr
+        km.sys.stderr = buf
+        try:
+            loaded = km.StateFile(p, "idx").load()
+        finally:
+            km.sys.stderr = err
+        cursor, state, failures, emitted, alerted, intact = loaded
+        self.assertEqual(cursor, 100)
+        self.assertEqual(emitted, set())
+        self.assertFalse(intact)                    # <- the pin is HELD, evidence marked unusable
+        self.assertIn("malformed", buf.getvalue())
+
+    def test_a_recorded_gap_alert_without_tracking_is_treated_as_inconsistent(self):
+        p = self._write({"identity": "idx", "cursor": 100, "state": "UP",
+                         "consecutive_failures": 0, "gap_alerted": 100})
+        _, _, _, emitted, alerted, intact = km.StateFile(p, "idx").load()
+        self.assertEqual(emitted, set())
+        self.assertEqual(alerted, 100)
+        self.assertFalse(intact)                    # something was pinned when this was written
+
+    def test_a_clean_file_with_no_pin_loads_intact(self):
+        p = self._write({"identity": "idx", "cursor": 100, "state": "UP", "consecutive_failures": 0})
+        _, _, _, emitted, alerted, intact = km.StateFile(p, "idx").load()
+        self.assertEqual((emitted, alerted, intact), (set(), None, True))
+
+    def test_a_forced_pin_survives_arming_so_replay_cap_cannot_cross_it(self):
+        # Loom's repro: corrupt emitted_above + gap_alerted 100 + max_replay 1 => cursor jumped to 201.
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = km.WatchTarget.__new__(km.WatchTarget)
+        t.persona, t.url, t.headers, t.opener = "argus", "http://x/api/inbox?persona=argus", {}, None
+        t.emitter, t.args = em, BoundedWindowEndToEndTest.FullArgs()
+        t.args.max_replay = 1
+        t.cursor, t.armed, t.fsm_state, t.failures = 100, False, "UP", 0
+        t.state_file = t.last_unread = None
+        t.fast_path = False
+        t.skips = t.first_poll = 0
+        t.last_heartbeat = km._monotonic()
+        t.count_url, t.unread_persona = km.NOTIFY_PENDING_URL, "argus"
+        t.emitted_above, t.gap_alerted = set(), 100
+        t.pin_evidence_intact, t.pin_forced = False, True    # what a corrupt load produces
+        orig, km.fetch = km.fetch, lambda o, u, h: km.Poll(
+            True, items=[{"id": 200}, {"id": 201}], omitted=3)
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertEqual(t.cursor, 100)             # *** did NOT jump to 201 ***
+
+
 class CaseAsymmetryInvariantTest(unittest.TestCase):
     """THE TWO CASE RULES POINT OPPOSITE WAYS ON PURPOSE. Do not 'harmonise' them.
 
@@ -965,9 +1102,15 @@ class StrandedInboxTest(unittest.TestCase):
 
     def setUp(self):
         km._REPORTED_STRANDED.clear()
+        # _PERSONA_MEMORY_COUNTS is module-global; without save/restore a test that seeds it leaks into
+        # every later test and produces order-dependent failures.
+        self._mem = dict(km._PERSONA_MEMORY_COUNTS)
+        km._PERSONA_MEMORY_COUNTS.clear()
 
     def tearDown(self):
         km._REPORTED_STRANDED.clear()
+        km._PERSONA_MEMORY_COUNTS.clear()
+        km._PERSONA_MEMORY_COUNTS.update(self._mem)
 
     def _report(self, directory, counts, watchers=("argus", "river")):
         em = self.FakeEmitter()
@@ -1054,6 +1197,22 @@ class StrandedInboxTest(unittest.TestCase):
         self.assertEqual(again, ["all"])
         self.assertTrue(ev3)
         self.assertIn("stranded mail", err3)
+
+    def test_LOOM4_suppression_is_keyed_EXACTLY_so_case_variants_do_not_gag_each_other(self):
+        # Loom re-audit 4, MEDIUM 5. The suppression set casefolded, so 'Claude-chat' and 'claude-chat'
+        # shared one key - and they are DIFFERENT inboxes on a case-sensitive server. One staying
+        # stranded held the other's alarm down. This is the same case-asymmetry defect in a third place.
+        km._PERSONA_MEMORY_COUNTS.update({"claude-chat": 0, "Claude-chat": 0, "argus": 94})
+        directory = ["claude-chat", "Claude-chat", "argus"]
+        first, _, _ = self._report(directory, {"claude-chat": 1, "Claude-chat": 1}, watchers=("argus",))
+        self.assertEqual(sorted(first), ["Claude-chat", "claude-chat"])
+        # lowercase is rescued; the CAPITAL variant is still stranded and stays suppressed...
+        gone, _, _ = self._report(directory, {"Claude-chat": 1}, watchers=("argus",))
+        self.assertEqual(gone, [])
+        # ...and now lowercase is stranded AGAIN. It must re-alert, even though its case-twin never cleared.
+        again, ev, _ = self._report(directory, {"claude-chat": 2, "Claude-chat": 1}, watchers=("argus",))
+        self.assertEqual(again, ["claude-chat"])
+        self.assertTrue(ev)
 
     def test_suppression_holds_while_the_condition_persists(self):
         # Releasing must not become "alert every poll" - the condition still holding is not news.
