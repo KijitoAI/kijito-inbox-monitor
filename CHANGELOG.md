@@ -161,6 +161,12 @@ reviewer originally assigned never read the request.
   and is asserted by test to state no cause, since deadlocked, unreachable and still-working are
   indistinguishable from this data and need opposite responses.
 
+  `--check-activity PERSONA --since-id N` evaluates a published report in one shot, with no token, network
+  or watch loop, so a shell heartbeat can call it. It exits 0 on evidence of activity, 1 on a silence in a
+  span the report actually covered (printing the observation), and 2 on NOT OBSERVABLE or an unreadable
+  report. 1 and 2 are distinct deliberately: collapsing them turns "I was not watching" into "they were
+  silent". The watcher and the one-shot share one implementation of the tri-state.
+
 - **Every event now carries a producer-owned `event_id`**, so a consumer can dedupe without hashing our NDJSON
   bytes. Byte-hashing works until it doesn't: it couples the consumer to our serialisation, so a change to key
   order, spacing or `--content-chars` silently changes the dedupe key and re-delivers old events. Prompted by a

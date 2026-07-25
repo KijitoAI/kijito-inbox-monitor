@@ -615,6 +615,71 @@ class AuthorshipSignalTest(unittest.TestCase):
         with open(path) as f:
             json.load(f)
 
+    # ---- the one-shot check: exit codes ARE the contract ----------------------------------------
+    def _report(self, path, floor=100, authored=None, since="2026-07-25T02:00:00+00:00"):
+        with open(path, "w") as f:
+            json.dump({"observed_since": since, "observation_floor_id": floor,
+                       "last_authored": authored or {}}, f)
+        return path
+
+    def _run_check(self, path, persona, since_id, waits=1):
+        out, err = __import__("io").StringIO(), __import__("io").StringIO()
+        so, se = km.sys.stdout, km.sys.stderr
+        km.sys.stdout, km.sys.stderr = out, err
+        try:
+            rc = km.check_activity(path, persona, since_id, waits)
+        finally:
+            km.sys.stdout, km.sys.stderr = so, se
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_exit_0_on_evidence_of_activity(self):
+        p = self._report(os.path.join(tempfile.mkdtemp(), "a.json"),
+                         authored={"river": {"id": 200, "created": "t"}})
+        rc, text = self._run_check(p, "river", 150)
+        self.assertEqual(rc, 0)
+        self.assertIn("active", text)
+
+    def test_exit_1_prints_the_observation_for_a_covered_silence(self):
+        p = self._report(os.path.join(tempfile.mkdtemp(), "a.json"), floor=100,
+                         authored={"river": {"id": 200, "created": "t"}})
+        rc, text = self._run_check(p, "loom", 150, waits=2)
+        self.assertEqual(rc, 1)
+        self.assertIn("no activity from loom", text)
+        for word in km.FORBIDDEN_DIAGNOSES:
+            self.assertNotIn(word, text.lower())
+
+    def test_exit_2_is_DISTINCT_from_exit_1(self):
+        # Collapsing "I was not watching" into "they were silent" is the false assertion this whole
+        # signal exists to refuse, so the two must never share an exit code.
+        p = self._report(os.path.join(tempfile.mkdtemp(), "a.json"), floor=100)
+        rc, text = self._run_check(p, "loom", 50)
+        self.assertEqual(rc, 2)
+        self.assertIn("not observable", text.lower())
+        self.assertNotIn("no activity from", text)
+
+    def test_an_unreadable_or_corrupt_report_asserts_nothing(self):
+        d = tempfile.mkdtemp()
+        rc, _ = self._run_check(os.path.join(d, "missing.json"), "loom", 50)
+        self.assertEqual(rc, 2)
+        bad = os.path.join(d, "bad.json")
+        with open(bad, "w") as f:
+            f.write("{not json")
+        rc, _ = self._run_check(bad, "loom", 50)
+        self.assertEqual(rc, 2)
+
+    def test_the_published_report_and_the_in_process_view_agree(self):
+        # One implementation of the tri-state, used from both sides. A second would be a second chance
+        # to get a subtle rule wrong.
+        self._observe([{"id": 300, "from": "river", "created": "t"}])
+        path = os.path.join(tempfile.mkdtemp(), "a.json")
+        km.write_activity_file(path)
+        with open(path) as f:
+            published = json.load(f)
+        for persona, floor in (("river", 200), ("loom", 400), ("loom", 10)):
+            self.assertIs(km.evaluate_activity(published, persona, floor),
+                          km.activity_since(persona, floor),
+                          "disagreement for %s since %s" % (persona, floor))
+
     def test_a_bad_activity_path_is_non_fatal(self):
         self._observe([{"id": 1, "from": "river", "created": "t"}])
         buf, err = __import__("io").StringIO(), km.sys.stderr
