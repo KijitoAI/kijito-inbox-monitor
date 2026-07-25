@@ -5,9 +5,14 @@ anywhere. Pushing a version tag publishes to both PyPI and npm, with provenance 
 
 ## Cut a release
 
-1. Bump the version to the same value in both files:
+1. Bump the version to the same value in all THREE places:
    - `pyproject.toml` -> `[project] version`
    - `package.json` -> `"version"`
+   - `kijito_inbox_monitor.py` -> `__version__`
+   The third is easy to miss and this file used to omit it. It is not cosmetic: `__version__` builds
+   the `User-Agent` the watcher sends, so leaving it behind makes every request report the previous
+   release, and server-side logs then attribute traffic to a version that is not running.
+   Verify with: `grep -n '^version\|"version"\|^__version__' pyproject.toml package.json kijito_inbox_monitor.py`
 2. Add a section for the new version to `CHANGELOG.md`.
 3. Commit, tag, and push:
    ```sh
