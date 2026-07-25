@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 import urllib.error
@@ -475,6 +476,124 @@ class DeclaredOmissionsTest(unittest.TestCase):
         poll = km.fetch(FakeOpener(FakeResponse(200, json.loads(body))), "http://x/api/inbox", {})
         self.assertTrue(poll.ok)
         self.assertEqual(poll.omitted, 3)
+
+
+class EventIdTest(unittest.TestCase):
+    """Every event carries a producer-owned id, so a consumer never has to hash our NDJSON bytes."""
+
+    class Capture:
+        def __init__(self):
+            self.lines = []
+
+        def write(self, line):
+            self.lines.append(json.loads(line))
+
+        def close(self):
+            pass
+
+    def _emitter(self):
+        cap = self.Capture()
+        em = km.Emitter("stdout-jsonl", None, 200, False, sink=cap)
+        return em, cap
+
+    def test_every_event_carries_one(self):
+        em, cap = self._emitter()
+        em.new({"id": 7, "from": "river", "content": "hi", "created": "t", "_persona": "argus"})
+        for kind in ("armed", "alert", "recovered", "heartbeat", "persona_added"):
+            em.lifecycle(kind, persona="argus", cursor=7)
+        self.assertEqual(len(cap.lines), 6)
+        for ev in cap.lines:
+            self.assertTrue(ev.get("event_id"), "missing event_id on %r" % ev["event"])
+
+    def test_a_message_id_is_the_identity_of_a_new_event(self):
+        em, cap = self._emitter()
+        em.new({"id": 41, "from": "river", "content": "x", "created": "t", "_persona": "argus"})
+        self.assertEqual(cap.lines[0]["event_id"], "argus:new:41")
+
+    def test_the_same_message_gets_the_same_id_from_a_DIFFERENT_run(self):
+        # THE POINT OF THE FEATURE. A re-delivery after state loss, or a second watcher on the same
+        # inbox, must be recognisable as the same message - otherwise the consumer does the work twice.
+        a, cap_a = self._emitter()
+        b, cap_b = self._emitter()
+        self.assertNotEqual(a._run, b._run)          # genuinely different runs
+        msg = {"id": 41, "from": "river", "content": "x", "created": "t", "_persona": "argus"}
+        a.new(msg)
+        b.new(msg)
+        self.assertEqual(cap_a.lines[0]["event_id"], cap_b.lines[0]["event_id"])
+
+    def test_the_same_message_id_in_two_personas_is_two_events(self):
+        em, cap = self._emitter()
+        em.new({"id": 5, "from": "r", "content": "x", "created": "t", "_persona": "argus"})
+        em.new({"id": 5, "from": "r", "content": "x", "created": "t", "_persona": "loom"})
+        self.assertNotEqual(cap.lines[0]["event_id"], cap.lines[1]["event_id"])
+
+    def test_two_signals_in_the_SAME_clock_tick_are_distinct(self):
+        # Loom's actual bug: ID-less events deduped by event+ts collapse when two land inside one tick.
+        # Distinctness here is by construction, not by the clock being fast enough.
+        em, cap = self._emitter()
+        orig, km._now_iso = km._now_iso, lambda: "2026-07-25T02:00:00.000000+00:00"
+        try:
+            em.lifecycle("alert", persona="argus", reason="first")
+            em.lifecycle("alert", persona="argus", reason="second")
+        finally:
+            km._now_iso = orig
+        self.assertEqual(cap.lines[0]["ts"], cap.lines[1]["ts"])          # same tick
+        self.assertNotEqual(cap.lines[0]["event_id"], cap.lines[1]["event_id"])
+
+    def test_two_IDENTICAL_signals_are_still_distinct(self):
+        # Even byte-identical alerts must not collapse: a recurrence is a second thing to see.
+        em, cap = self._emitter()
+        orig, km._now_iso = km._now_iso, lambda: "2026-07-25T02:00:00.000000+00:00"
+        try:
+            em.lifecycle("alert", persona="argus", reason="same")
+            em.lifecycle("alert", persona="argus", reason="same")
+        finally:
+            km._now_iso = orig
+        self.assertNotEqual(cap.lines[0]["event_id"], cap.lines[1]["event_id"])
+
+    def test_signal_ids_do_not_collide_across_a_restart(self):
+        # A BARE counter restarts at 1 and re-issues ids a consumer has already seen, which makes it
+        # DROP live events. The per-run token is what rules that out.
+        a, cap_a = self._emitter()
+        b, cap_b = self._emitter()
+        a.lifecycle("alert", persona="argus", reason="before restart")
+        b.lifecycle("alert", persona="argus", reason="after restart")
+        self.assertNotEqual(cap_a.lines[0]["event_id"], cap_b.lines[0]["event_id"])
+
+    def test_the_id_survives_a_change_to_content_clipping(self):
+        # Byte-hashing would change the key here and re-deliver the message; a producer-owned id does not.
+        wide, cap_w = self.Capture(), None
+        a = km.Emitter("stdout-jsonl", None, 200, False, sink=wide)
+        narrow = self.Capture()
+        b = km.Emitter("stdout-jsonl", None, 3, False, sink=narrow)
+        msg = {"id": 9, "from": "river", "content": "a much longer body", "created": "t",
+               "_persona": "argus"}
+        a.new(msg)
+        b.new(msg)
+        self.assertNotEqual(wide.lines[0]["content"], narrow.lines[0]["content"])
+        self.assertEqual(wide.lines[0]["event_id"], narrow.lines[0]["event_id"])
+
+    def test_an_event_without_a_persona_still_gets_an_id(self):
+        em, cap = self._emitter()
+        em.lifecycle("alert", reason="no persona on this target")
+        self.assertTrue(cap.lines[0]["event_id"].startswith("_:alert:"))
+
+    def test_exec_mode_exports_it(self):
+        seen = {}
+        em = km.Emitter("exec-per-event", "true", 200, False)
+        orig = km.subprocess.run
+        # The stub must return a COMPLETED-PROCESS-SHAPED object, not None: emit() consumes
+        # `r.returncode` to decide whether delivery was acknowledged (Loom re-audit 7, HIGH 1), which
+        # postdates this test. A stub returning None makes emit() raise instead of reporting delivery.
+        def _run(*a, **kw):
+            seen.update(kw.get("env") or {})
+            return subprocess.CompletedProcess(args=a[0] if a else "", returncode=0)
+        km.subprocess.run = _run
+        try:
+            em.new({"id": 12, "from": "r", "content": "x", "created": "t", "_persona": "argus"})
+        finally:
+            km.subprocess.run = orig
+        self.assertEqual(seen.get("KIJITOMON_EVENT_ID"), "argus:new:12")
 
 
 class UnreadNotShownParseTest(unittest.TestCase):

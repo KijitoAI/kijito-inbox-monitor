@@ -169,7 +169,7 @@ event ingestion). So `exec-per-event` is the more portable primitive; `stdout-js
 
 ### 6.1 Event schema (stdout-jsonl)
 
-One object per line; every event carries `event`, `source`, `ts` (emit-time UTC ISO).
+One object per line; every event carries `event`, `source`, `ts` (emit-time UTC ISO) and `event_id` (§6.3).
 ```
 {"event":"new",         "source":"kijito-inbox","ts":"<iso>","id":246,"from":"river","content":"<≤N or omitted>","created":"<iso>"}
 {"event":"armed",       "source":"kijito-inbox","ts":"<iso>","cursor":250}
@@ -201,6 +201,34 @@ Every event invokes `CMD`; inapplicable env vars are unset:
 
 The spawned command has a 10s timeout; a non-zero exit or timeout is logged to stderr and is non-fatal (and never
 holds the cursor back, per §7.0).
+
+### 6.3 `event_id`: the producer owns event identity
+
+Every emitted event carries an `event_id`, stamped at the single `Emitter.emit()` chokepoint so a future event
+kind cannot forget one. It exists because leaving identity absent does not remove the need for it - it
+relocates the problem into N consumers, each of whom invents a key and some of whom get it wrong. The observed
+case: a consumer deduping ID-less events by `event+ts`, which is unique only while two events never land inside
+one clock tick, and our `ts` is stamped at emit time.
+
+Two identities, because messages and signals need opposite guarantees:
+
+| kind | id | guarantee |
+|------|----|-----------|
+| `new` | `<persona>:new:<message id>` | the SAME message always yields the SAME id - across a restart, a re-delivery after state loss, and two watchers of one inbox |
+| everything else | `<persona>:<event>:<run>-<n>` | unique to that emission; a recurrence is a different event and does not collapse into its earlier self |
+
+The asymmetry follows from the cost of being wrong in each direction: a duplicated message is duplicated WORK,
+while a duplicated signal is only noise - and conversely, collapsing two outages into one hides the second.
+Repeated announcements of an *unchanged* condition are suppressed at the source (the alarms are edge-triggered
+and self-clearing, §5.2), which is where suppression belongs.
+
+`<run>` is 8 random bytes per process. A bare in-process counter is specifically ruled out: it restarts at 1 and
+issues ids a consumer has already seen to brand-new events, so a correct consumer DROPS live mail - a worse
+failure than the duplicate the id was introduced to prevent.
+
+Deliberately NOT a hash of the emitted line. Byte-hashing couples the consumer to our serialisation, so a change
+to key order, spacing, or `--content-chars` silently changes the dedupe key and re-delivers old events. Verified
+by emitting the same mail from two processes with different `--content-chars`: the `new` ids are identical.
 
 ## 7. Robustness contract
 

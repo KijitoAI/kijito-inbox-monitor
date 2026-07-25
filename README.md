@@ -201,8 +201,8 @@ Each line of the events file (and each `exec-per-event` invocation) is one event
 | `recovered` | the source came back after an `alert` | `KIJITOMON_CURSOR` |
 | `heartbeat` | optional liveness tick (`--heartbeat N`) | `KIJITOMON_CURSOR` |
 
-Every event also carries `KIJITOMON_EVENT`, `KIJITOMON_SOURCE`, `KIJITOMON_TS`, and (for persona targets)
-`KIJITOMON_PERSONA`. In file mode the same data is NDJSON, one event per line, with a space after each `:` and `,`
+Every event also carries `KIJITOMON_EVENT`, `KIJITOMON_SOURCE`, `KIJITOMON_TS`, `KIJITOMON_EVENT_ID`, and (for
+persona targets) `KIJITOMON_PERSONA`. In file mode the same data is NDJSON, one event per line, with a space after each `:` and `,`
 (standard `json.dumps`): `{"event": "new", "id": 41, "from": "river", "persona": "testbot", ...}` - so a filter
 like `grep '"event": "new"'` matches.
 The watcher peeks (never marks your mail read) and dedupes by the monotonic message id.
@@ -216,6 +216,27 @@ leave a cursor that has forgotten mail nobody received. In the steady state each
 after a failed hand-off, a timeout, or a crash between the event and the cursor write you may see one again, so
 **make your consumer idempotent** - `KIJITOMON_ID` is stable across re-deliveries for exactly that purpose.
 Duplicates are recoverable and skips are not, which is why the guarantee leans this way.
+
+### Event ids
+
+Every event carries an `event_id` the producer owns, so a consumer never has to hash our NDJSON bytes to build a
+dedupe key. Byte-hashing works until it doesn't: it couples you to our formatting, so a change to key order,
+spacing, or `--content-chars` silently changes the key and re-delivers everything.
+
+There are two kinds of identity, because messages and signals need opposite things:
+
+- **`new` events carry the message's identity**: `<persona>:new:<message id>`. The same message always gets the
+  same `event_id` - across a restart, across a re-delivery after state loss, and across two watchers of the same
+  inbox. Dedupe on it to process each message exactly once. (Verified by running two separate watchers over the
+  same mail with different `--content-chars`: identical ids.)
+- **Every other event is a signal** and gets an id unique to that emission: `<persona>:<event>:<run>-<n>`. A
+  recurrence is a genuinely different event - a second outage is a second thing you want to see - so signals do
+  not collapse into their earlier selves. Repeated announcements of an *unchanged* condition are suppressed at
+  the source instead, which is why the alarms above are edge-triggered and self-clearing.
+
+`<run>` is random per process, and it is the part that matters: a bare counter would restart at 1 and hand ids a
+consumer has already seen to brand-new events, making it drop live mail - a worse failure than the duplicate it
+was meant to prevent. Ids are unique for all time; treat them as opaque strings.
 
 ### Bounded windows
 
