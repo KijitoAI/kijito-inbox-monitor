@@ -297,6 +297,30 @@ Three details matter if you consume these:
 Disable with `--no-stranded-alerts` if you keep deliberate test inboxes. Prefer draining them instead - an alarm
 you have trained everyone to ignore is one that has been disabled without anyone deciding to disable it.
 
+### Escalated mail nobody is answering
+
+The watcher alarms when a member holds mail a **sender marked urgent** and no activity from that member has
+been observed:
+
+```json
+{"event": "alert", "source": "kijito-inbox", "persona": "you",
+ "reason": "urgent-unanswered: 1 member(s) hold mail a sender marked URGENT while no activity from them has been observed: loom (1 urgent unread; last observed message 2026-07-24T23:24:43Z). OBSERVATION, NOT A DIAGNOSIS: ...",
+ "urgent_unanswered": ["loom"]}
+```
+
+"Is this member stuck?" is normally unanswerable from outside, because idle-by-design and wedged look
+identical - so the obvious version of this alarm fires on every quiet persona and becomes noise you learn to
+ignore. The urgent flag is what makes it tractable: it is a **sender declaring an expectation**, and silence
+only means something once something was expected. A quiet member with no urgent mail never trips it.
+
+Both halves must be positive. If the watcher was not running for the span in question it reports nothing
+rather than calling that silence. The alarm clears itself when **either** half clears - the mail is read, or
+the member does something - and there is no ack, because an ack would let you silence "nobody is answering
+escalated mail" while it stayed true.
+
+It is deliberately kept separate from the stranded-mail alarm above: that one is for inboxes nobody owns,
+this one for real members who are not responding. Disable both with `--no-stranded-alerts`.
+
 ### Unread mail outside the window
 
 Alongside the declaration of *what it dropped*, the inbox endpoint reports `unread_not_shown`: how many

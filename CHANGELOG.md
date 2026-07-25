@@ -138,6 +138,25 @@ reviewer originally assigned never read the request.
   the suite's two `ResourceWarning`s. `StateFile.unlock()` now exists and is called on shutdown.
 
 ### Added
+- **Urgent-unanswered alarm.** The watcher reports members holding mail a sender marked **urgent** while no
+  activity from them has been observed.
+
+  "Is this member stuck?" is normally unanswerable from outside: idle-by-design and wedged look identical,
+  so the obvious alarm fires on every quiet persona and rots into noise. The urgent flag breaks the tie
+  because it is a *sender* declaring an expectation - not the recipient declaring liveness - and silence
+  only means something once something was expected. A quiet member with no urgent mail never trips it, so
+  the alarm fires exactly where somebody escalated and nothing happened.
+
+  Both halves of the predicate must be positive: `unread_urgent > 0` and an explicit "no activity in a span
+  we covered". A NOT-OBSERVABLE answer means the watcher was not running then, and reporting that as silence
+  would be a fabrication. It costs no request - `unread_urgent` arrives on the same row as the unread count
+  the fast path already fetches every tick, and was previously parsed and discarded.
+
+  Kept disjoint from the stranded-mail alarm on purpose - that one is for inboxes nobody owns, this one for
+  real members who are not responding - because two alarms covering one inbox drift apart and then disagree.
+  Same honesty rules as the rest: an `alert` rather than a new event name, one summarising event per
+  watcher, the observation and never the diagnosis, self-clearing when either half clears, and no ack.
+
 - **`--activity-file PATH`: publish who has been observed AUTHORING mail.** Refreshed each tick, it lets a
   harness answer "has X been active since my message?" from data the watcher already collects.
 

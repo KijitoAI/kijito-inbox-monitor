@@ -691,6 +691,187 @@ class AuthorshipSignalTest(unittest.TestCase):
         self.assertIn("WARNING", buf.getvalue())   # warned, did not raise
 
 
+class UrgentUnreadTest(unittest.TestCase):
+    """`unread_urgent` rides along on the count fetch. It is the only DECLARED EXPECTATION the hive has:
+    a sender saying this needs attention now, which is what makes a recipient's silence meaningful."""
+
+    def setUp(self):
+        km._URGENT_UNREAD.clear()
+
+    tearDown = setUp
+
+    def test_it_is_captured_from_the_same_row_as_the_unread_count(self):
+        counts = km._parse_unread_rows({"result": [
+            {"persona": "loom", "unread": 7, "unread_urgent": 1},
+            {"persona": "argus", "unread": 19, "unread_urgent": 0}]})
+        self.assertEqual(counts, {"loom": 7, "argus": 19})       # the fast path is untouched
+        self.assertEqual(km._URGENT_UNREAD, {"loom": 1, "argus": 0})
+
+    def test_an_absent_field_records_NO_STATEMENT_not_zero(self):
+        # An older server that never sends it must not be read as "nothing is escalated".
+        km._parse_unread_rows({"result": [{"persona": "loom", "unread": 7}]})
+        self.assertNotIn("loom", km._URGENT_UNREAD)
+
+    def test_junk_is_not_a_count(self):
+        for junk in ("1", 1.5, True, -1, None, []):
+            km._URGENT_UNREAD.clear()
+            km._parse_unread_rows({"result": [{"persona": "l", "unread": 1, "unread_urgent": junk}]})
+            self.assertNotIn("l", km._URGENT_UNREAD, "%r must not be read as a count" % (junk,))
+
+    def test_the_activity_report_publishes_only_personas_with_urgent_mail(self):
+        km._parse_unread_rows({"result": [
+            {"persona": "loom", "unread": 7, "unread_urgent": 1},
+            {"persona": "argus", "unread": 19, "unread_urgent": 0}]})
+        path = os.path.join(tempfile.mkdtemp(), "a.json")
+        km._OBSERVED_SINCE = "2026-07-25T07:00:00+00:00"
+        try:
+            km.write_activity_file(path)
+        finally:
+            km._OBSERVED_SINCE = None
+        with open(path) as f:
+            d = json.load(f)
+        self.assertEqual(d["urgent_unread"], {"loom": 1})   # argus at 0 is not noise worth publishing
+
+
+class UrgentUnansweredAlarmTest(unittest.TestCase):
+    """§5.5 - escalated mail nobody is answering. The alarm that is only possible because a SENDER
+    declared an expectation; without that, idle-by-design and wedged are indistinguishable."""
+
+    class Target:
+        def __init__(self, persona):
+            self.persona = persona
+
+    class Emitter:
+        def __init__(self):
+            self.events = []
+
+        def lifecycle(self, event, **f):
+            self.events.append((event, f))
+
+    def setUp(self):
+        km._URGENT_UNREAD.clear()
+        km._LAST_AUTHORED.clear()
+        km._INBOX_FLOORS.clear()
+        km._REPORTED_URGENT_QUIET.clear()
+        km._OBSERVED_SINCE = "2026-07-25T07:00:00+00:00"
+
+    def tearDown(self):
+        self.setUp()
+        km._OBSERVED_SINCE = None
+
+    def _observe(self, items, inbox="argus"):
+        km.note_authorship(items)
+        km.note_observation_floor(inbox, items)
+
+    def _run(self, directory=("argus", "loom"), targets=("argus",)):
+        em = self.Emitter()
+        fresh = km.report_urgent_unanswered(list(directory),
+                                            [self.Target(p) for p in targets], em)
+        return fresh, [f for e, f in em.events if e == "alert"]
+
+    def test_it_fires_when_escalated_mail_meets_silence(self):
+        km._URGENT_UNREAD.update({"loom": 1})
+        self._observe([{"id": 100, "from": "river", "created": "t"}])
+        fresh, alerts = self._run()
+        self.assertEqual(fresh, ["loom"])
+        self.assertEqual(alerts[0]["urgent_unanswered"], ["loom"])
+        self.assertIn("URGENT", alerts[0]["reason"])
+
+    def test_it_does_NOT_fire_for_a_persona_that_is_merely_idle(self):
+        # THE WHOLE OBJECTION THIS DESIGN ANSWERS. No urgent mail = no declared expectation = no alarm,
+        # however long the persona has been quiet.
+        km._URGENT_UNREAD.update({"loom": 0})
+        self._observe([{"id": 100, "from": "river", "created": "t"}])
+        self.assertEqual(self._run()[0], [])
+
+    def test_it_does_NOT_fire_when_the_member_is_demonstrably_active(self):
+        km._URGENT_UNREAD.update({"loom": 3})
+        self._observe([{"id": 100, "from": "river", "created": "t"},
+                       {"id": 101, "from": "loom", "created": "t2"}])
+        self.assertEqual(self._run()[0], [])
+
+    def test_it_does_NOT_fire_on_a_span_we_never_observed(self):
+        # activity_since returns NOT-OBSERVABLE; reporting that as silence is the fabrication the
+        # tri-state exists to refuse.
+        km._URGENT_UNREAD.update({"loom": 1})
+        self.assertEqual(self._run()[0], [])          # nothing observed at all yet
+
+    def test_a_NOT_OBSERVABLE_answer_is_not_silence_even_with_a_floor(self):
+        # The sharper case, and the one a coarser `is not True` test would miss: window data exists, but
+        # the watch loop never started, so activity_since answers NOT OBSERVABLE rather than False.
+        # Only a positive False may fire this alarm.
+        km._URGENT_UNREAD.update({"loom": 1})
+        self._observe([{"id": 100, "from": "river", "created": "t"}])
+        km._OBSERVED_SINCE = None                     # floor is set; observation window is not
+        self.assertIsNone(km.activity_since("loom", km.observation_floor_id()))
+        self.assertEqual(self._run()[0], [])
+
+    def test_a_None_directory_is_missing_data_not_an_empty_one(self):
+        # Asserted as a VALUE rather than by letting an exception escape, so a regression shows up as a
+        # clean failure instead of an error - an erroring test says "the code broke", a failing one says
+        # "the code broke THIS WAY", and only the second survives a mutation harness that (rightly)
+        # distrusts mutants which merely crash.
+        km._URGENT_UNREAD.update({"loom": 1})
+        self._observe([{"id": 100, "from": "river", "created": "t"}])
+
+        def safely(fn, *a):
+            try:
+                return fn(*a)
+            except Exception as e:
+                return "raised %s" % type(e).__name__
+
+        self.assertEqual(safely(km.urgent_unanswered, None), [])
+        self.assertEqual(safely(km.report_urgent_unanswered, None, [self.Target("argus")],
+                                self.Emitter()), [])
+
+    def test_it_announces_once_then_self_clears_on_EITHER_half(self):
+        km._URGENT_UNREAD.update({"loom": 1})
+        self._observe([{"id": 100, "from": "river", "created": "t"}])
+        self.assertEqual(self._run()[0], ["loom"])
+        self.assertEqual(self._run()[0], [])          # suppressed while unchanged
+        km._URGENT_UNREAD["loom"] = 0                 # half 1 clears (mail got read)
+        self.assertEqual(self._run()[0], [])
+        km._URGENT_UNREAD["loom"] = 1                 # and a recurrence is announced again
+        self.assertEqual(self._run()[0], ["loom"])
+
+    def test_activity_alone_also_releases_the_suppression(self):
+        km._URGENT_UNREAD.update({"loom": 1})
+        self._observe([{"id": 100, "from": "river", "created": "t"}])
+        self.assertEqual(self._run()[0], ["loom"])
+        self._observe([{"id": 102, "from": "loom", "created": "t3"}])   # half 2 clears
+        self.assertEqual(self._run()[0], [])
+        km._LAST_AUTHORED.pop("loom")                                   # goes quiet again
+        self.assertEqual(self._run()[0], ["loom"])
+
+    def test_it_states_no_cause(self):
+        km._URGENT_UNREAD.update({"loom": 1})
+        self._observe([{"id": 100, "from": "river", "created": "t"}])
+        reason = self._run()[1][0]["reason"].lower()
+        for word in km.FORBIDDEN_DIAGNOSES:
+            self.assertNotIn(word, reason, "must not assert %r" % word)
+
+    def test_it_is_disjoint_from_the_stranded_alarm(self):
+        # A persona the directory does not know is the STRANDED alarm's business. Two alarms covering one
+        # inbox drift apart and then disagree about it.
+        km._URGENT_UNREAD.update({"phantom": 4})
+        self._observe([{"id": 100, "from": "river", "created": "t"}])
+        self.assertEqual(self._run(directory=("argus", "loom"))[0], [])
+
+    def test_one_summarising_event_per_watcher_not_one_per_pair(self):
+        km._URGENT_UNREAD.update({"loom": 1, "quill": 2})
+        self._observe([{"id": 100, "from": "river", "created": "t"}])
+        fresh, alerts = self._run(directory=("argus", "river", "loom", "quill"),
+                                  targets=("argus", "river"))
+        self.assertEqual(sorted(fresh), ["loom", "quill"])
+        self.assertEqual(len(alerts), 2)                       # two watchers, not four pairs
+        self.assertEqual(sorted(alerts[0]["urgent_unanswered"]), ["loom", "quill"])
+
+    def test_no_directory_means_no_claim(self):
+        km._URGENT_UNREAD.update({"loom": 1})
+        self._observe([{"id": 100, "from": "river", "created": "t"}])
+        self.assertEqual(self._run(directory=())[0], [])
+
+
 class EventIdTest(unittest.TestCase):
     """Every event carries a producer-owned id, so a consumer never has to hash our NDJSON bytes."""
 
