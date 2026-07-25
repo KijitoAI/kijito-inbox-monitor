@@ -129,6 +129,9 @@ def build_opener(pinned_ip):
 # --------------------------------------------------------------------------------------------------------------------
 # §5 http-poll adapter - peek + shape-validate + classify healthy/failure
 # --------------------------------------------------------------------------------------------------------------------
+_MISSING = object()   # "the server did not send this field at all", distinct from an explicit null
+
+
 class Poll:
     """Result of one fetch. ok=True → HEALTHY (items is the validated list). ok=False → liveness FAILURE.
 
@@ -139,7 +142,7 @@ class Poll:
     then advances past them. The truncation is not silent in the DATA - only in the handling of it.
     """
     def __init__(self, ok, items=None, reason=None, status=None, redirected=False, omitted=0,
-                 omitted_exact=True, next_before_id=None):
+                 omitted_exact=True, next_before_id=None, continuation_ok=True):
         self.ok = ok
         self.items = items
         self.reason = reason
@@ -148,6 +151,10 @@ class Poll:
         self.omitted = omitted             # >0 iff the server said this window is incomplete
         self.omitted_exact = omitted_exact  # False => `omitted` is only a LOWER BOUND, never closable by count
         self.next_before_id = next_before_id  # backward cursor; None when nothing older was withheld
+        # False when the server's continuation was ABSENT or MALFORMED - i.e. it never answered. Distinct
+        # from next_before_id=None, which is the server AFFIRMING there is nothing older. A walk may treat
+        # only the affirmation as terminal; silence is a contract violation and must pin.
+        self.continuation_ok = continuation_ok
 
 
 def fetch(opener, url, headers):
@@ -170,16 +177,33 @@ def fetch(opener, url, headers):
         data = json.loads(body)
     except (ValueError, UnicodeDecodeError) as e:
         return Poll(False, reason="parse-fail: %s" % e, status=status)
-    if not isinstance(data, dict) or not isinstance(data.get("result"), list):
+    if not isinstance(data, dict):
+        return Poll(False, reason="shape-invalid: body is not an object", status=status)
+    # ONE implementation of the body contract, shared with the tests. Two copies of a rule this subtle is
+    # two chances to get it wrong, and the tests would then be exercising the copy production does not use.
+    return fetch_from_payload(data, status=status)
+
+
+def fetch_from_payload(data, status=200):
+    """Build a Poll from an already-decoded body. The validation path fetch() uses, exposed so tests can
+    exercise the CONTRACT (absent vs null vs malformed continuation) rather than construct Polls by hand -
+    a hand-built Poll bypasses exactly the checks under test."""
+    items = data.get("result")
+    if not isinstance(items, list):
         return Poll(False, reason="shape-invalid: result is not a list", status=status)
-    items = data["result"]
     for m in items:
         if not isinstance(m, dict) or not isinstance(m.get("id"), int):
             return Poll(False, reason="shape-invalid: row missing integer id", status=status)
     n, exact = _declared_omissions(data)
-    nb = data.get("next_before_id")
+    nb_raw = data.get("next_before_id", _MISSING)
+    if nb_raw is None:
+        nb, nb_ok = None, True
+    elif isinstance(nb_raw, int) and not isinstance(nb_raw, bool) and nb_raw >= 0:
+        nb, nb_ok = nb_raw, True
+    else:
+        nb, nb_ok = None, False
     return Poll(True, items=items, status=status, omitted=n, omitted_exact=exact,
-                next_before_id=nb if isinstance(nb, int) else None)
+                next_before_id=nb, continuation_ok=nb_ok)
 
 
 def _declared_omissions(data):
@@ -488,6 +512,11 @@ class Emitter:
 # --------------------------------------------------------------------------------------------------------------------
 # §7.3 State file (canonical identity + flock + atomic write + resume)
 # --------------------------------------------------------------------------------------------------------------------
+# A state file that EXISTS but cannot be trusted. Distinct from None (genuinely absent) because the two
+# demand opposite behaviour: absent means baseline, corrupt means fail closed and re-emit.
+CORRUPT_STATE = object()
+
+
 class StateFile:
     def __init__(self, path, identity):
         self.path = path
@@ -510,8 +539,18 @@ class StateFile:
             raise FatalConfig("state-file in use (another watcher holds the lock): %s" % self.path)
 
     def load(self):
-        """Return (cursor, state, failures) on a VALID identity-matching file; None if absent/invalid (fall through).
-        Raises FatalConfig on a present-but-unreadable path."""
+        """Return the resumed state on a VALID identity-matching file; None if genuinely ABSENT.
+
+        Raises FatalConfig on a present-but-unreadable path, and returns the CORRUPT sentinel on a file
+        that EXISTS but cannot be trusted.
+
+        ABSENT AND CORRUPT ARE NOT THE SAME ANSWER (Loom re-audit 5, HIGH 2). Both used to return None, so
+        a garbled state file was indistinguishable from a first launch - and a first launch BASELINES to
+        the newest visible id, silently skipping every message between the lost cursor and now. That is a
+        permanent, invisible loss produced by the one event most likely to accompany a crash. A file that
+        is present but unparseable is EVIDENCE THAT A CURSOR EXISTED, so it must fail closed and re-emit
+        rather than fail open and skip. Duplicates are recoverable; skips are not.
+        """
         if not os.path.exists(self.path):
             return None
         try:
@@ -528,10 +567,15 @@ class StateFile:
             failures = d["consecutive_failures"]
             ident = d["identity"]
         except (ValueError, KeyError, TypeError):
-            return None  # schema-invalid → treat as absent
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file is present but unparseable; refusing to "
+                             "baseline over it (that would silently skip everything since the lost cursor): "
+                             "%s\n" % self.path)
+            return CORRUPT_STATE
         if not ((cursor is None or isinstance(cursor, int)) and state in ("UP", "DOWN")
                 and isinstance(failures, int)):
-            return None
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file has a valid envelope but invalid "
+                             "fields; refusing to baseline over it: %s\n" % self.path)
+            return CORRUPT_STATE
         if ident != self.identity:
             sys.stderr.write("kijito-inbox-monitor: WARNING state-file identity mismatch (%r != %r) - NOT resuming its "
                              "cursor; re-baselining to avoid a silently-blind watcher.\n" % (ident, self.identity))
@@ -792,6 +836,7 @@ class WatchTarget:
         # pin state was corrupt. A gap can then only be closed by an authoritative read, never by counting.
         self.pin_evidence_intact = True
         self.pin_forced = False   # hold a pin whose tracking we lost, so nothing can jump the watermark
+        self.state_corrupt = False  # a state file was PRESENT but unusable: arm fail-closed, and say so
 
         self.count_url = NOTIFY_PENDING_URL
         cp = urllib.parse.urlsplit(url)
@@ -803,7 +848,16 @@ class WatchTarget:
             if not args.self_test:
                 self.state_file.lock()
                 loaded = self.state_file.load()
-                if loaded is not None:
+                if loaded is CORRUPT_STATE:
+                    # A file that EXISTS but cannot be parsed is EVIDENCE A CURSOR EXISTED. Baselining
+                    # here would step over every message between that lost cursor and now, invisibly.
+                    # So fail closed: keep no cursor, force the pin so the watermark cannot jump, and
+                    # mark the evidence unusable. The first poll then emits everything visible (the
+                    # replay cap is bypassed while pinned) and the gap is announced rather than buried.
+                    self.state_corrupt = True
+                    self.pin_forced = True
+                    self.pin_evidence_intact = False
+                elif loaded is not None:
                     r_cursor, r_state, r_failures, r_emitted, r_alerted, r_intact = loaded
                     self.cursor = r_cursor
                     self.fsm_state, self.failures = r_state, r_failures
@@ -878,6 +932,16 @@ class WatchTarget:
         `covered` is True only if the walk reached stop_at or ran out of older messages. A walk cut
         short by the page budget returns False, and the caller must keep the watermark pinned: a
         partial walk proves nothing, and claiming otherwise is the very failure this replaced.
+
+        THE CHAIN IS VALIDATED STRICTLY, NOT ASSUMED (Loom re-audit 5, HIGH 1). Coverage-by-exhaustion
+        is only as good as the chain being a real chain, so every link is checked before it is trusted:
+          · the continuation must BE AN ANSWER. A missing or malformed `next_before_id` is not an
+            end-of-chain, it is silence, and reading silence as "nothing older" hands back coverage the
+            server never asserted.
+          · the continuation must EQUAL THE OLDEST ROW WE WERE HANDED. The contract is "pass the oldest
+            id you were returned"; a server whose continuation points BELOW that is skipping the rows in
+            between, and following it walks straight over them while reporting success.
+        Neither check can be satisfied by accident, and both fail to PIN, which is the safe direction.
         """
         sep = "&" if "?" in self.url else "?"
         rows, cursor, pages = [], from_id, 0
@@ -886,14 +950,21 @@ class WatchTarget:
             poll = fetch(self.opener, "%s%sbefore_id=%d" % (self.url, sep, cursor), self.headers)
             if not poll.ok:
                 return (rows, False)          # transient failure: no claim either way
+            if not poll.continuation_ok:
+                # Absent or malformed continuation: the server did not answer. NOT exhaustion.
+                return (rows, False)
             batch = poll.items or []
             rows.extend(batch)
             if batch:
                 oldest = min(m["id"] for m in batch)
                 if oldest <= stop_at:
                     return (rows, True)       # walked back past the watermark: span fully seen
+                if poll.next_before_id is not None and poll.next_before_id != oldest:
+                    # The chain skips rows between `oldest` and the continuation. Following it would
+                    # walk over them and still report the span covered.
+                    return (rows, False)
             if poll.next_before_id is None:
-                return (rows, True)           # no older mail exists at all
+                return (rows, True)           # server AFFIRMS there is nothing older
             if poll.next_before_id >= cursor:
                 return (rows, False)          # cursor not advancing; refuse to spin
             cursor = poll.next_before_id
@@ -942,7 +1013,17 @@ class WatchTarget:
                 do_arm = not self.armed
 
                 if do_arm:
-                    if self.cursor is None:
+                    if self.cursor is None and self.state_corrupt:
+                        # Fail CLOSED: arm BELOW everything visible and EMIT the whole window, rather than
+                        # baselining to the newest id and skipping the lost span in silence. The replay cap
+                        # is deliberately not applied - it exists to stop a huge first-run backlog, and
+                        # here every visible message is one we may already owe someone.
+                        self.cursor = min((m["id"] for m in items), default=0) - 1
+                        new_items = sorted(items, key=lambda m: m["id"])
+                        diag = ("state_corrupt", {"armed_at": self.cursor,
+                                                  "reason": "state file present but unusable; re-emitting the "
+                                                            "visible window instead of baselining over it"})
+                    elif self.cursor is None:
                         self.cursor = max((m["id"] for m in items), default=0)
                     else:
                         current_max = max((m["id"] for m in items), default=0)
@@ -1025,6 +1106,13 @@ class WatchTarget:
                     if closed and not self.pin_evidence_intact:
                         # An authoritative read re-establishes ground truth, so the span is knowable again.
                         self.pin_evidence_intact = True
+                    if closed:
+                        # AND RELEASE THE FORCED PIN (Loom re-audit 5, MEDIUM). A forced pin was held
+                        # because tracking was lost; a COMPLETED walk is the authoritative evidence that
+                        # replaces it. Leaving it set froze the watermark permanently, and because a
+                        # non-pinned poll never records emitted ids, every later window re-emitted the
+                        # same mail forever - the duplicate storm the pin exists to prevent.
+                        self.pin_forced = False
                     pinned = not closed
                     # Alert identity is the PINNED WATERMARK, not the window floor. The floor drifts upward
                     # as new mail arrives, so keying on it re-fires for what is the same unresolved span;
@@ -1073,15 +1161,24 @@ class WatchTarget:
                                                    % (self.cursor, dropped)),
                                            cursor_at=self.cursor, forgot=dropped,
                                            pinned=True, evidence_lost=True)
-                elif not self.pin_forced:
+                else:
                     # A COMPLETE window that reaches back past the watermark proves everything above it is
                     # visible, so a leftover pin can be released even when there is nothing NEW to emit.
                     # Gating this on `new_items` left a restored pin stuck forever whenever the window
                     # contained only ids we had already delivered - the exact state a restart lands in.
                     reach = min((m["id"] for m in items), default=None)
                     complete = poll.omitted == 0 and reach is not None and reach <= (self.cursor or 0)
-                    high = max([m["id"] for m in new_items] + ([max(m["id"] for m in items)] if complete else []),
-                               default=None)
+                    if self.pin_forced and complete:
+                        # The other authoritative proof: nothing was withheld AND the window reaches back
+                        # past the watermark, so there is no span left to be uncertain about. Without this
+                        # a forced pin that never sees a gap again could never clear, and the watermark
+                        # would stay frozen for the life of the process.
+                        self.pin_forced = False
+                    if self.pin_forced:
+                        high = None           # still forced: the watermark holds
+                    else:
+                        high = max([m["id"] for m in new_items]
+                                   + ([max(m["id"] for m in items)] if complete else []), default=None)
                     if high is not None and high > (self.cursor or 0):
                         self.cursor = high
                         # Watermark moved, so anything at or below it is confirmed and needs no tracking.

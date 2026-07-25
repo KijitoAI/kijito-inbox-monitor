@@ -443,6 +443,7 @@ class BoundedWindowGapTest(unittest.TestCase):
         t.opener, t.headers = None, {}
         t.emitted_above, t.gap_alerted = set(), None
         t.pin_evidence_intact, t.pin_forced = True, False
+        t.state_corrupt = False
         return t
 
     def test_window_reaching_back_past_the_cursor_is_safe(self):
@@ -479,6 +480,7 @@ class WalkBackTest(unittest.TestCase):
         t.opener, t.headers = None, {}
         t.emitted_above, t.gap_alerted = set(), None
         t.pin_evidence_intact, t.pin_forced = True, False
+        t.state_corrupt = False
         return t
 
     def _pages(self, mapping, calls=None):
@@ -601,6 +603,7 @@ class BoundedWindowEndToEndTest(unittest.TestCase):
         t.count_url, t.unread_persona = km.NOTIFY_PENDING_URL, "argus"
         t.emitted_above, t.gap_alerted = set(), None
         t.pin_evidence_intact, t.pin_forced = True, False
+        t.state_corrupt = False
         return t
 
     def _fetch(self, main_items, omitted, walk=None, exact=True, walk_fail=False):
@@ -836,13 +839,73 @@ class CorruptPinStateTest(unittest.TestCase):
         t.count_url, t.unread_persona = km.NOTIFY_PENDING_URL, "argus"
         t.emitted_above, t.gap_alerted = set(), 100
         t.pin_evidence_intact, t.pin_forced = False, True    # what a corrupt load produces
-        orig, km.fetch = km.fetch, lambda o, u, h: km.Poll(
-            True, items=[{"id": 200}, {"id": 201}], omitted=3)
+        t.state_corrupt = False
+
+        # The walk must NOT succeed here, or it would legitimately close the span and release the pin -
+        # which is a DIFFERENT property, tested separately below. Isolating them keeps this test about
+        # the one thing its name claims: arming must not let the replay cap cross a forced pin.
+        def f(opener, url, headers):
+            if "before_id=" in url:
+                return km.Poll(False, reason="http 502")
+            return km.Poll(True, items=[{"id": 200}, {"id": 201}], omitted=3)
+        orig, km.fetch = km.fetch, f
         try:
             t.poll_once()
         finally:
             km.fetch = orig
         self.assertEqual(t.cursor, 100)             # *** did NOT jump to 201 ***
+        self.assertEqual([e for e, _ in em.events if e == "replay_capped"], [])
+        self.assertTrue(t.pin_forced)               # an unresolved span keeps the pin forced
+
+    def test_a_completed_authoritative_walk_RELEASES_a_forced_pin(self):
+        # Loom re-audit 5, MEDIUM. A forced pin is held because TRACKING was lost; a completed walk is the
+        # authoritative evidence that replaces it. Never clearing it froze the watermark forever, and since
+        # a non-pinned poll records no emitted ids, every later window re-emitted the same mail.
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = BoundedWindowEndToEndTest()._target(cursor=100, emitter=em)
+        t.pin_evidence_intact, t.pin_forced = False, True
+
+        def f(opener, url, headers):
+            if "before_id=" in url:
+                # walks back past the watermark: authoritative exhaustion
+                return km.Poll(True, items=[{"id": 150}, {"id": 100}], next_before_id=None)
+            return km.Poll(True, items=[{"id": 200}], omitted=1, next_before_id=200)
+        orig, km.fetch = km.fetch, f
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertFalse(t.pin_forced)              # released by authoritative evidence
+        self.assertTrue(t.pin_evidence_intact)
+        self.assertEqual(t.cursor, 200)             # and the watermark can move again
+
+    def test_a_forced_pin_with_no_gap_is_released_by_a_COMPLETE_window(self):
+        # The other authoritative proof, and without it a forced pin that never meets another gap could
+        # never clear at all - the watermark would stay frozen for the life of the process.
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = BoundedWindowEndToEndTest()._target(cursor=100, emitter=em)
+        t.pin_evidence_intact, t.pin_forced = False, True
+        orig, km.fetch = km.fetch, lambda o, u, h: km.Poll(
+            True, items=[{"id": 90}, {"id": 100}, {"id": 120}], omitted=0, next_before_id=90)
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertFalse(t.pin_forced)
+        self.assertEqual(t.cursor, 120)
+
+    def test_a_forced_pin_is_NOT_released_by_an_incomplete_window(self):
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = BoundedWindowEndToEndTest()._target(cursor=100, emitter=em)
+        t.pin_evidence_intact, t.pin_forced = False, True
+        orig, km.fetch = km.fetch, lambda o, u, h: km.Poll(
+            True, items=[{"id": 90}, {"id": 120}], omitted=2, next_before_id=90)
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertTrue(t.pin_forced)               # the server still admits it withheld rows
+        self.assertEqual(t.cursor, 100)
 
 
 class CaseAsymmetryInvariantTest(unittest.TestCase):
@@ -1181,3 +1244,163 @@ class WaitValidationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Loom5ContractValidationTest(unittest.TestCase):
+    """Loom re-audit 5. The chain must be VALIDATED, not assumed - written from loom's own repros."""
+
+    def _target(self, cursor, emitter):
+        return BoundedWindowEndToEndTest()._target(cursor, emitter)
+
+    def _run(self, t, f):
+        orig, km.fetch = km.fetch, f
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+
+    # ---- HIGH 1a: silence is not exhaustion ------------------------------------------------------
+    def test_LOOM5_a_continuation_that_is_ABSENT_must_not_read_as_end_of_chain(self):
+        # loom's repro: cursor 100, first visible 200, the continuation page [150] OMITS
+        # next_before_id while 125 is hidden. Reading that omission as exhaustion advanced the cursor
+        # to 200 with no alert, stepping over 125 permanently.
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = self._target(cursor=100, emitter=em)
+
+        def f(opener, url, headers):
+            if "before_id=" in url:
+                return km.fetch_from_payload({"result": [{"id": 150}]})    # NO next_before_id key
+            return km.Poll(True, items=[{"id": 200}], omitted=1, next_before_id=200)
+        self._run(t, f)
+        self.assertEqual(t.cursor, 100)                       # *** did NOT step over 125 ***
+        self.assertTrue([x for e, x in em.events if e == "alert"])
+
+    def test_LOOM5_a_MALFORMED_continuation_must_not_read_as_end_of_chain(self):
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = self._target(cursor=100, emitter=em)
+
+        def f(opener, url, headers):
+            if "before_id=" in url:
+                return km.fetch_from_payload({"result": [{"id": 150}], "next_before_id": "150"})
+            return km.Poll(True, items=[{"id": 200}], omitted=1, next_before_id=200)
+        self._run(t, f)
+        self.assertEqual(t.cursor, 100)
+        self.assertTrue([x for e, x in em.events if e == "alert"])
+
+    def test_an_EXPLICIT_null_continuation_is_still_a_real_terminal(self):
+        # The counterpart that must keep working: an affirmed "nothing older" closes the span normally,
+        # or the fix would pin forever and break the feature it is protecting.
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = self._target(cursor=100, emitter=em)
+
+        def f(opener, url, headers):
+            if "before_id=" in url:
+                return km.fetch_from_payload({"result": [{"id": 150}], "next_before_id": None})
+            return km.Poll(True, items=[{"id": 200}], omitted=1, next_before_id=200)
+        self._run(t, f)
+        self.assertEqual(t.cursor, 200)
+        self.assertEqual([x for e, x in em.events if e == "alert"], [])
+
+    # ---- HIGH 1b: the continuation must match the oldest row handed back -------------------------
+    def test_LOOM5_a_continuation_below_the_oldest_returned_row_skips_and_must_pin(self):
+        # loom's repro: page [150] with next_before_id 120 silently skips 130.
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = self._target(cursor=100, emitter=em)
+
+        # The chain is otherwise WELL-FORMED and would terminate cleanly, so the only thing that can
+        # catch the skip is the oldest-row check. Without it the walk reaches 100, declares the span
+        # covered, and the cursor steps over 130 - which is the defect.
+        pages = {200: {"result": [{"id": 150}], "next_before_id": 120},   # skips 130
+                 120: {"result": [{"id": 100}], "next_before_id": None}}
+
+        def f(opener, url, headers):
+            if "before_id=" in url:
+                bid = int(url.split("before_id=")[1].split("&")[0])
+                return km.fetch_from_payload(pages[bid])
+            return km.Poll(True, items=[{"id": 200}], omitted=1, next_before_id=200)
+        self._run(t, f)
+        self.assertEqual(t.cursor, 100)
+        self.assertTrue([x for e, x in em.events if e == "alert"])
+
+    def test_a_continuation_equal_to_the_oldest_row_is_accepted(self):
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = self._target(cursor=100, emitter=em)
+        pages = {200: {"result": [{"id": 150}], "next_before_id": 150},
+                 150: {"result": [{"id": 100}], "next_before_id": None}}
+
+        def f(opener, url, headers):
+            if "before_id=" in url:
+                bid = int(url.split("before_id=")[1].split("&")[0])
+                return km.fetch_from_payload(pages[bid])
+            return km.Poll(True, items=[{"id": 200}], omitted=1, next_before_id=200)
+        self._run(t, f)
+        self.assertEqual(t.cursor, 200)
+        self.assertEqual([x for e, x in em.events if e == "alert"], [])
+
+    # ---- the parse layer ------------------------------------------------------------------------
+    def test_fetch_separates_affirmed_null_from_silence(self):
+        ok = km.fetch_from_payload({"result": [], "next_before_id": None})
+        self.assertTrue(ok.continuation_ok)
+        self.assertIsNone(ok.next_before_id)
+        cur = km.fetch_from_payload({"result": [], "next_before_id": 0})
+        self.assertTrue(cur.continuation_ok)
+        self.assertEqual(cur.next_before_id, 0)               # 0 is a REAL cursor
+        for bad in ({"result": []},                            # absent
+                    {"result": [], "next_before_id": "12"},
+                    {"result": [], "next_before_id": 1.5},
+                    {"result": [], "next_before_id": True},
+                    {"result": [], "next_before_id": -1}):
+            p = km.fetch_from_payload(bad)
+            self.assertFalse(p.continuation_ok, "%r must not count as an answer" % (bad,))
+
+
+class Loom5CorruptStateTest(unittest.TestCase):
+    """Loom re-audit 5, HIGH 2. A state file that EXISTS but is unusable must fail CLOSED."""
+
+    def _write(self, text):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "hive.json")
+        with open(p, "w") as f:
+            f.write(text)
+        return p
+
+    def _load(self, text):
+        buf, err = __import__("io").StringIO(), km.sys.stderr
+        km.sys.stderr = buf
+        try:
+            return km.StateFile(self._write(text), "idx").load(), buf.getvalue()
+        finally:
+            km.sys.stderr = err
+
+    def test_unparseable_json_is_CORRUPT_not_absent(self):
+        loaded, warned = self._load("{not json")
+        self.assertIs(loaded, km.CORRUPT_STATE)
+        self.assertIn("unparseable", warned)
+
+    def test_valid_json_with_invalid_fields_is_CORRUPT_not_absent(self):
+        loaded, _ = self._load(json.dumps({"identity": "idx", "cursor": "nope",
+                                           "state": "UP", "consecutive_failures": 0}))
+        self.assertIs(loaded, km.CORRUPT_STATE)
+
+    def test_a_genuinely_absent_file_is_still_absent(self):
+        self.assertIsNone(km.StateFile(os.path.join(tempfile.mkdtemp(), "nope.json"), "idx").load())
+
+    def test_an_empty_file_is_still_absent(self):
+        loaded, _ = self._load("   ")
+        self.assertIsNone(loaded)
+
+    def test_LOOM5_corrupt_state_re_emits_the_window_instead_of_baselining_over_it(self):
+        # loom's repro: corrupt prior cursor 100 + visible 150,200 => baselined to 200 and skipped BOTH.
+        em = BoundedWindowEndToEndTest.RecordingEmitter()
+        t = BoundedWindowEndToEndTest()._target(cursor=None, emitter=em)
+        t.armed = False
+        t.state_corrupt, t.pin_forced, t.pin_evidence_intact = True, True, False
+        t.args.max_replay = 1                       # the cap must NOT be able to swallow them either
+        orig, km.fetch = km.fetch, lambda o, u, h: km.Poll(
+            True, items=[{"id": 150}, {"id": 200}], omitted=0, next_before_id=150)
+        try:
+            t.poll_once()
+        finally:
+            km.fetch = orig
+        self.assertEqual(em.new_ids, [150, 200])    # *** both emitted, neither skipped ***
+        self.assertTrue([f for e, f in em.events if e == "state_corrupt"])
