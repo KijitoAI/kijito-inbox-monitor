@@ -14,18 +14,36 @@ anywhere. Pushing a version tag publishes to both PyPI and npm, with provenance 
    release, and server-side logs then attribute traffic to a version that is not running.
    Verify with: `grep -n '^version\|"version"\|^__version__' pyproject.toml package.json kijito_inbox_monitor.py`
 2. Add a section for the new version to `CHANGELOG.md`.
-3. Commit, tag, and push:
+3. Run the pre-publish gates. BOTH must report clean, and the canary must prove the gate can still
+   fire - a gate that cannot fail is worse than no gate, because it certifies:
+   ```sh
+   ./scripts/prepublish-gate.sh
+   ```
+   It re-derives the file list from `git ls-files` on purpose. A hardcoded list has been wrong twice,
+   and PyPI/npm metadata is immutable per version, so the descriptions in `pyproject.toml` and
+   `package.json` are exactly the text you cannot fix later.
+4. Commit, tag, and push:
    ```sh
    git commit -am "release: vX.Y.Z"
    git tag -a vX.Y.Z -m "kijito-inbox-monitor vX.Y.Z"
    git push origin main --follow-tags
    ```
-4. The tag triggers `.github/workflows/publish-pypi.yml` and `publish-npm.yml`. Both publish
+5. The tag triggers `.github/workflows/publish-pypi.yml` and `publish-npm.yml`. Both publish
    over OIDC, no tokens.
-5. Create the GitHub Release for the tag:
+6. Confirm BOTH registries independently - never trust the workflow's own report, because a
+   half-failure (one registry published, the other not) is the case that actually happens and a
+   version can never be re-uploaded:
+   ```sh
+   gh run watch
+   npm view kijito-inbox-monitor version
+   curl -s https://pypi.org/pypi/kijito-inbox-monitor/json | python3 -c 'import json,sys; print(json.load(sys.stdin)["info"]["version"])'
+   ```
+7. Create the GitHub Release for the tag:
    ```sh
    gh release create vX.Y.Z --title vX.Y.Z --notes-file <(sed -n '/## \[X.Y.Z\]/,/## \[/p' CHANGELOG.md)
    ```
+   That `sed` range is INCLUSIVE, so it trails the next version's heading into the notes. Strip the
+   last line, or check the rendered release before you walk away.
 
 ## One-time setup (already done for 0.1.0)
 
@@ -41,4 +59,9 @@ anywhere. Pushing a version tag publishes to both PyPI and npm, with provenance 
   every version after it publishes over OIDC.
 - Keep public-facing text free of em-dashes and internal references before tagging. That includes
   the README, the design doc, the script docstring and `--help` text, and the PyPI/npm
-  descriptions, not just Markdown.
+  descriptions, not just Markdown. Step 3 enforces this; the prose here is the rationale, not the
+  check. A gate that lives only in prose does not run.
+- Beware the shell when writing any gate by hand. `FILES=$(git ls-files); grep -nE ... $FILES` does
+  NOT word-split in zsh: grep receives one nonexistent filename, exits non-zero, and an
+  `|| echo clean` reports success while having inspected nothing. That exact false clean was
+  observed in this repo. The script pipes NUL-delimited paths into `xargs -0` for this reason.
