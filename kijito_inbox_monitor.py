@@ -149,7 +149,7 @@ class Poll:
     then advances past them. The truncation is not silent in the DATA - only in the handling of it.
     """
     def __init__(self, ok, items=None, reason=None, status=None, redirected=False, omitted=0,
-                 omitted_exact=True, next_before_id=None, continuation_ok=True):
+                 omitted_exact=True, next_before_id=None, continuation_ok=True, consistent=True):
         self.ok = ok
         self.items = items
         self.reason = reason
@@ -162,6 +162,11 @@ class Poll:
         # from next_before_id=None, which is the server AFFIRMING there is nothing older. A walk may treat
         # only the affirmation as terminal; silence is a contract violation and must pin.
         self.continuation_ok = continuation_ok
+        # False when the window's OWN TWO HALVES disagree - see fetch_from_payload(). A window that
+        # contradicts itself cannot be believed in either direction, so it can neither close a span nor
+        # be walked through; it PINS. Both directions of the contradiction are covered, not just the
+        # one that happens to have been seen in the wild.
+        self.consistent = consistent
 
 
 def fetch(opener, url, headers):
@@ -216,8 +221,30 @@ def fetch_from_payload(data, status=200):
         nb, nb_ok = nb_raw, True
     else:
         nb, nb_ok = None, False
+    # THE OMISSION DECLARATION AND THE CONTINUATION ARE TWO HALVES OF ONE STATEMENT, and the server emits
+    # them from a SINGLE expression - `next_before_id = oldest_row if (has_more or size_dropped) else None`
+    # (Kijito web_api.py, commented "present exactly when mail was withheld"). So a window withheld rows IF
+    # AND ONLY IF it hands back a continuation, and either half contradicting the other is a contract
+    # violation, not a quirk to interpret:
+    #   withheld AND terminal      -> "I hid rows" + "there is nothing older"  (Loom re-audit 6, HIGH 3)
+    #   withheld NOTHING AND more  -> "I hid nothing" + "there is more"        (Loom re-audit 7, HIGH 4)
+    # The second is not merely the theoretical twin of the first; it follows from how the window is BUILT.
+    # A page returns every older row that FIT, so if it withheld nothing there is nothing older left for a
+    # continuation to point at. Believing the "I hid nothing" half advances the cursor over whatever the
+    # other half says is still there, which is the silent-loss direction.
+    # VERIFIED against the live API across 14 pages, including the case that could have made this rule
+    # pin production forever: a page returning EXACTLY `limit` rows with more behind it declares
+    # truncated=True (limit=4 -> next_before_id=1032), while one that exactly exhausts the mailbox
+    # declares nothing and terminates (limit=5 -> next_before_id=null). The server never leaves a
+    # complete window pointing onward, so this check cannot fire on healthy traffic.
+    consistent = True
+    if nb_ok:
+        if n and nb is None:
+            consistent = False
+        elif not n and nb is not None:
+            consistent = False
     return Poll(True, items=items, status=status, omitted=n, omitted_exact=exact,
-                next_before_id=nb, continuation_ok=nb_ok)
+                next_before_id=nb, continuation_ok=nb_ok, consistent=consistent)
 
 
 def _declared_omissions(data):
@@ -391,6 +418,8 @@ class RotatingFileSink:
         self.max_bytes = max_bytes
         self.keep = max(1, keep)
         self._fh = None
+        self._pending = False      # bytes written that are not known to be on stable storage yet
+        self._sync_failed = False  # an fsync we can never retry (the fd was rotated away) failed
         self._open()
 
     def _open(self):
@@ -399,9 +428,43 @@ class RotatingFileSink:
         self._fh = open(self.path, "a", encoding="utf-8")
 
     def write(self, line):
-        self._fh.write(line)
-        self._fh.flush()
+        """Append one event line. Returns True IFF the line reached the file.
+
+        A FAILED write must never be reported as a delivery. The cursor that acknowledges an event is
+        persisted from the same poll, so swallowing an OSError here would advance the watermark over a
+        message nobody received - the exact silent loss this tool exists to prevent, arriving through
+        the emit path instead of the fetch path.
+        """
+        try:
+            self._fh.write(line)
+            self._fh.flush()
+        except OSError as e:
+            sys.stderr.write("kijito-inbox-monitor: WARNING event write FAILED, holding the cursor: %s\n" % e)
+            return False
+        self._pending = True
         self._maybe_rotate()
+        return True
+
+    def sync(self):
+        """Force written events onto stable storage. Returns True IFF they are durable.
+
+        THE DURABILITY BARRIER (Loom re-audit 7, MEDIUM). flush() only moves bytes from Python's buffer
+        into the kernel's; a power loss between the flush and the writeback loses them. The state file
+        IS fsynced, so without this the CURSOR can outlive the EVENT it acknowledges - the watcher comes
+        back believing it delivered mail that no consumer ever saw, and never fetches it again. Ordering,
+        not just syncing, is what matters: event durable BEFORE cursor durable.
+        """
+        failed_earlier, self._sync_failed = self._sync_failed, False
+        ok = True
+        if self._pending:
+            try:
+                self._fh.flush()
+                os.fsync(self._fh.fileno())
+                self._pending = False
+            except OSError as e:
+                sys.stderr.write("kijito-inbox-monitor: WARNING event fsync FAILED, holding the cursor: %s\n" % e)
+                ok = False
+        return ok and not failed_earlier
 
     def _maybe_rotate(self):
         if self.max_bytes <= 0:
@@ -412,6 +475,11 @@ class RotatingFileSink:
             return
         if size < self.max_bytes:
             return
+        # Sync BEFORE the rename: after os.replace this fd names the archive, so a later sync() cannot
+        # make these bytes durable. If it fails, remember it - the next sync() must report non-durable
+        # once (holding the cursor for one poll) rather than silently losing the signal.
+        if not self.sync():
+            self._sync_failed = True
         try:
             self._fh.close()
             oldest = "%s.%d" % (self.path, self.keep)
@@ -470,6 +538,28 @@ class Emitter:
         for s in self._sinks_by_persona.values():
             s.close()
 
+    def sync(self, persona=None):
+        """Make THIS persona's written events durable. Returns True IFF they are on stable storage.
+
+        Called by the watcher BEFORE it persists a cursor that acknowledges those events. exec-per-event
+        has no sink of ours to sync (the consumer owns its own durability, and its exit status is the
+        acknowledgement), and a stdout stream is a pipe we do not own - both answer True.
+
+        SCOPED TO ONE PERSONA on purpose. The Emitter is shared by every watch target, so syncing all
+        sinks would let ONE persona's failing sink retract every OTHER persona's deliveries - a full
+        directory's worth of duplicate storms caused by a stream nobody was reading. In template mode
+        each persona owns its sink; in single-file mode there is one shared sink and syncing it is
+        correct for whichever target asks.
+        """
+        ok = True
+        if self.sink is not None:
+            ok = self.sink.sync() and ok
+        if self.sink_template is not None:
+            s = self._sinks_by_persona.get(persona or "_all")
+            if s is not None:
+                ok = s.sync() and ok
+        return ok
+
     def _clip(self, content):
         if self.no_content:
             return None
@@ -477,15 +567,27 @@ class Emitter:
         return s[: self.content_chars]
 
     def emit(self, event):
-        """event: dict already containing event/source/ts and type-specific fields."""
+        """Deliver one event. Returns True IFF delivery was ACKNOWLEDGED.
+
+        DELIVERY IS ACKNOWLEDGED, NOT ASSUMED (Loom re-audit 7, HIGH 1). The return value is what lets
+        the watcher hold its cursor below a message it could not hand over. Before this, emit() swallowed
+        every failure and the cursor advanced regardless, so a consumer whose --exec exited non-zero -
+        the wake hook that is the entire point of exec mode - never saw that message again, and the
+        watcher reported success. Anything other than True here means "not acknowledged": the message
+        will be re-delivered rather than dropped, because a duplicate is recoverable and a skip is not.
+        """
         if self.mode == "stdout-jsonl":
             line = json.dumps(event, ensure_ascii=False) + "\n"
             sink = self._sink_for(event.get("persona"))
             if sink is not None:
-                sink.write(line)
-            else:
+                return sink.write(line)
+            try:
                 sys.stdout.write(line)
                 sys.stdout.flush()
+            except OSError as e:
+                sys.stderr.write("kijito-inbox-monitor: WARNING stdout write FAILED, holding the cursor: %s\n" % e)
+                return False
+            return True
         else:  # exec-per-event
             env = dict(os.environ)
             env["KIJITOMON_EVENT"] = str(event.get("event", ""))
@@ -507,16 +609,29 @@ class Emitter:
                     # shell consumer, and exec-per-event is the portable primitive people reach for first.
                     env[envname] = ",".join(str(x) for x in v) if isinstance(v, list) else str(v)
             try:
-                subprocess.run(self.exec_cmd, shell=True, env=env, timeout=EXEC_TIMEOUT, check=False)
+                r = subprocess.run(self.exec_cmd, shell=True, env=env, timeout=EXEC_TIMEOUT, check=False)
             except subprocess.TimeoutExpired:
-                sys.stderr.write("kijito-inbox-monitor: exec timed out (non-fatal): %s\n" % self.exec_cmd)
-            except Exception as e:  # non-fatal - watch continues, cursor already advanced
-                sys.stderr.write("kijito-inbox-monitor: exec failed (non-fatal): %s\n" % e)
+                # A timeout is NOT a delivery. The command may well have run - so the consumer must be
+                # idempotent - but we have no acknowledgement, and inventing one is how mail disappears.
+                sys.stderr.write("kijito-inbox-monitor: exec TIMED OUT, holding the cursor: %s\n" % self.exec_cmd)
+                return False
+            except Exception as e:
+                sys.stderr.write("kijito-inbox-monitor: exec FAILED to run, holding the cursor: %s\n" % e)
+                return False
+            if r.returncode != 0:
+                sys.stderr.write("kijito-inbox-monitor: exec exited %d, holding the cursor (the event will be "
+                                 "re-delivered): %s\n" % (r.returncode, self.exec_cmd))
+                return False
+            return True
 
     # convenience constructors (carry the canonical fields; ts stamped at emit time)
     def new(self, m):
+        """Emit one `new` event. Returns True IFF the message is ACKNOWLEDGED (see emit())."""
         if self.suppress_authors and m.get("from") in self.suppress_authors:
-            return  # --suppress-author: don't wake on an event WE authored (self-echo noise). Cursor still advances.
+            # --suppress-author: don't wake on an event WE authored (self-echo noise). This is a
+            # deliberate POLICY drop, so it counts as acknowledged - the cursor must still advance, or
+            # suppressing an author would pin the watermark forever on that author's next message.
+            return True
         ev = {"event": "new", "source": SOURCE, "ts": _now_iso(), "id": m.get("id"),
               "from": m.get("from"), "created": m.get("created")}
         if m.get("_persona"):
@@ -524,12 +639,12 @@ class Emitter:
         c = self._clip(m.get("content"))
         if c is not None:
             ev["content"] = c
-        self.emit(ev)
+        return self.emit(ev)
 
     def lifecycle(self, event, **fields):
         ev = {"event": event, "source": SOURCE, "ts": _now_iso()}
         ev.update(fields)
-        self.emit(ev)
+        return self.emit(ev)
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -538,6 +653,64 @@ class Emitter:
 # A state file that EXISTS but cannot be trusted. Distinct from None (genuinely absent) because the two
 # demand opposite behaviour: absent means baseline, corrupt means fail closed and re-emit.
 CORRUPT_STATE = object()
+
+
+def _fsync_dir(path):
+    """fsync a DIRECTORY so a rename inside it is durable. Returns True on success.
+
+    os.replace is atomic for a concurrent READER, but atomicity is not durability: after a power loss
+    the new file's contents can be on disk while the directory entry still names the old inode - i.e. a
+    silently OLDER cursor. Syncing the file alone (which is all we did) does not cover the rename.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        os.fsync(fd)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def identity_migratable(stored, current):
+    """True iff a persisted identity differs from the current one ONLY BY THE CASE OF A QUERY VALUE.
+
+    THE CASE-ONLY MIGRATION (Loom re-audit 7, HIGH 3). The state PATH casefolds the persona
+    (_state_safe_persona - the local filesystem is case-insensitive, so it must), while the IDENTITY
+    embeds the persona with its original case, straight from the directory. So one file, written when
+    the directory spelled the persona `Loom`, is reloaded by a run that discovered `loom` - the identity
+    compares UNEQUAL, load() reports ABSENT, and absent BASELINES to the newest visible id, skipping
+    everything since the lost cursor. A cursor destroyed by a spelling change is exactly the silent skip
+    the state file exists to prevent.
+
+    ★ THIS IS A THIRD LAYER, NOT A HARMONISATION OF THE OTHER TWO (see CaseAsymmetryInvariantTest, and
+    do not "simplify" it into them). The SERVER's inbox namespace stays case-SENSITIVE - `Loom` and
+    `loom` remain distinct inboxes and a variant holding mail is still alarmed on as stranded. What this
+    says is narrower and follows from the path layer: because the path already collapses the variants,
+    ONE state file can only ever describe ONE of them, so a casefold-equal identity in THAT file is the
+    same watched source spelled differently - a migration to accept and rewrite, not a different source
+    to baseline over.
+
+    Deliberately strict about WHAT may differ: scheme, host, port and path must match EXACTLY, and so
+    must every query KEY. Only the query VALUE is compared case-insensitively. Nothing here invents
+    case-insensitivity for a URL path or for a host we did not already lowercase.
+    """
+    if not (isinstance(stored, list) and len(stored) == 5 and isinstance(current, list) and len(current) == 5):
+        return False
+    if stored[:4] != current[:4]:
+        return False
+    sq, cq = stored[4], current[4]
+    if not (isinstance(sq, list) and isinstance(cq, list)) or len(sq) != len(cq):
+        return False
+    for s, c in zip(sq, cq):
+        if not (isinstance(s, (list, tuple)) and len(s) == 2):
+            return False
+        if str(s[0]) != str(c[0]) or str(s[1]).casefold() != str(c[1]).casefold():
+            return False
+    return True
 
 
 class StateFile:
@@ -559,6 +732,10 @@ class StateFile:
         try:
             fcntl.flock(self._lockf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
+            # Close the sidecar we just opened before failing. Leaving it open leaks an fd per refused
+            # lock - and persona rediscovery runs every tick, so a persona whose file is held by another
+            # watcher would leak one fd per attempt for the life of the process.
+            self.unlock()
             raise FatalConfig("state-file in use (another watcher holds the lock): %s" % self.path)
 
     def load(self):
@@ -605,17 +782,67 @@ class StateFile:
                              "fields; refusing to baseline over it: %s\n" % self.path)
             return CORRUPT_STATE
         if ident != self.identity:
-            sys.stderr.write("kijito-inbox-monitor: WARNING state-file identity mismatch (%r != %r) - NOT resuming its "
-                             "cursor; re-baselining to avoid a silently-blind watcher.\n" % (ident, self.identity))
-            return None
+            if identity_migratable(ident, self.identity):
+                # CASE-ONLY MIGRATION, not a different source - see identity_migratable(). Resume the
+                # cursor; the next save() rewrites the file with the current spelling, so this converges
+                # after one poll instead of re-warning forever.
+                sys.stderr.write("kijito-inbox-monitor: state-file identity differs only by case (%r -> %r); "
+                                 "MIGRATING it rather than re-baselining (re-baselining would skip every "
+                                 "message since the stored cursor): %s\n" % (ident, self.identity, self.path))
+            else:
+                sys.stderr.write("kijito-inbox-monitor: WARNING state-file identity mismatch (%r != %r) - NOT "
+                                 "resuming its cursor; re-baselining to avoid a silently-blind watcher.\n"
+                                 % (ident, self.identity))
+                return None
+        # EVERY PERSISTED FIELD IS READ STRICTLY, AND ANYTHING UNRECOGNISED FAILS CLOSED (Loom re-audit 7,
+        # HIGH 2). The pin's own flags were read with `d.get(k) is True`, so a JSON `1` - the shape a
+        # hand-edit, a jq one-liner or another language's serialiser produces - normalised to False and
+        # SILENTLY UNPINNED the watermark, letting the replay cap cross the very span the pin was
+        # protecting. `pin_evidence_intact` had the mirror bug (`is False`, so `0` read as intact), and
+        # ints-that-are-bools were accepted as row ids and as gap_alerted. A malformed field is EVIDENCE
+        # THE FILE CANNOT BE TRUSTED, so the honest answer is CORRUPT_STATE - which arms below the visible
+        # window and re-emits it - never a quietly permissive default.
+        strict_ok = True
+
+        def _flag(key):
+            """Strict tri-state read of a persisted boolean: (value, ok)."""
+            nonlocal strict_ok
+            v = d.get(key, _MISSING)
+            if v is _MISSING or v is None:
+                return False
+            if v is True or v is False:
+                return v
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file field %r is not a boolean (%r); refusing "
+                             "to interpret it: %s\n" % (key, v, self.path))
+            strict_ok = False
+            return False
+
         # Ids already emitted ABOVE a pinned watermark. Absent in files written by older versions, which is
         # exactly the forward-compat case: an empty set just means "nothing pinned", the pre-pinning behaviour.
-        alerted = d.get("gap_alerted")
-        alerted = alerted if isinstance(alerted, int) else None
+        alerted = d.get("gap_alerted", _MISSING)
+        if alerted is _MISSING or alerted is None:
+            alerted = None
+        elif _is_int(alerted):
+            pass
+        else:
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file 'gap_alerted' is not an integer (%r); "
+                             "refusing to interpret it: %s\n" % (alerted, self.path))
+            alerted, strict_ok = None, False
+        release_at = d.get("pin_release_at", _MISSING)
+        if release_at is _MISSING or release_at is None:
+            release_at = None
+        elif _is_int(release_at):
+            pass
+        else:
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file 'pin_release_at' is not an integer (%r); "
+                             "refusing to interpret it: %s\n" % (release_at, self.path))
+            release_at, strict_ok = None, False
         raw = d.get("emitted_above")
         if raw is None:
             emitted, intact = set(), True          # no pin was in force; the ordinary case
-        elif isinstance(raw, list) and all(isinstance(i, int) for i in raw):
+        elif isinstance(raw, list) and all(_is_int(i) for i in raw):
+            # _is_int, not isinstance(i, int): `true` in this list would otherwise become the id 1 and
+            # suppress a real message 1 for the life of the pin.
             emitted, intact = set(raw), True
         else:
             # CORRUPT PIN STATE MUST FAIL CLOSED. Loading it as an empty set silently UNPINS: the watcher
@@ -636,16 +863,37 @@ class StateFile:
         # nothing has been tracked yet. So a restart lost the pin, the replay cap was free again, and the
         # very span the pin was protecting got crossed on the first poll. A pin that does not survive a
         # restart is not a pin; the crash is when you need it.
-        d_intact = d.get("pin_evidence_intact")
-        if d_intact is False:
+        # Read strictly: `0` used to slip past `is False` and leave the evidence marked INTACT, which is
+        # the fail-OPEN direction on the one field that says "stop trusting your own view of this span".
+        if d.get("pin_evidence_intact", _MISSING) is not _MISSING and not _flag("pin_evidence_intact"):
             intact = False
+        pin_forced = _flag("pin_forced")
+        state_corrupt = _flag("state_corrupt")
+        if not strict_ok:
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file has malformed pin fields; treating the "
+                             "whole file as CORRUPT (fail closed) rather than resuming a state we cannot "
+                             "read: %s\n" % self.path)
+            return CORRUPT_STATE
         return {"cursor": cursor, "state": state, "failures": failures, "emitted_above": emitted,
                 "gap_alerted": alerted, "pin_evidence_intact": intact,
-                "pin_forced": d.get("pin_forced") is True,
-                "state_corrupt": d.get("state_corrupt") is True}
+                "pin_forced": pin_forced, "pin_release_at": release_at,
+                "state_corrupt": state_corrupt}
+
+    def unlock(self):
+        """Release the single-writer flock and close the sidecar fd.
+
+        The OS drops an flock when the process exits, so this is hygiene rather than correctness - but an
+        fd held for a target that is torn down is a genuine leak in a long-lived process, and it is what
+        surfaced as the suite's two ResourceWarnings (Loom re-audit 7, item 7).
+        """
+        if self._lockf is not None:
+            try:
+                self._lockf.close()
+            finally:
+                self._lockf = None
 
     def save(self, cursor, state, failures, emitted_above=None, gap_alerted=None,
-             pin_forced=False, pin_evidence_intact=True, state_corrupt=False):
+             pin_forced=False, pin_evidence_intact=True, state_corrupt=False, pin_release_at=None):
         if not IS_POSIX:
             return  # best-effort; skip on Windows
         d = {"identity": self.identity, "cursor": cursor, "state": state, "consecutive_failures": failures}
@@ -664,6 +912,10 @@ class StateFile:
             d["pin_evidence_intact"] = False
         if state_corrupt:
             d["state_corrupt"] = True
+        # The floor that RELEASES a corruption pin. Persisted with the pin itself: a pin whose release
+        # condition does not survive a restart is a pin that can never clear.
+        if pin_release_at is not None:
+            d["pin_release_at"] = pin_release_at
         dirn = os.path.dirname(os.path.abspath(self.path)) or "."
         os.makedirs(dirn, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=dirn, prefix=".kijmon-", suffix=".tmp")
@@ -673,6 +925,9 @@ class StateFile:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self.path)
+            # The rename needs its own sync - see _fsync_dir(). Without it the cursor's DURABILITY story
+            # stops one level short of the thing that makes it visible.
+            _fsync_dir(dirn)
         except OSError as e:
             sys.stderr.write("kijito-inbox-monitor: WARNING state-file write failed (non-fatal): %s\n" % e)
             try:
@@ -885,6 +1140,12 @@ class WatchTarget:
         self.pin_evidence_intact = True
         self.pin_forced = False   # hold a pin whose tracking we lost, so nothing can jump the watermark
         self.state_corrupt = False  # a state file was PRESENT but unusable: arm fail-closed, and say so
+        # The floor at which a corruption pin may RELEASE. A corrupt-state arm parks the watermark one
+        # BELOW the window it re-emits, so the ordinary release test (a complete window reaching back to
+        # at-or-below the watermark) is unsatisfiable by construction - the pin carries the floor that
+        # discharges it instead. Persisted, because a release condition that dies on restart is not one.
+        self.pin_release_at = None
+        self.delivery_blocked = False  # an emit failed; the cursor is held below it until it succeeds
 
         self.count_url = NOTIFY_PENDING_URL
         cp = urllib.parse.urlsplit(url)
@@ -912,6 +1173,7 @@ class WatchTarget:
                     self.gap_alerted = loaded["gap_alerted"]
                     self.pin_evidence_intact = loaded["pin_evidence_intact"]
                     self.state_corrupt = loaded["state_corrupt"]
+                    self.pin_release_at = loaded["pin_release_at"]
                     # A persisted forced pin is authoritative; the inference from missing tracking is only
                     # a fallback for files written before the flag existed.
                     self.pin_forced = loaded["pin_forced"] or not loaded["pin_evidence_intact"]
@@ -942,6 +1204,59 @@ class WatchTarget:
             fields["persona"] = self.persona
         self.emitter.lifecycle(event, **fields)
 
+    def _pin_release_floor(self):
+        """The reach a COMPLETE window must achieve to discharge a pin.
+
+        Normally the watermark itself: a window reaching back to at-or-below the cursor visibly spans
+        everything we have not confirmed. A CORRUPTION pin is the exception - it parks the watermark one
+        below the window it re-emits, so that window's own floor is always cursor+1 and the ordinary test
+        can never be met by it (Loom re-audit 7, HIGH 5: the pin never cleared, the cursor never moved,
+        and the window was re-delivered on every poll for the life of the process AND across restarts).
+        Taking the MAX keeps the ordinary rule exactly as strict as it was - a recorded floor can only
+        ever be the span we re-emitted, never something below the watermark.
+        """
+        floor = self.cursor or 0
+        if self.pin_release_at is not None:
+            floor = max(floor, self.pin_release_at)
+        return floor
+
+    def _release_pin(self):
+        """Discharge a forced pin AND everything that was holding it up.
+
+        ONE implementation, because there are TWO authoritative proofs (a completed backward walk, and a
+        complete window reaching the release floor) and they must leave identical state. They did not:
+        the walk path cleared only `pin_forced`, so a released corruption pin went on persisting
+        `state_corrupt: true` and its `pin_release_at` for the life of the file - a state file still
+        describing a corruption that had been fully recovered. Found by running the repro against the
+        LIVE api.kijito.ai and reading what was actually written back, which no fixture asserted.
+        """
+        self.pin_forced = False
+        self.pin_release_at = None
+        self.state_corrupt = False
+
+    def _delivery_failed(self, mid):
+        """Report a failed hand-off ONCE, and say what the watcher is doing about it.
+
+        Deliberately stderr and NOT an `alert` event: the event channel is the thing that just failed, so
+        an alarm about it would be routed through the broken pipe (exec mode re-runs the same failing
+        command; sink mode writes to the file that just refused a write). Reporting a fault down the
+        faulty channel is how the fault stays invisible. Keyed on the condition and self-clearing, like
+        every other alarm here.
+        """
+        if self.delivery_blocked:
+            return
+        self.delivery_blocked = True
+        sys.stderr.write("kijito-inbox-monitor: WARNING delivery of message %s to persona %r FAILED; HOLDING the "
+                         "cursor below it so it is re-delivered rather than skipped (further reports "
+                         "suppressed until delivery recovers)\n" % (mid, self.persona))
+
+    def _delivery_recovered(self):
+        if not self.delivery_blocked:
+            return
+        self.delivery_blocked = False
+        sys.stderr.write("kijito-inbox-monitor: delivery to persona %r recovered; the cursor is advancing "
+                         "again\n" % self.persona)
+
     def _uncovered_gap(self, poll, items):
         """(cursor, window_floor, omitted) iff omitted mail may sit ABOVE the cursor, else None.
 
@@ -955,12 +1270,21 @@ class WatchTarget:
         back and this returns None - no behaviour change. It fires after an outage or a burst, which is
         exactly when a bounded window starts hiding things.
         """
-        if not poll.omitted or self.cursor is None or not self.armed or not items:
+        declared, exact = poll.omitted, poll.omitted_exact
+        if not poll.consistent:
+            # A SELF-CONTRADICTORY WINDOW IS AN OMISSION WE CANNOT COUNT (Loom re-audit 7, HIGH 4). This
+            # check used to read `poll.omitted` alone and never looked at the continuation at all, so a
+            # window declaring "I withheld nothing" while handing back a cursor for older mail was taken
+            # at its word - and the watermark stepped over whatever the continuation was pointing at.
+            # There is no number to reach here, so it enters as an UNQUANTIFIED withholding: closable
+            # only by a backward walk that exhausts the span, never by arithmetic.
+            declared, exact = max(declared, 1), False
+        if not declared or self.cursor is None or not self.armed or not items:
             return None
         floor = min(m["id"] for m in items)
         if floor <= self.cursor:
             return None
-        return (self.cursor, floor, poll.omitted, poll.omitted_exact)
+        return (self.cursor, floor, declared, exact)
 
     def _walk_back(self, from_id, stop_at):
         """Page BACKWARD over (stop_at, from_id) and return (rows, covered).
@@ -1004,10 +1328,15 @@ class WatchTarget:
                 return (rows, False)
             batch = poll.items or []
             rows.extend(batch)
-            if poll.omitted and poll.next_before_id is None:
-                # SELF-CONTRADICTORY PAGE (Loom re-audit 6, HIGH 3): it declares that rows were withheld
-                # AND that nothing older exists. Both cannot be true, and believing the terminal half
-                # closes a span over the very rows the other half just admitted to hiding.
+            # VALIDATE THE PAGE BEFORE TAKING ANY COVERAGE FROM IT. Every check below rejects a page
+            # whose own account of itself does not hold together; a page that fails one of them cannot
+            # be trusted to have handed back the rows it appears to contain, so it may not close a span
+            # even when it seems to reach the watermark.
+            if not poll.consistent:
+                # SELF-CONTRADICTORY PAGE, IN EITHER DIRECTION. Withheld-rows + "nothing older" (Loom
+                # re-audit 6, HIGH 3) and withheld-nothing + "there is more" (Loom re-audit 7, HIGH 4)
+                # are the same defect facing opposite ways: the two halves of the page's declaration
+                # disagree, so believing EITHER half steps over what the other one just asserted.
                 return (rows, False)
             if not batch:
                 if poll.next_before_id is not None:
@@ -1018,12 +1347,15 @@ class WatchTarget:
                     return (rows, False)
                 return (rows, True)           # empty AND affirmed terminal: the chain genuinely ends
             oldest = min(m["id"] for m in batch)
-            if oldest <= stop_at:
-                return (rows, True)           # walked back past the watermark: span fully seen
             if poll.next_before_id is not None and poll.next_before_id != oldest:
                 # The chain skips rows between `oldest` and the continuation. Following it would
                 # walk over them and still report the span covered.
+                # Checked BEFORE the reach-back return below: a page that reaches the watermark while
+                # skipping rows is still a page whose row set we cannot vouch for, and taking coverage
+                # from it would be trusting the one page we just caught misdescribing itself.
                 return (rows, False)
+            if oldest <= stop_at:
+                return (rows, True)           # walked back past the watermark: span fully seen
             if poll.next_before_id is None:
                 return (rows, True)           # server AFFIRMS there is nothing older
             if poll.next_before_id >= cursor:
@@ -1081,6 +1413,8 @@ class WatchTarget:
                         # here every visible message is one we may already owe someone.
                         self.cursor = min((m["id"] for m in items), default=0) - 1
                         new_items = sorted(items, key=lambda m: m["id"])
+                        # THE PIN NOW CARRIES ITS OWN RELEASE FLOOR (Loom re-audit 7, HIGH 5) - see
+                        # _pin_release_floor(). Set here, and again below if this first window was empty.
                         diag = ("state_corrupt", {"armed_at": self.cursor,
                                                   "reason": "state file present but unusable; re-emitting the "
                                                             "visible window instead of baselining over it"})
@@ -1117,6 +1451,16 @@ class WatchTarget:
                                         if m["id"] > self.cursor and m["id"] not in self.emitted_above),
                                        key=lambda m: m["id"])
 
+                # THE CORRUPTION PIN'S RELEASE FLOOR, in ONE place so the arming poll and a later one
+                # cannot disagree (Loom re-audit 7, HIGH 5). A corrupt arm parks the watermark at
+                # min(visible)-1 so it can re-emit the whole window; that makes the ordinary release test
+                # - a complete window reaching back to at-or-below the watermark - unsatisfiable by
+                # construction, because the reach IS min(visible) and min(visible) > min(visible)-1. So
+                # the pin recorded the floor it must reach back to instead. Also set on a LATER poll when
+                # the arming window was EMPTY: there was no floor to record then, and leaving it unset
+                # would freeze the watermark exactly as before, one poll further on.
+                if self.pin_forced and self.state_corrupt and self.pin_release_at is None and items:
+                    self.pin_release_at = min(m["id"] for m in items)
                 if recovered:
                     self.lifecycle("recovered", cursor=self.cursor)
                 if diag:
@@ -1173,7 +1517,7 @@ class WatchTarget:
                         # replaces it. Leaving it set froze the watermark permanently, and because a
                         # non-pinned poll never records emitted ids, every later window re-emitted the
                         # same mail forever - the duplicate storm the pin exists to prevent.
-                        self.pin_forced = False
+                        self._release_pin()
                     pinned = not closed
                     # Alert identity is the PINNED WATERMARK, not the window floor. The floor drifts upward
                     # as new mail arrives, so keying on it re-fires for what is the same unresolved span;
@@ -1191,14 +1535,76 @@ class WatchTarget:
                                        omitted=omitted, window_floor=window_floor, cursor_at=cursor_at,
                                        reconciled=len(gap_recovered), pinned=True)
 
+                # DELIVERY IS ACKNOWLEDGED, NOT ASSUMED (Loom re-audit 7, HIGH 1). The cursor IS the
+                # acknowledgement - once it advances past an id, that message is never fetched again - so
+                # it may only advance over messages the emitter actually DELIVERED. An --exec that exits
+                # non-zero, times out, or cannot be spawned used to advance it anyway: the wake hook that
+                # is the entire point of exec mode failed, the message was never retried, and the watcher
+                # reported success. Delivery stops at the FIRST failure so a consumer never sees message
+                # N+1 before a retried N; the guarantee is at-least-once IN ORDER, because a duplicate is
+                # recoverable and a skip is not.
+                delivered, blocked_at = set(), None
                 for m in new_items:
-                    m = dict(m)
-                    m["_persona"] = self.persona
-                    self.emitter.new(m)
-                if pinned:
-                    # Watermark HELD. Remember what we delivered above it so the next poll (and any
-                    # restart, since this is persisted) neither re-emits it nor forgets the gap.
-                    self.emitted_above.update(m["id"] for m in new_items)
+                    if blocked_at is not None:
+                        break
+                    row = dict(m)
+                    row["_persona"] = self.persona
+                    if self.emitter.new(row) is True:
+                        delivered.add(m["id"])
+                    else:
+                        blocked_at = m["id"]
+                        self._delivery_failed(m["id"])
+                # THE DURABILITY BARRIER (Loom re-audit 7, MEDIUM): the event must be on stable storage
+                # BEFORE the cursor that acknowledges it. If the sink cannot be synced, NOTHING emitted
+                # this poll counts as delivered - the acknowledgement is retracted wholesale rather than
+                # left half-true.
+                if delivered and not self.emitter.sync(self.persona):
+                    blocked_at = min(delivered) if blocked_at is None else min(blocked_at, min(delivered))
+                    delivered = set()
+                if blocked_at is None:
+                    self._delivery_recovered()
+
+                if not pinned:
+                    # A COMPLETE window that reaches back past the watermark proves everything above it is
+                    # visible, so a leftover pin can be released even when there is nothing NEW to emit.
+                    # Gating this on `new_items` left a restored pin stuck forever whenever the window
+                    # contained only ids we had already delivered - the exact state a restart lands in.
+                    reach = min((m["id"] for m in items), default=None)
+                    complete = (poll.omitted == 0 and poll.consistent
+                                and reach is not None and reach <= self._pin_release_floor())
+                    if self.pin_forced and complete:
+                        # The other authoritative proof: nothing was withheld AND the window reaches back
+                        # past the watermark, so there is no span left to be uncertain about. Without this
+                        # a forced pin that never sees a gap again could never clear, and the watermark
+                        # would stay frozen for the life of the process.
+                        self._release_pin()
+                    if self.pin_forced:
+                        high = None           # still forced: the watermark holds
+                    else:
+                        high = max(sorted(delivered)
+                                   + ([max(m["id"] for m in items)] if complete else []), default=None)
+                    if blocked_at is not None and high is not None:
+                        # THE GATE ITSELF: never acknowledge past a message we could not hand over, not
+                        # even via a complete window. `complete` proves the SERVER hid nothing; it says
+                        # nothing about whether WE delivered what it showed us.
+                        high = min(high, blocked_at - 1)
+                    if high is not None and high > (self.cursor or 0):
+                        self.cursor = high
+                        # Watermark moved, so anything at or below it is confirmed and needs no tracking.
+                        self.emitted_above = {i for i in self.emitted_above if i > self.cursor}
+                        if not self.emitted_above:
+                            self.gap_alerted = None
+                            self.pin_evidence_intact = True
+
+                # EVERY DELIVERED ID THE WATERMARK DOES NOT COVER IS REMEMBERED, whatever left it
+                # uncovered (Loom re-audit 7, HIGH 5). This used to live inside the `pinned` branch
+                # alone, so the OTHER ways of not advancing - a forced pin with no gap in sight, a
+                # delivery that failed further up the batch - delivered mail and then forgot they had.
+                # The corruption pin hit exactly that: it could not advance and it recorded nothing, so
+                # it re-emitted its entire window on every poll and every restart, forever.
+                uncovered = {i for i in delivered if i > (self.cursor or 0)}
+                if uncovered:
+                    self.emitted_above.update(uncovered)
                     if len(self.emitted_above) > PIN_TRACKING_CAP:
                         # A pin that cannot clear would otherwise grow this set - and the state file -
                         # without bound. Keep the NEWEST ids (the ones a future window can still show us,
@@ -1222,31 +1628,6 @@ class WatchTarget:
                                                    % (self.cursor, dropped)),
                                            cursor_at=self.cursor, forgot=dropped,
                                            pinned=True, evidence_lost=True)
-                else:
-                    # A COMPLETE window that reaches back past the watermark proves everything above it is
-                    # visible, so a leftover pin can be released even when there is nothing NEW to emit.
-                    # Gating this on `new_items` left a restored pin stuck forever whenever the window
-                    # contained only ids we had already delivered - the exact state a restart lands in.
-                    reach = min((m["id"] for m in items), default=None)
-                    complete = poll.omitted == 0 and reach is not None and reach <= (self.cursor or 0)
-                    if self.pin_forced and complete:
-                        # The other authoritative proof: nothing was withheld AND the window reaches back
-                        # past the watermark, so there is no span left to be uncertain about. Without this
-                        # a forced pin that never sees a gap again could never clear, and the watermark
-                        # would stay frozen for the life of the process.
-                        self.pin_forced = False
-                    if self.pin_forced:
-                        high = None           # still forced: the watermark holds
-                    else:
-                        high = max([m["id"] for m in new_items]
-                                   + ([max(m["id"] for m in items)] if complete else []), default=None)
-                    if high is not None and high > (self.cursor or 0):
-                        self.cursor = high
-                        # Watermark moved, so anything at or below it is confirmed and needs no tracking.
-                        self.emitted_above = {i for i in self.emitted_above if i > self.cursor}
-                        if not self.emitted_above:
-                            self.gap_alerted = None
-                            self.pin_evidence_intact = True
 
             else:
                 self.failures += 1
@@ -1261,7 +1642,8 @@ class WatchTarget:
                                  self.emitted_above, self.gap_alerted,
                                  pin_forced=self.pin_forced,
                                  pin_evidence_intact=self.pin_evidence_intact,
-                                 state_corrupt=self.state_corrupt)
+                                 state_corrupt=self.state_corrupt,
+                                 pin_release_at=self.pin_release_at)
 
         # §9 enable the fast-path once - on the first healthy poll where the count endpoint is available.
         # (Single enable point; the max-id cursor stays the source of truth for WHAT to emit, unread is only
@@ -1521,6 +1903,9 @@ def run(args):
         seam.wait(lp_backoff if lp_backoff else args.poll_seconds)
 
     emitter.close()
+    for target in targets:
+        if target.state_file is not None:
+            target.state_file.unlock()
     return 0
 
 

@@ -5,6 +5,47 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+### Changed
+- **Delivery is now ACKNOWLEDGED rather than assumed, and the delivery guarantee is stated honestly as
+  at-least-once, in order** (Loom re-audit 7, HIGH 1). The cursor *is* the acknowledgement: once it moves
+  past an id that message is never fetched again. It previously advanced on selection, so an `--exec` that
+  exited non-zero, timed out, or failed to spawn had its result discarded and the message was silently
+  dropped - on the one path whose entire purpose is waking an agent. It now advances only over messages the
+  emitter reports as delivered (`exec` exit 0, or a successful write), stopping at the first failure so a
+  consumer never sees message N+1 ahead of a retried N. **Make your consumer idempotent**; `KIJITOMON_ID` is
+  stable across re-deliveries. This also resolves a contradiction that already existed between the README
+  ("exactly once across restarts") and DESIGN.md ("best-effort/at-most-once"); the docs now agree.
+
+### Fixed
+- **A window that withheld nothing while pointing at older mail was believed** (Loom re-audit 7, HIGH 4).
+  The server sets `next_before_id` *exactly* when rows were withheld, so "I hid nothing" and "there is more"
+  cannot both be true - and the gap check never looked at the continuation at all, so it took the first half
+  at its word and advanced over whatever the second half pointed at. Both directions of the contradiction now
+  pin. Verified against the live API across 14 pages, including the exactly-at-limit edge that could have made
+  the rule fire on healthy traffic (it does not).
+- **A malformed pin field in the state file failed open** (Loom re-audit 7, HIGH 2). `pin_forced` was read
+  as `value is True`, so a JSON `1` normalised to false and silently *unpinned* the watermark, letting the
+  replay cap cross the very span the pin was protecting; `pin_evidence_intact: 0` had the mirror bug, and
+  booleans were accepted as message ids. Every persisted field is now read strictly, and anything
+  unrecognised is treated as a corrupt state file rather than a permissive default.
+- **A persona respelled in a different case destroyed its own cursor** (Loom re-audit 7, HIGH 3). The state
+  *path* casefolds while the stored *identity* keeps the directory's spelling, so a file written as
+  `persona=Loom` was reloaded by a run that discovered `loom`, judged a mismatch, and re-baselined - skipping
+  every message since. A case-only difference now migrates the file and keeps the cursor. Deliberately
+  narrow: only the query *value* is compared case-insensitively.
+- **The corruption-recovery pin could never clear** (Loom re-audit 7, HIGH 5). It parks the watermark one
+  below the window it re-emits, which made the ordinary release test unsatisfiable by that same window - so
+  the pin held forever, the cursor froze, and because delivered ids were recorded only while a *gap* was
+  pinned, the identical window was re-emitted on every poll and across every restart. The pin now carries a
+  persisted release floor, and every delivered id the watermark does not cover is remembered whatever left it
+  uncovered. (Repairing a fail-open into a permanent fail-closed is not a repair.)
+- **A cursor could outlive the event it acknowledged** (Loom re-audit 7, MEDIUM). The state file's temp was
+  fsynced but the directory holding the rename was not, and the event sink was flushed but never fsynced.
+  Events are now fsynced *before* the cursor that acknowledges them is persisted, and the state directory is
+  fsynced after `os.replace`; a sink that cannot be synced retracts that poll's acknowledgements entirely.
+- The single-writer lock file descriptor was never released - leaked on every refused lock, and the source of
+  the suite's two `ResourceWarning`s. `StateFile.unlock()` now exists and is called on shutdown.
+
 ### Added
 - **Stranded-mail alarm.** The watcher reports mail sitting in an inbox that nothing consumes. Such mail
   is undeliverable and nothing else reports it: the sender gets a success and a message id, the recipient

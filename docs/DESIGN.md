@@ -1,8 +1,11 @@
 # Kijito Inbox Monitor: Design & Implementation Spec
 
-**Updated:** 2026-06-29 (rev 7, remote-only: watches your Kijito inbox at `api.kijito.ai`, token required;
-the `--url`/SSRF-by-class machinery is gone - see §5, §8, §11). Builds on rev 6 (v2 multi-persona +
-supervised producer). **Status:** shipped and live (v2 under launchd).
+**Updated:** 2026-07-25 (rev 8: the bounded-window / delivery-acknowledgement contracts, from seven rounds of
+adversarial audit - §5 pagination consistency, §7.0 acknowledged delivery + durability ordering, §7.3 strict
+persisted schema + corrupt-state recovery + case-only identity migration, §14.7 the three case layers).
+Rev 7 was remote-only: watches your Kijito inbox at `api.kijito.ai`, token required; the `--url`/SSRF-by-class
+machinery is gone - see §5, §8, §11. Builds on rev 6 (v2 multi-persona + supervised producer).
+**Status:** shipped and live (v2 under launchd).
 
 **Goal:** give Kijito a solid, usable client-side liveness watcher for its built-in inbox. The concrete
 Kijito-inbox monitor is the win. Agnosticism is a means (generalize only where it makes the tool more
@@ -61,8 +64,23 @@ v1 ships one adapter (`http-poll`, the Kijito reference). Future adapters are ex
   the `mark_read=false` URL. (Triple-confirmed; the original seed was fixed for this.)
 - **`id` is a SERIAL PK, so it is strictly monotonic** (schema.py:168), with gaps allowed. The cursor keys on
   max-id, never on read/unread state.
-- **No pagination:** the response is a full list (seen at 148K/539 msgs). Emit only the diff (id > cursor); never
-  dump the body.
+- ⚠️ **The window is BOUNDED and PAGINATED** (this supersedes the original "no pagination: the response is a full
+  list" note, which was true when it was audited and is not now - and assuming it still held is how a bounded window
+  turns into permanent mail loss). The endpoint returns the **newest** rows that fit a count limit AND an aggregate content budget, and
+  declares what it left out via `truncated` (rows withheld, quantity NOT stated), `size_dropped` (exactly N rows
+  withheld) and `size_truncated` (a lone oversized message had its BODY clipped - no row withheld, so it is NOT an
+  omission). Older rows are reached by passing the OLDEST id you were returned back as `before_id`.
+- **The omission declaration and the continuation are two halves of ONE statement.** The server sets
+  `next_before_id = <oldest row returned> if (truncated or size_dropped) else null` - "present exactly when mail was
+  withheld". So a window withheld rows **if and only if** it hands back a continuation, and either half contradicting
+  the other is a contract violation that PINS rather than something to interpret:
+  - withheld rows + `next_before_id: null` → "I hid rows" and "there is nothing older" (Loom re-audit 6, HIGH 3);
+  - withheld nothing + a non-null `next_before_id` → "I hid nothing" and "there is more" (Loom re-audit 7, HIGH 4).
+  The second also follows from how the window is BUILT: a page returns every older row that fit, so if it withheld
+  nothing there is nothing older left to point at. Believing either half steps over what the other one asserts.
+  Verified live across 14 pages including the exactly-at-limit edge (a page returning exactly `limit` rows with more
+  behind it declares `truncated: true`; one that exactly exhausts the mailbox declares nothing and terminates), so
+  the check cannot fire on healthy traffic. Emit only the diff (id > cursor); never dump the body.
 - **Auth:** a Kijito API token is **required** (the API is authenticated). Supply it via `$KIJITOMON_TOKEN` or
   `--token-file` (file wins over env); it is injected as `Authorization: Bearer <token>`, or with `--auth-header NAME`
   as `NAME: <token>` verbatim. The header name (`--auth-header`) and the token-value source are independent axes. A
@@ -137,8 +155,23 @@ holds the cursor back, per §7.0).
 - **`armed` fires on the first healthy poll** (never before a fetch). There is exactly one `armed` per (re)arm,
   carrying the post-decision `cursor`. A failed first poll does not baseline (it's a §7.1 failure; `armed` waits).
 - **Each healthy poll:** select items with `id > cursor`; sort ascending; emit one `new` per item; then advance
-  `cursor` to the max id in the selected diff, unconditionally. The cursor advances on selection, not emit success.
-  Emit is best-effort/at-most-once: an exec failure neither holds back nor re-emits. `cursor` is monotonic.
+  `cursor` **only over what was ACKNOWLEDGED**. `cursor` is monotonic.
+  - **The cursor IS the acknowledgement** (Loom re-audit 7, HIGH 1). Advancing past an id means that message is
+    never fetched again, so it may only advance over a message the emitter reports as delivered: `exec` exit 0,
+    or a successful write to the events file/stdout. A non-zero exit, an exec timeout, a failed spawn or a failed
+    write is **not** a delivery: the cursor holds below that id and the message is re-delivered next poll. This
+    replaces the previous "best-effort/at-most-once, an exec failure neither holds back nor re-emits" contract,
+    which silently dropped mail on the one path (`--exec`) whose entire purpose is waking an agent - while the
+    README promised exactly-once. Two documents cannot state opposite guarantees; this one is the guarantee.
+  - **Delivery stops at the FIRST failure in a batch**, so a consumer never sees message N+1 ahead of a retried N.
+    The guarantee is **at-least-once, IN ORDER**; consumers must be idempotent on `id`.
+  - A `--suppress-author` drop is a deliberate POLICY drop and counts as acknowledged (otherwise suppressing an
+    author would pin the watermark on that author's next message forever).
+  - **Durability ordering** (Loom re-audit 7, MEDIUM): the event is `fsync`ed BEFORE the cursor that acknowledges
+    it is persisted, and the state-file's directory is `fsync`ed after `os.replace` so the rename itself is
+    durable. Otherwise a power loss can leave a cursor that has forgotten an event no consumer ever received.
+    If the sink cannot be synced, NOTHING emitted in that poll counts as delivered - the acknowledgement is
+    withdrawn wholesale rather than left half-true.
 - **First-healthy-poll branches** (mutually exclusive; each emits exactly one `armed`):
   - **UNSET baseline** (cursor was UNSET, including a state-file resume whose cursor was `null`): `cursor = max(id)`
     (or 0 if empty); emit `armed`; no `new`, no cap (nothing to replay). This branch is exempt from the cap.
@@ -175,7 +208,14 @@ read-state-neutral (DONE-WHEN #5 holds after self-test).
 
 ### 7.3 State persistence (`--state-file PATH`, optional, recommended under a supervisor)
 - **Content (JSON):** `{"identity":<canonical-id>, "cursor":<int|null>, "state":"UP|DOWN",
-  "consecutive_failures":<int>}`.
+  "consecutive_failures":<int>}`, plus the optional pin fields written only when they are in force:
+  `emitted_above` (list of int), `gap_alerted` (int), `pin_forced` (true), `pin_evidence_intact` (false),
+  `state_corrupt` (true), `pin_release_at` (int).
+- **Every persisted field is read STRICTLY, and anything unrecognised fails CLOSED** (Loom re-audit 7, HIGH 2).
+  Booleans must be JSON booleans and integers must be real integers - a JSON `1` for `pin_forced` used to
+  normalise to `false` and silently UNPIN the watermark, letting the replay cap cross the very span the pin was
+  protecting; `pin_evidence_intact: 0` had the mirror bug. A malformed field is evidence the file cannot be
+  trusted, so it is treated as CORRUPT (below), never as a permissive default. `true` is not a message id.
 - **Canonical identity (`<canonical-id>`)** is computed before DNS resolution so trivial URL variations don't flip
   it. From the effective inbox URL, it is the tuple `(scheme.lower(), host.lower(), effective_port, path,
   sorted(query_params except the constant mark_read))`. Normalize by stripping a trailing `/` on path, filling the
@@ -188,11 +228,31 @@ read-state-neutral (DONE-WHEN #5 holds after self-test).
 - **Write:** after each poll, write atomically: `mkstemp` in the same dir, then write, `fsync`, `os.replace`;
   best-effort remove of stale temps.
 - **Resume validity:** valid iff it parses as the schema (integer-or-null `cursor`, `state ∈ {UP,DOWN}`, integer
-  `consecutive_failures`) and `identity` equals the current canonical-id. On a valid match, resume per §7.0 (cursor
-  unless `--seed-at` overrides; FSM always). On an identity mismatch, do not resume the cursor (it would yield a
-  silently-blind watcher): log a loud warning, re-baseline the cursor as UNSET, and start the FSM fresh (UP/0). A
-  parse/schema-invalid or empty file is treated as absent (fall through). A present-but-unreadable path is a fatal
-  config error.
+  `consecutive_failures`) and `identity` matches the current canonical-id. On a valid match, resume per §7.0 (cursor
+  unless `--seed-at` overrides; FSM always). A present-but-unreadable path is a fatal config error.
+- **ABSENT and CORRUPT are different answers, and the difference is the whole point** (Loom re-audit 5 HIGH 2,
+  re-audit 6 HIGH 4). ⚠️ This supersedes the earlier "a parse/schema-invalid or empty file is treated as absent
+  (fall through)" contract, which was the exact fail-open it describes:
+  - **Absent** (no file) → first launch → baseline the cursor to the newest visible id.
+  - **Present but unusable** - unparseable, zero-byte/whitespace, valid-envelope-with-invalid-fields, or a
+    malformed pin field → **CORRUPT**. A file that EXISTS is evidence a cursor existed here, so baselining would
+    silently skip everything between that lost cursor and now. Instead the watcher arms **below** the visible
+    window (`cursor = min(visible) - 1`), re-emits that window, forces the pin, marks its evidence unusable, and
+    emits a `state_corrupt` diagnostic. Duplicates are recoverable; skips are not.
+  - **The corruption pin must be DISCHARGEABLE** (Loom re-audit 7, HIGH 5). Because it parks the watermark one
+    below the window it re-emits, the ordinary release test ("a complete window reaches back to at-or-below the
+    watermark") can never be met by that window - its floor is always `cursor+1`. So the pin records
+    `pin_release_at = min(visible)`, persisted with it, and releases when a complete window reaches that floor.
+    A fail-open repaired into a permanent fail-closed is not a repair: it re-emitted the same window on every
+    poll, forever, across restarts.
+- **Identity mismatch → re-baseline, EXCEPT a case-only difference, which MIGRATES** (Loom re-audit 7, HIGH 3).
+  A mismatch normally means a different source, so the cursor is not resumed (that would yield a silently-blind
+  watcher): log a loud warning, re-baseline the cursor as UNSET, start the FSM fresh (UP/0). But the state PATH
+  casefolds the persona while the identity keeps the directory's spelling, so one file written as `persona=Loom`
+  is reloaded by a run that discovered `loom` - and "mismatch" there destroys a live cursor and skips everything
+  since. When the stored identity differs ONLY by the case of a query VALUE (scheme, host, port, path and every
+  query KEY must match exactly), it is the same watched source spelled differently: resume it and rewrite the
+  identity on the next save. See §14.7 - this is a THIRD case layer, not a harmonisation of the other two.
 - **Without `--state-file`:** no lock and no persistence, so the FSM is per-process (a restart resets it), and two
   no-state watchers for the same inbox would both emit `new` (duplicate delivery; they don't corrupt read-state since
   both peek, but the harness is woken twice). Run a single instance, or use `--state-file` under a supervisor (which
@@ -404,3 +464,26 @@ success.)
 - **Marketplace** surfacing, at launch-time.
 - **Codex-side consumer bridge:** Codex sessions aren't yet woken by their event file; the Claude harness Monitor
   tool is the native consumer (done).
+
+
+### 14.7 The three case layers (they point different ways ON PURPOSE - do not "harmonise" them)
+
+Reading the source, the case rules look inconsistent and invite a tidy-up. They are not: they answer different
+questions about different systems. `CaseAsymmetryInvariantTest` is the defence, and it fails BOTH harmonisations.
+
+1. **PATH (`_state_safe_persona`) CASEFOLDS.** The local filesystem is case-INSENSITIVE (APFS, NTFS), so
+   `Claude-chat` and `claude-chat` name the SAME file. Not casefolding made the producer block on a flock it
+   already held, leaving that persona with no event stream at all - a silent wake gap.
+2. **SERVER NAMESPACE (`stranded_inboxes`) DOES NOT CASEFOLD.** The server's inbox namespace is case-SENSITIVE:
+   the `Claude-chat` inbox held a genuinely different message set from `claude-chat`. Casefolding here merges two
+   real inboxes and hides stranded mail - shipped that way for an hour, and it stopped detecting the very incident
+   it exists for.
+3. **STATE-FILE IDENTITY (`identity_migratable`) MIGRATES A CASE-ONLY DIFFERENCE** (Loom re-audit 7, HIGH 3). This
+   follows FROM layer 1 rather than contradicting layer 2: because the path already collapses the variants, ONE
+   state file can only ever describe ONE of them, so a casefold-equal identity in that file is the same watched
+   source spelled differently - a migration to accept and rewrite, not a different source to baseline over.
+   Deliberately narrow: only the query VALUE is compared case-insensitively; scheme, host, port, path and every
+   query KEY must match exactly, so nothing here invents case-insensitivity for a URL path.
+
+The variant inbox remains unwatchable locally (layer 1) AND unwatched remotely (layer 2), which is precisely why
+it is ALARMED on rather than adopted - while layer 3 keeps a live cursor from being destroyed by a spelling change.

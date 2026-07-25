@@ -205,8 +205,17 @@ Every event also carries `KIJITOMON_EVENT`, `KIJITOMON_SOURCE`, `KIJITOMON_TS`, 
 `KIJITOMON_PERSONA`. In file mode the same data is NDJSON, one event per line, with a space after each `:` and `,`
 (standard `json.dumps`): `{"event": "new", "id": 41, "from": "river", "persona": "testbot", ...}` - so a filter
 like `grep '"event": "new"'` matches.
-The watcher peeks (never marks your mail read) and dedupes by the monotonic message id, so you get each message
-exactly once across restarts.
+The watcher peeks (never marks your mail read) and dedupes by the monotonic message id.
+
+**Delivery guarantee: at-least-once, in order.** The cursor is an *acknowledgement* - it advances only past a
+message the emitter actually delivered, and delivery stops at the first failure so you never see message N+1
+before a retried N. In `exec-per-event` mode your command's **exit status is the acknowledgement**: exit 0 and
+the watcher moves on; exit non-zero (or time out) and it holds the cursor and re-delivers on the next poll. In
+file mode the event is `fsync`ed before the cursor that acknowledges it is persisted, so a power loss cannot
+leave a cursor that has forgotten mail nobody received. In the steady state each message arrives exactly once;
+after a failed hand-off, a timeout, or a crash between the event and the cursor write you may see one again, so
+**make your consumer idempotent** - `KIJITOMON_ID` is stable across re-deliveries for exactly that purpose.
+Duplicates are recoverable and skips are not, which is why the guarantee leans this way.
 
 ### Bounded windows
 
