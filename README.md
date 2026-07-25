@@ -197,7 +197,7 @@ Each line of the events file (and each `exec-per-event` invocation) is one event
 |---------|---------|----------------------|
 | `armed` | emitted once per persona on the first healthy poll (baseline set) | `KIJITOMON_CURSOR` |
 | `new` | a new inbox message | `KIJITOMON_ID`, `KIJITOMON_FROM`, `KIJITOMON_CONTENT`, `KIJITOMON_CREATED`, `KIJITOMON_PERSONA` |
-| `alert` | the source has been unreachable for `--alert-after` polls (dead-man), **or** mail is stranded in an inbox nobody watches (see below) | `KIJITOMON_REASON`, `KIJITOMON_FAILURES`, `KIJITOMON_STRANDED` |
+| `alert` | the source has been unreachable for `--alert-after` polls (dead-man), **or** mail is stranded in an inbox nobody watches, **or** the server holds unread mail this window did not show (all below) | `KIJITOMON_REASON`, `KIJITOMON_FAILURES`, `KIJITOMON_STRANDED` |
 | `recovered` | the source came back after an `alert` | `KIJITOMON_CURSOR` |
 | `heartbeat` | optional liveness tick (`--heartbeat N`) | `KIJITOMON_CURSOR` |
 
@@ -275,6 +275,33 @@ Three details matter if you consume these:
 
 Disable with `--no-stranded-alerts` if you keep deliberate test inboxes. Prefer draining them instead - an alarm
 you have trained everyone to ignore is one that has been disabled without anyone deciding to disable it.
+
+### Unread mail outside the window
+
+Alongside the declaration of *what it dropped*, the inbox endpoint reports `unread_not_shown`: how many
+unread messages it holds that this response did not hand you. The watcher raises an `alert` when that count
+is above zero.
+
+```json
+{"event": "alert", "source": "kijito-inbox", "persona": "you",
+ "reason": "unread-not-shown: the server reports 3 unread message(s) in this inbox that this window did not include. ...",
+ "unread_not_shown": 3, "window_floor": 1204, "cursor_at": 1180, "above_watermark": true}
+```
+
+It is an **observation, not a diagnosis**, and worth reading literally. The count covers unread mail
+*anywhere* in the inbox - including messages this watcher already delivered to your stream that you simply
+have not read - so on its own it is not evidence that anything was missed. `above_watermark` is the fact
+that separates the two cases: when it is `false`, the window reached back past the watcher's cursor, so
+everything above the cursor was visible and the unseen unread can only be mail already delivered. Coverage
+of an un-emitted span is still established by the backward walk above; this count is a cheap signal, never
+proof. Like the stranded alarm it clears itself when the condition goes away, and it has no ack.
+
+**If you page the API yourself, do not reuse this field as a general "is anything hidden" check.** The
+server computes it only when it withheld something, so it is `0` **by construction** on a page with nothing
+older - and the last page of a backward walk is exactly that page. Measured against a live inbox holding
+four unread messages: the newest page reported `0` (correctly - all four were in it), a mid-walk page
+reported `4` (the whole inbox's unread, not that window's), and the terminal page reported `0` while all
+four sat above it. Only the newest page's count answers the question "is there unread mail I cannot see".
 
 ## CLI
 

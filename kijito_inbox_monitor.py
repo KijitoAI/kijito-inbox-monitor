@@ -152,7 +152,8 @@ class Poll:
     then advances past them. The truncation is not silent in the DATA - only in the handling of it.
     """
     def __init__(self, ok, items=None, reason=None, status=None, redirected=False, omitted=0,
-                 omitted_exact=True, next_before_id=None, continuation_ok=True, consistent=True):
+                 omitted_exact=True, next_before_id=None, continuation_ok=True, consistent=True,
+                 unread_not_shown=None):
         self.ok = ok
         self.items = items
         self.reason = reason
@@ -170,6 +171,10 @@ class Poll:
         # be walked through; it PINS. Both directions of the contradiction are covered, not just the
         # one that happens to have been seen in the wild.
         self.consistent = consistent
+        # Unread mail the server holds that this response did NOT hand us. None = the server did not say
+        # (older API), which is NOT the same as 0 - see _hidden_unread() for why that distinction is the
+        # whole safety property of this field.
+        self.unread_not_shown = unread_not_shown
 
 
 def fetch(opener, url, headers):
@@ -246,8 +251,14 @@ def fetch_from_payload(data, status=200):
             consistent = False
         elif not n and nb is not None:
             consistent = False
+    uns = data.get("unread_not_shown")
+    # A non-int (absent, null, a string, a float) means the server made NO statement. Coercing that to 0
+    # would manufacture a "nothing is hidden" assertion out of silence - the exact inversion this field
+    # exists to avoid. Negative is nonsense from a count, so it is also treated as no statement.
     return Poll(True, items=items, status=status, omitted=n, omitted_exact=exact,
-                next_before_id=nb, continuation_ok=nb_ok, consistent=consistent)
+                next_before_id=nb, continuation_ok=nb_ok, consistent=consistent,
+                unread_not_shown=uns if isinstance(uns, int) and not isinstance(uns, bool) and uns >= 0
+                else None)
 
 
 def _declared_omissions(data):
@@ -1205,10 +1216,14 @@ class StateFile:
                              "whole file as CORRUPT (fail closed) rather than resuming a state we cannot "
                              "read: %s\n" % self.path)
             return CORRUPT_STATE
+        # Whether the unread-not-shown alarm is currently ANNOUNCED. Absent (older file) reads as False:
+        # a re-announce after an upgrade costs one event and is honest about the current condition,
+        # whereas defaulting to True would silence a live condition for the rest of the run.
+        hidden = d.get("unread_hidden") is True
         return {"cursor": cursor, "state": state, "failures": failures, "emitted_above": emitted,
                 "gap_alerted": alerted, "pin_evidence_intact": intact,
                 "pin_forced": pin_forced, "pin_release_at": release_at,
-                "state_corrupt": state_corrupt}
+                "state_corrupt": state_corrupt, "unread_hidden": hidden}
 
     def unlock(self):
         """Release the single-writer flock and close the sidecar fd.
@@ -1224,7 +1239,8 @@ class StateFile:
                 self._lockf = None
 
     def save(self, cursor, state, failures, emitted_above=None, gap_alerted=None,
-             pin_forced=False, pin_evidence_intact=True, state_corrupt=False, pin_release_at=None):
+             pin_forced=False, pin_evidence_intact=True, state_corrupt=False, pin_release_at=None,
+             unread_hidden=False):
         """Persist the cursor. Returns True IFF the write is DURABLE (Loom re-audit 8, HIGH 3).
 
         The directory fsync used to be called and its answer thrown away, so a failure returned success
@@ -1255,6 +1271,11 @@ class StateFile:
         # condition does not survive a restart is a pin that can never clear.
         if pin_release_at is not None:
             d["pin_release_at"] = pin_release_at
+        # Same reason, for the unread-not-shown alarm: KeepAlive restarts a crashing producer, and an
+        # un-persisted suppression would turn a crash loop into a wake storm on a condition nobody can
+        # act on any faster for being told twice.
+        if unread_hidden:
+            d["unread_hidden"] = True
         dirn = os.path.dirname(os.path.abspath(self.path)) or "."
         _makedirs_private(dirn)
         fd, tmp = tempfile.mkstemp(dir=dirn, prefix=".kijmon-", suffix=".tmp")
@@ -1518,6 +1539,13 @@ class WatchTarget:
         self.pin_release_at = None
         self.delivery_blocked = False  # an emit failed; the cursor is held below it until it succeeds
         self.state_not_durable = False  # the last cursor write could not be proven durable
+        # Is the unread-not-shown alarm currently ANNOUNCED? Keyed on the CONDITION, so it self-clears
+        # (§5.2). One flag per target, so the key is per-inbox and EXACT - a case-variant persona is a
+        # different WatchTarget with a different flag, and cannot hold this one's alarm down.
+        self.unread_hidden = False
+        # Does the persona DIRECTORY know this inbox? Optimistic by default: see poll_once() for why this
+        # alarm fails OPEN where the stranded-mail alarm fails closed.
+        self.directory_backed = True
 
         self.count_url = NOTIFY_PENDING_URL
         cp = urllib.parse.urlsplit(url)
@@ -1549,6 +1577,7 @@ class WatchTarget:
                     # A persisted forced pin is authoritative; the inference from missing tracking is only
                     # a fallback for files written before the flag existed.
                     self.pin_forced = loaded["pin_forced"] or not loaded["pin_evidence_intact"]
+                    self.unread_hidden = loaded["unread_hidden"]
         if args.seed_at is not None:
             self.cursor = args.seed_at
 
@@ -1717,6 +1746,44 @@ class WatchTarget:
         if floor <= self.cursor:
             return None
         return (self.cursor, floor, declared, exact)
+
+    def _hidden_unread(self, poll):
+        """Does the server hold unread mail this window did not show us? True / False / None (NO CLAIM).
+
+        §5.2 A CHEAP ALARM SIGNAL - deliberately NOT a coverage mechanism. `unread_not_shown` is a COUNT
+        with no cursor of its own, so it can say THAT something is out of view but never WHICH rows;
+        coverage stays with the backward walk, which terminates (§5.1). This answers only the alarm
+        question "is there unread mail I cannot see", where a superset is the right answer because you
+        want to know regardless of WHY the mail is absent.
+
+        THE TRAP, AND IT INVERTS THE OBVIOUS READING OF A ZERO. The server computes this field ONLY
+        when it withheld something; otherwise it is 0 BY CONSTRUCTION. So `== 0` does NOT assert "no
+        unread mail exists". VERIFIED LIVE against api.kijito.ai on a real inbox holding 4 unread:
+            newest page      next_before_id=1179  unread_not_shown=0   <- computed, and truly nothing hidden
+            walk page        next_before_id=1145  unread_not_shown=4   <- the whole inbox's unread, not this window's
+            terminal page    next_before_id=null  unread_not_shown=0   <- 0 WITH 4 UNREAD SITTING ABOVE IT
+        Reading that last 0 as "clear" is the false-negative this method exists to refuse. A FALSE
+        assertion is therefore only avoidable by requiring POSITIVE evidence for the negative answer,
+        never by trusting the number - which is why the two False branches below are justified by
+        DIFFERENT facts and are not the redundancy they look like.
+
+        EVALUATE ONLY ON THE NEWEST-PAGE POLL. On a backward-walk page `next_before_id is None` means
+        merely "nothing OLDER than this page", not "nothing outside this window" - the terminal-page row
+        above is exactly that case. poll_once() calls this with the un-cursored poll only, so the walk
+        pages structurally cannot reach it.
+        """
+        n = poll.unread_not_shown
+        if n is None:
+            return None          # server made no statement (older API) -> assert nothing in either direction
+        if n > 0:
+            return True          # unread mail exists that this response did not include
+        if poll.next_before_id is not None:
+            return False         # the 0 was genuinely COMPUTED against a withheld remainder
+        if poll.omitted == 0:
+            return False         # complete window: nothing older exists and nothing was withheld
+        # Contradictory: rows were declared omitted, yet no cursor leads to them. The 0 is unexplained,
+        # so make no claim rather than report a clear we cannot justify.
+        return None
 
     def _walk_back(self, from_id, stop_at):
         """Page BACKWARD over (stop_at, from_id) and return (rows, covered).
@@ -1911,6 +1978,7 @@ class WatchTarget:
                 # The server returns the NEWEST messages that fit, and declares what it left out. If it
                 # omitted anything AND the window does not reach back to our cursor, un-emitted mail can
                 # be sitting in the uncovered gap - and advancing the cursor past it loses it forever.
+                window_cursor = self.cursor   # the watermark AS THIS WINDOW SAW IT, before any advance
                 gap = self._uncovered_gap(poll, items)
                 pinned = False
                 release_earned = False
@@ -2010,6 +2078,52 @@ class WatchTarget:
                     delivered = set()
                 if blocked_at is None:
                     self._delivery_recovered()
+
+                # §5.2 UNREAD MAIL WE CANNOT SEE. Fires on the FALSE->TRUE edge and releases itself when
+                # the condition clears, so it needs no ack: an ack would let someone silence "there is
+                # mail you are not being shown" while it was still true.
+                hidden = self._hidden_unread(poll)
+                if hidden is True:
+                    # Routed like the stranded-mail alarm, but failing the OPPOSITE way on purpose. That
+                    # one withholds when the directory is unknown because alarming would flag EVERY
+                    # persona; this one concerns the target's OWN inbox, so the worst case of firing is a
+                    # line in a stream nobody reads, while the worst case of withholding is the silent
+                    # wake gap this whole tool exists to prevent. Suppressed only for an inbox the
+                    # directory positively does not know - and the flag is then left UNSET so the alarm
+                    # can still announce itself if that inbox later becomes directory-backed.
+                    if not self.unread_hidden and self.directory_backed:
+                        floor = min((m["id"] for m in items), default=None)
+                        unread_reason = (
+                            "unread-not-shown: the server reports %d unread message(s) in this "
+                            "inbox that this window did not include. OBSERVATION, NOT A "
+                            "DIAGNOSIS: the count covers unread mail ANYWHERE in the inbox, "
+                            "including messages already delivered to this stream that the agent "
+                            "has not read, so it is not by itself evidence of missed mail. "
+                            "Coverage of an un-emitted span is proven by the backward walk, "
+                            "never by this count." % poll.unread_not_shown)
+                        # ★ LATCH ONLY ON DELIVERY, and go through _alarm for the stderr fallback
+                        # (re-audit 11, F1 - this feature predates that rule and was written against the
+                        # old `lifecycle` + commit-first shape). `unread_hidden` is a PURE ANNOUNCEMENT
+                        # LATCH: it drives no behaviour, it only records "this condition was announced",
+                        # and it is PERSISTED - so committing it before the emit would suppress an
+                        # UNDELIVERED alarm for the life of the condition AND across restarts. The
+                        # condition is re-derived every poll, so re-raising costs nothing and self-clears
+                        # the moment it is genuinely delivered. See [[22470]] for the discriminating
+                        # question (announcement latch vs behavioural state).
+                        if self._alarm("alert", unread_reason,
+                                       reason=unread_reason,
+                                       unread_not_shown=poll.unread_not_shown,
+                                       window_floor=floor, cursor_at=window_cursor,
+                                       # The discriminating FACT, left for the reader to interpret: when
+                                       # the window reaches back past the watermark, everything above it
+                                       # is visible, so the unseen unread can only be mail already
+                                       # delivered.
+                                       above_watermark=(None if floor is None or window_cursor is None
+                                                        else floor > window_cursor)):
+                            self.unread_hidden = True
+                elif hidden is False:
+                    self.unread_hidden = False   # condition cleared -> re-arm, so a recurrence is announced
+                # hidden is None -> the server made no statement; hold the current state and claim nothing
 
                 # ★ A PIN IS NOT DISCHARGED ON A POLL THAT COULD NOT DELIVER (found by adversarially
                 # re-reading my own round-7 work, the way loom would). Both proofs answer "did the SERVER
@@ -2122,7 +2236,8 @@ class WatchTarget:
                                  pin_forced=self.pin_forced,
                                  pin_evidence_intact=self.pin_evidence_intact,
                                  state_corrupt=self.state_corrupt,
-                                 pin_release_at=self.pin_release_at)
+                                 pin_release_at=self.pin_release_at,
+                                 unread_hidden=self.unread_hidden)
             # ★ CONSUME THE ANSWER (Loom re-audit 9, MEDIUM). Round 8 taught me to RETURN a durability
             # status; this is the same defect one layer out - I produced an answer and then discarded it
             # at the call site, which is the exact thing the previous round was about. A cursor whose
@@ -2199,6 +2314,30 @@ def discover_from_counts(args, counts, targets, opener_by_origin, headers, emitt
             current.add(persona.casefold())
             target.lifecycle("persona_added")
     return added
+
+
+def refresh_directory_backing(args, directory, targets):
+    """Mark each target with whether the persona DIRECTORY knows its inbox (§5.2 alarm routing).
+
+    Refreshed EVERY tick rather than stamped when a target is built, because a brand-new persona's first
+    mail arrives through discover_from_counts BEFORE the periodic /api/personas rescan sees it: a
+    creation-time flag would brand a perfectly real persona as unbacked and then never revisit it, since
+    rediscovery skips personas already watched.
+
+    Compared EXACTLY, never casefolded - the same asymmetry as stranded_inboxes(). The server's inbox
+    namespace is case-SENSITIVE, so a case-variant is a DIFFERENT inbox and must not inherit the real
+    one's backing.
+
+    Two no-ops, both deliberate: an explicit --persona/--personas subset was hand-picked by an operator
+    who is by definition consuming those streams, and an EMPTY directory is missing data rather than
+    evidence of absence. In both cases the existing (optimistic) value stands.
+    """
+    if not watches_all_personas(args) or not directory:
+        return
+    known = {p for p in directory if p}
+    for target in targets:
+        if target.persona:
+            target.directory_backed = target.persona in known
 
 
 _REPORTED_STRANDED = set()
@@ -2381,6 +2520,7 @@ def run(args):
             discover_from_counts(args, unread_counts, targets, opener_by_origin, headers, emitter)
             if not args.no_stranded_alerts:
                 report_stranded_inboxes(directory_personas, unread_counts, targets, emitter)
+        refresh_directory_backing(args, directory_personas, targets)
         for target in targets:
             target.poll_once(counts_available, unread_counts)
         if seam.stop:

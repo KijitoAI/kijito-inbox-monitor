@@ -81,6 +81,11 @@ v1 ships one adapter (`http-poll`, the Kijito reference). Future adapters are ex
   Verified live across 14 pages including the exactly-at-limit edge (a page returning exactly `limit` rows with more
   behind it declares `truncated: true`; one that exactly exhausts the mailbox declares nothing and terminates), so
   the check cannot fire on healthy traffic. Emit only the diff (id > cursor); never dump the body.
+- **The window ALSO declares `unread_not_shown`** - how much unread mail the inbox holds that this response did
+  not hand over. It is a separate axis from the omission/continuation pair above: those describe THIS WINDOW's
+  completeness, while `unread_not_shown` counts unread mail anywhere in the inbox, including messages already
+  emitted to the stream that the agent simply has not read. So it is an OBSERVATION, never a diagnosis of missed
+  mail, and coverage of an un-emitted span is proven by the backward walk, never by this count (§5.2).
 - **Auth:** a Kijito API token is **required** (the API is authenticated). Supply it via `$KIJITOMON_TOKEN` or
   `--token-file` (file wins over env); it is injected as `Authorization: Bearer <token>`, or with `--auth-header NAME`
   as `NAME: <token>` verbatim. The header name (`--auth-header`) and the token-value source are independent axes. A
@@ -97,6 +102,64 @@ v1 ships one adapter (`http-poll`, the Kijito reference). Future adapters are ex
   dead-man's-switch).
 - **Config:** `poll_seconds` (default 60). The destination is the hard-baked Kijito API inbox URL including
   `mark_read=false`; only the persona varies.
+
+### 5.1 A bounded window must not silently swallow mail (fail closed)
+
+The cursor is a **confirmed-contiguous watermark**: everything at or below it is known delivered. It may only
+advance over a span the watcher has actually seen.
+
+- **The discriminator.** If the returned window reaches back *past* the cursor, every omitted message is older
+  than the watermark and was already delivered - the ordinary case, since long-polling keeps the backlog to a
+  message or two. If the window starts *above* the cursor while the server admits it dropped rows, the span
+  between them may hold mail never emitted.
+- **Coverage comes from EXHAUSTION, not arithmetic.** `truncated` says rows were withheld without saying how
+  many, so no count can prove a span empty - a single recovered message would "close" an unbounded hole. The
+  watcher instead pages BACKWARD with `before_id` until it reaches the watermark or the chain ends. Walking
+  terminates; counting cannot. This is also what makes an *inexact* omission closable at all, and it reaches
+  mail someone has already read, which an unread-only reconcile structurally cannot see.
+- **A walk that does not complete is not coverage.** Transient failure, a non-advancing cursor, or the
+  `WALK_BACK_MAX_PAGES` budget leaves the watermark **PINNED** and raises an `alert`. Visible mail keeps
+  flowing while pinned; ids emitted above the pin are remembered (and persisted) so nothing is re-delivered.
+- **Pagination contract:** pass the OLDEST id you were returned as `before_id`; repeat until the page is empty
+  or `next_before_id` is null; OMIT the parameter for the newest page, because `0` is a real cursor rather
+  than "no cursor". A malformed cursor is a hard 400, never a silent fallback to the newest page - that
+  loudness is what makes a completed walk usable as evidence. Order by **`id`**, never `created`: timestamps
+  are stamped pre-lock while ids are assigned under it, so concurrent senders invert.
+
+### 5.2 `unread_not_shown`: a cheap alarm, never a coverage mechanism
+
+`unread_not_shown` reports how many unread messages the server holds that this response did not hand back
+(`max(0, unread_count - rows_returned_still_unread)`, evaluated after this fetch's `mark_read`). Above zero,
+the watcher raises an `alert`; it is a superset of "withheld by the budget", which is the right answer for an
+alarm because you want to know regardless of *why* mail is absent.
+
+Three properties keep it honest:
+
+- **It is an observation, not a diagnosis.** The count covers unread mail anywhere in the inbox, including
+  messages this watcher already delivered that the agent never read, so it is not by itself evidence of missed
+  mail. The event carries `above_watermark` - whether the window floor sits above the cursor - as the
+  discriminating fact, and leaves the interpretation to the reader. Coverage stays with §5.1's walk: this is a
+  COUNT with no cursor of its own, so it can say THAT something is out of view but never WHICH rows.
+- **A zero is not self-justifying.** The server computes the field ONLY when it withheld something;
+  otherwise it is `0` **by construction**. So the negative answer requires positive evidence - either the zero
+  was genuinely computed (`next_before_id` is not null), or the window is structurally complete (nothing older
+  and nothing withheld). A count the server never stated at all is a THIRD state, and asserts nothing in
+  either direction; coercing that silence to `0` would manufacture an all-clear.
+- **Evaluate it on the NEWEST-PAGE poll only.** On a backward-walk page, `next_before_id is null` means
+  merely "nothing older than this page". Measured live against an inbox holding four unread: the newest page
+  reported `0` (correct - all four were in it), a mid-walk page reported `4` (the whole inbox's unread, not
+  that window's), and the terminal page reported `0` with all four sitting above it. Feeding walk pages to the
+  check would invent alarms and clear real ones.
+
+It is evaluated on full inbox polls only, so the §9 fast path (which skips the inbox fetch while the unread
+count is not rising) can delay it by at most `--resync-every` skips. That is acceptable for an alarm whose
+whole point is cheapness: the condition it reports is not one anybody can act on faster for hearing sooner.
+
+Routing follows the stranded-mail alarm - an `alert` rather than a new event name, no ack, self-clearing when
+the condition goes away - but fails the OPPOSITE way on an unknown directory. The stranded alarm withholds,
+because alarming with no directory would flag every persona; this one concerns the target's own inbox, where
+the worst case of firing is a line in a stream nobody reads and the worst case of withholding is the silent
+wake gap the tool exists to prevent.
 
 ## 6. Emit modes (portability)
 
