@@ -280,6 +280,28 @@ read-state-neutral (DONE-WHEN #5 holds after self-test).
   Per-request timeout default is 5s. Stdlib: no-redirect via `HTTPRedirectHandler.redirect_request → None`; IP-pin via
   a custom `HTTPConnection` through `do_open`; `urlopen(timeout=)`.
 - **Creds via env/file, never argv** (`$KIJITOMON_TOKEN` / `--token-file`; §5 for header and precedence).
+- ⚠️ **ON-DISK CONFIDENTIALITY: THE EVENT STREAM IS AS SENSITIVE AS THE TOKEN** (Loom re-audit 8 HIGH 1,
+  re-audit 9 HIGH 1/2). It contains message bodies unless `--no-content`. Attention naturally follows the
+  word "secret", so the token was 0600 from the start while the file full of plaintext was created with a
+  plain `open()` and inherited the umask - 0644 on any normal machine, verified live across 53 files.
+  The contract now:
+  - Event streams, their rotated archives, the state file and its lock sidecar are **exactly 0600**; every
+    directory this tool creates is 0700, at **every level** (`os.makedirs(mode=)` applies the mode to the
+    leaf only, so a nested path silently left its parents 0755).
+  - **Existing** artifacts are repaired on startup, not just newly created ones - the creation mode does
+    nothing for a file that already leaked, and those files are never recreated.
+  - ★ **The repair FAILS CLOSED, and this is the part that was wrong first.** The initial fix followed
+    symlinks, validated neither owner nor file type, and wrote the mail anyway when the chmod failed - so
+    it chmod'ed and appended to a link's *target*, and a *dangling* link caused it to create that target
+    elsewhere. **A passive disclosure had been turned into an active write primitive.** Opens now use
+    `O_NOFOLLOW` (the final component must not be a symlink) and `O_NONBLOCK` (a FIFO planted at the path
+    would otherwise block the writer forever - a hang, which is worse than a crash because nothing
+    reports it), then validate **on the fd we already hold** that it is a regular file owned by us at
+    0600. Anything else raises and the caller turns it into a **failed delivery**: the cursor holds, the
+    mail is retried, and nothing is written or diverted. "Best-effort so we do not crash" is the wrong
+    instinct for a file we are about to append private mail to.
+  - A directory anyone else can write is reported (sticky directories like `/tmp` excluded, since the
+    sticky bit is exactly what makes a shared writable directory safe).
 - **Opaque mode:** content is fetched over the authenticated channel; `--no-content` omits message bodies entirely,
   and any future hosted bridge carries an opaque wake only.
 

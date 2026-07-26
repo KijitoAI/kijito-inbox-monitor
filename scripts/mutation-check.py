@@ -22,6 +22,7 @@ All three have happened in this repo.
 """
 
 import re, shutil, subprocess, sys, tempfile, os
+MUTANT_TIMEOUT = 90   # a mutant that hangs must not stall the gate; it is reported, never counted
 SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "kijito_inbox_monitor.py")
 TESTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "test_kijito_monitor.py")
 M=[
@@ -91,8 +92,8 @@ M=[
   "                if delivered and not self.emitter.sync(self.persona):",
   "                if False:"),
  ("L7-MEDIUM: the barrier syncs every persona's sink, not this one's",
-  "        if self.sink_template is not None:\n            s = self._sinks_by_persona.get(persona or \"_all\")\n            if s is not None:\n                ok = s.sync() and ok",
-  "        for s in self._sinks_by_persona.values():\n            ok = s.sync() and ok"),
+  "            s = self._sinks_by_persona.get(persona or \"_all\")\n            if s is not None:\n                ok = s.sync() and ok",
+  "            for s in self._sinks_by_persona.values():\n                ok = s.sync() and ok"),
  # ★ loom re-audit 8: deleting a CALL proves the call is present; it does NOT prove the ANSWER is
  # read. Both forms are kept deliberately - the weak one catches removal, the strong one catches
  # "called it and ignored what it said", which is the defect that actually shipped.
@@ -109,8 +110,8 @@ M=[
   "        self._fh = _open_private(self.path, \"a\", encoding=\"utf-8\")",
   "        self._fh = open(self.path, \"a\", encoding=\"utf-8\")"),
  ("L8-HIGH1: an already-leaked file is left world-readable",
-  "        if st.st_mode & 0o077:\n            os.fchmod(fd, PRIVATE_FILE_MODE)",
-  "        if False:\n            os.fchmod(fd, PRIVATE_FILE_MODE)"),
+  "    if cur != PRIVATE_FILE_MODE:",
+  "    if False:"),
  ("L8-HIGH1: the lock sidecar goes back to the umask",
   "        self._lockf = _open_private(self.path + \".lock\", \"a+\")",
   "        self._lockf = open(self.path + \".lock\", \"a+\")"),
@@ -118,8 +119,8 @@ M=[
   "        if not existed:",
   "        if False:"),
  ("L8-HIGH2: a rotation does not sync the rewritten directory entries",
-  "            self._dir_pending = True\n            self._open()",
-  "            self._open()"),
+  "            self._dir_pending = True\n            self._reopen_or_break()",
+  "            self._reopen_or_break()"),
  ("L8-HIGH2: sync() ignores the pending directory entry",
   "        if self._dir_pending:",
   "        if False:"),
@@ -186,6 +187,42 @@ M=[
  ("L7-poison: the sink crashes instead of reporting a failed delivery",
   "        except (OSError, UnicodeError, ValueError) as e:",
   "        except OSError as e:"),
+ ("L9-H1: O_NOFOLLOW dropped (symlink followed again)",
+  "             | getattr(os, \"O_NOFOLLOW\", 0) | getattr(os, \"O_NONBLOCK\", 0))",
+  "             | getattr(os, \"O_NONBLOCK\", 0))"),
+ ("L9-H1: O_NONBLOCK dropped (a FIFO would hang the watcher)",
+  "             | getattr(os, \"O_NOFOLLOW\", 0) | getattr(os, \"O_NONBLOCK\", 0))",
+  "             | getattr(os, \"O_NOFOLLOW\", 0))"),
+ ("L9-H1: the re-read after chmod is dropped (repair assumed, not verified)",
+  "        again = os.fstat(fd).st_mode & 0o777",
+  "        again = PRIVATE_FILE_MODE"),
+ ("L9-H1: the owner check is dropped",
+  "    if st.st_uid != os.geteuid():",
+  "    if False:"),
+ ("L9-H1: the regular-file check is dropped",
+  "    if not stat.S_ISREG(st.st_mode):",
+  "    if False:"),
+ ("L9-H1: ★ an untightenable file is WARNED ABOUT and written anyway (the round-8 behaviour)",
+  "        if again != PRIVATE_FILE_MODE:\n            raise InsecureFile",
+  "        if False:\n            raise InsecureFile"),
+ ("L9-H2: pre-existing rotated archives are not repaired",
+  "        for i in range(1, self.keep + 2):\n            _repair_mode(",
+  "        for i in []:\n            _repair_mode("),
+ ("L9-H2: the state file itself is not repaired",
+  "        _repair_mode(self.path)          # the state file itself",
+  "        pass  # the state file itself"),
+ ("L9-M3: makedirs goes back to leaf-only",
+  "    for d in reversed(missing):\n        try:\n            os.mkdir(d, PRIVATE_DIR_MODE)",
+  "    for d in reversed(missing[:1]):\n        try:\n            os.mkdir(d, PRIVATE_DIR_MODE)"),
+ ("L9-M4: ★ save()'s durability answer is discarded again (result ignored at the CALL SITE)",
+  "            if durable is False:\n                self._state_not_durable()",
+  "            if False:\n                self._state_not_durable()"),
+ ("L9-M5: a broken sink falls through to stdout instead of failing delivery",
+  "            if sink is _BROKEN_SINK:\n                return False",
+  "            if sink is _BROKEN_SINK:\n                return True"),
+ ("L9-M5: a failed reopen escapes the poll loop again",
+  "        if self._broken is not None or self._fh is None:\n            self._reopen_or_break()",
+  "        if False:\n            self._reopen_or_break()"),
  ("L7-item7: the lock fd is never released",
   "            try:\n                self._lockf.close()\n            finally:\n                self._lockf = None",
   "            pass"),
@@ -205,7 +242,17 @@ M=[
 def run(src):
     d=tempfile.mkdtemp(); shutil.copy(TESTS, os.path.join(d,"test_kijito_monitor.py"))
     open(os.path.join(d,"kijito_inbox_monitor.py"),"w").write(src)
-    p=subprocess.run([sys.executable,"-m","unittest","test_kijito_monitor"],cwd=d,capture_output=True,text=True)
+    # PIN THE WARNING FILTER. Inherited PYTHONWARNINGS=error turns a mutant's leaked fd into an ERROR,
+    # which silently converts "survived" into "caught" - a gate whose verdict depends on the caller's
+    # environment is not a gate (Loom re-audit 9, MEDIUM: 55+ ResourceWarnings under warnings=error).
+    env=dict(os.environ); env["PYTHONWARNINGS"]="default"
+    try:
+        p=subprocess.run([sys.executable,"-m","unittest","test_kijito_monitor"],cwd=d,capture_output=True,
+                         text=True,env=env,timeout=MUTANT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        # A mutant that HANGS is not caught - nothing asserted anything, the suite simply stopped. It also
+        # used to stall the gate itself indefinitely, which is how a quality tool becomes one nobody runs.
+        return None, "HUNG"
     return p.returncode, p.stderr
 base=open(SRC).read()
 rc,_=run(base)
@@ -220,12 +267,18 @@ for label,pat,rep in M:
     except SyntaxError as e:
         print("!! DOES NOT COMPILE:",label,e); surv.append(label); continue
     rc,err=run(mut)
+    if rc is None:
+        print("!! HUNG, not a catch:",label); surv.append(label); continue
     m=re.search(r"FAILED \((.*)\)",err); det=m.group(1) if m else "error"
     total=re.search(r"Ran (\d+) tests",err)
     nerr=re.search(r"errors=(\d+)",det); nfail=re.search(r"failures=(\d+)",det)
     if rc==0: print("SURVIVED ",label); surv.append(label)
-    elif nfail is None and nerr and total and int(nerr.group(1))>int(total.group(1))*0.5:
-        print("!! CRASHED not failed:",label,det); surv.append(label)
+    elif nfail is None and nerr:
+        # STRICTLY: no FAILURES means no test NOTICED the behaviour - it only noticed the program
+        # breaking. The old form allowed this whenever errors were under half the suite, which is how
+        # two error-only mutants were being counted as caught while the docstring said otherwise
+        # (Loom re-audit 9, MEDIUM). A threshold here is a way of being slightly wrong on purpose.
+        print("!! ERRORS ONLY, not a catch:",label,det); surv.append(label)
     else: print("caught   ",label,"  (%s)"%det)
 print()
 print("%d SURVIVED"%len(surv) if surv else "all %d mutations caught"%len(M))

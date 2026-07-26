@@ -19,6 +19,7 @@ import select
 import signal
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
@@ -443,18 +444,46 @@ class RotatingFileSink:
         self._pending = False      # bytes written that are not known to be on stable storage yet
         self._sync_failed = False  # an fsync we can never retry (the fd was rotated away) failed
         self._dir_pending = False  # a directory ENTRY changed (create/rotate) and is not durable yet
+        self._broken = None        # non-None => the sink is unusable; write() reports a FAILED delivery
         self._open()
 
     def _open(self):
+        # Never abandon a live handle: any path that reopens without closing first leaks an fd per
+        # rotation, which in a long-lived producer is unbounded. Defensive rather than reactive - the
+        # callers currently all close first, and this makes that non-load-bearing.
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except OSError:
+                pass
+            self._fh = None
         dirn = os.path.dirname(os.path.abspath(self.path)) or "."
         _makedirs_private(dirn)
-        existed = os.path.exists(self.path)
+        existed = os.path.lexists(self.path)   # lexists: a dangling SYMLINK counts as present, and must
         self._fh = _open_private(self.path, "a", encoding="utf-8")
+        # EVERY persisted artifact, not just the one we opened (Loom re-audit 9, H2): rotated archives
+        # written by an older version keep their 0644 forever otherwise, because they are never reopened.
+        for i in range(1, self.keep + 2):
+            _repair_mode("%s.%d" % (self.path, i))
         if not existed:
             # A NEW FILE NEEDS ITS DIRECTORY ENTRY SYNCED, NOT JUST ITS BYTES (Loom re-audit 8, HIGH 2).
             # fsync on the fd makes the CONTENT durable; the NAME lives in the directory. Deferred to
             # sync() so it lands before the cursor that acknowledges these events is persisted.
             self._dir_pending = True
+
+    def _reopen_or_break(self):
+        """Reopen after a rotation. A failure here must NOT escape the poll loop (Loom re-audit 9,
+        MEDIUM): an exception out of write() unwinds through poll_once and, under a KeepAlive supervisor,
+        is a crash loop. It becomes a broken sink instead, which write() reports as a failed delivery, so
+        the cursor holds and the mail is re-delivered when the sink recovers."""
+        try:
+            self._open()
+            self._broken = None
+        except OSError as e:
+            self._broken = str(e)
+            self._fh = None
+            sys.stderr.write("kijito-inbox-monitor: WARNING events sink %s is unusable (%s); holding the "
+                             "cursor until it recovers\n" % (self.path, e))
 
     def write(self, line):
         """Append one event line. Returns True IFF the line reached the file.
@@ -464,6 +493,10 @@ class RotatingFileSink:
         message nobody received - the exact silent loss this tool exists to prevent, arriving through
         the emit path instead of the fetch path.
         """
+        if self._broken is not None or self._fh is None:
+            self._reopen_or_break()                     # try to recover, silently on success
+            if self._broken is not None or self._fh is None:
+                return False
         try:
             self._fh.write(line)
             self._fh.flush()
@@ -524,7 +557,11 @@ class RotatingFileSink:
         if not self.sync():
             self._sync_failed = True
         try:
-            self._fh.close()
+            try:
+                self._fh.close()
+            except OSError as e:   # a close() failure is a real error, not a reason to unwind the poll
+                sys.stderr.write("kijito-inbox-monitor: WARNING closing %s during rotation failed: %s\n"
+                                 % (self.path, e))
             oldest = "%s.%d" % (self.path, self.keep)
             if os.path.exists(oldest):
                 os.remove(oldest)
@@ -540,14 +577,19 @@ class RotatingFileSink:
             # Every rename above rewrote directory ENTRIES; none of them is durable until the directory
             # itself is synced (Loom re-audit 8, HIGH 2).
             self._dir_pending = True
-            self._open()  # always reopen by NAME - a tail -F consumer follows us onto the fresh file
+            self._reopen_or_break()  # reopen by NAME - a tail -F consumer follows us onto the fresh file
 
     def close(self):
         if self._fh is not None:
             try:
                 self._fh.close()
+            except OSError as e:
+                sys.stderr.write("kijito-inbox-monitor: WARNING closing %s failed: %s\n" % (self.path, e))
             finally:
                 self._fh = None
+
+
+_BROKEN_SINK = object()   # a sink that exists in config but cannot be written to SAFELY
 
 
 class Emitter:
@@ -565,16 +607,31 @@ class Emitter:
         self._max_bytes = max_bytes
         self._keep = keep
         self._sinks_by_persona = {}
+        self._broken_sinks = set()
 
     def _sink_for(self, persona):
-        """Route an event to its persona's sink (template mode), the single shared sink, or stdout (None)."""
+        """Route an event to its persona's sink (template mode), the single shared sink, or stdout (None).
+
+        A sink we cannot create SAFELY returns the BROKEN sentinel, never None: None means "no sink
+        configured, write to stdout", and falling through to stdout because a path looked like a symlink
+        would print the mail we just refused to file. One persona's bad path must also not take the
+        others down, so it is contained here rather than raised.
+        """
         if self.sink_template is None:
             return self.sink
         key = persona or "_all"  # events with no persona (e.g. a bare --url target) land in one _all file
         s = self._sinks_by_persona.get(key)
         if s is None:
+            if key in self._broken_sinks:
+                return _BROKEN_SINK
             path = self.sink_template.replace("{persona}", _state_safe_persona(key))
-            s = RotatingFileSink(path, self._max_bytes, self._keep)
+            try:
+                s = RotatingFileSink(path, self._max_bytes, self._keep)
+            except OSError as e:
+                self._broken_sinks.add(key)
+                _warn_persona_once(key, "cannot open an events sink for %r safely (%s); its mail will be "
+                                        "held, not written elsewhere" % (key, e))
+                return _BROKEN_SINK
             self._sinks_by_persona[key] = s
         return s
 
@@ -601,6 +658,8 @@ class Emitter:
         if self.sink is not None:
             ok = self.sink.sync() and ok
         if self.sink_template is not None:
+            if (persona or "_all") in self._broken_sinks:
+                return False       # nothing was written, so nothing is durable; hold the cursor
             s = self._sinks_by_persona.get(persona or "_all")
             if s is not None:
                 ok = s.sync() and ok
@@ -627,6 +686,8 @@ class Emitter:
             # content, `from`, an alarm `reason` built from server data - rather than each of them.
             line = _safe_text(json.dumps(event, ensure_ascii=False)) + "\n"
             sink = self._sink_for(event.get("persona"))
+            if sink is _BROKEN_SINK:
+                return False           # a failed delivery: hold the cursor, never divert the mail
             if sink is not None:
                 return sink.write(line)
             try:
@@ -707,36 +768,139 @@ PRIVATE_FILE_MODE = 0o600   # event streams and lock sidecars carry/guard messag
 PRIVATE_DIR_MODE = 0o700
 
 
-def _open_private(path, mode="a", encoding=None):
-    """Open a file that must never be world-readable, and REPAIR an existing one that already is.
+class InsecureFile(OSError):
+    """A path we were about to write MAIL into is not something we are willing to write mail into."""
 
-    THE EVENT STREAM CARRIES MESSAGE BODIES (Loom re-audit 8, HIGH 1). A plain open() takes the process
-    umask, which is 022 on this machine and on most defaults, so every events.<persona>.ndjson was created
-    0644 - world-readable private hive mail, verified live. The token file (0600) and the state file (0600
-    via mkstemp) were already right, which is what made the gap easy to miss: the ONE file nobody had
-    thought about is the one with the plaintext in it.
-    The mode argument to os.open applies ONLY at creation, so a fix that stops there leaves every ALREADY
-    LEAKED file exactly as permissive as it was - which is why the existing mode is checked and tightened
-    too. Repair is best-effort: a file we do not own must not crash the watcher, but it must be reported.
+
+def _assert_private_fd(fd, path):
+    """Fail CLOSED unless this fd is a REGULAR file, owned by US, at exactly 0600 (Loom re-audit 9, H1/H2).
+
+    My round-8 repair was best-effort - it warned on failure and wrote anyway - on the reasoning that "a
+    file we do not own must not crash the watcher". That reasoning is exactly backwards for a file we are
+    about to append PRIVATE MAIL to: loom's repro left a pre-existing 0666 file at 0666 and delivered mail
+    into it. Refusing to write is the only safe answer, and the caller turns that into a FAILED DELIVERY,
+    so the cursor holds and nothing is lost.
     """
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, PRIVATE_FILE_MODE)
-    try:
-        st = os.fstat(fd)
-        if st.st_mode & 0o077:
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise InsecureFile("%s is not a regular file" % path)
+    if st.st_uid != os.geteuid():
+        raise InsecureFile("%s is owned by uid %d, not by us (uid %d)" % (path, st.st_uid, os.geteuid()))
+    cur = st.st_mode & 0o777
+    if cur != PRIVATE_FILE_MODE:
+        # EXACTLY 0600, not merely "no group/other bits" - a 0700 event file kept its execute bit under
+        # the old `st_mode & 0o077` test, which is a mode nothing here should ever have (re-audit 9, H2).
+        try:
             os.fchmod(fd, PRIVATE_FILE_MODE)
-            sys.stderr.write("kijito-inbox-monitor: tightened %s from %o to 0600 (it carries message "
-                             "content and was readable by other local users)\n" % (path, st.st_mode & 0o777))
+        except OSError as e:
+            # Typed, so a caller reading the log can tell "we refused this path" from "the disk broke".
+            raise InsecureFile("%s is %o and cannot be tightened to 0600: %s" % (path, cur, e))
+        again = os.fstat(fd).st_mode & 0o777
+        if again != PRIVATE_FILE_MODE:
+            raise InsecureFile("%s is %o and could not be tightened to 0600 (now %o)" % (path, cur, again))
+        sys.stderr.write("kijito-inbox-monitor: tightened %s from %o to 0600 (it carries message content "
+                         "and was reachable by other local users)\n" % (path, cur))
+
+
+def _open_private(path, mode="a", encoding=None):
+    """Open a file that must never be readable by anyone else, refusing anything suspicious.
+
+    THE EVENT STREAM CARRIES MESSAGE BODIES. A plain open() takes the process umask (022 by default), so
+    every events.<persona>.ndjson was created 0644 - world-readable private hive mail, verified live
+    (re-audit 8, H1). But the FIRST repair was itself unsafe (re-audit 9, H1), and worse than the leak it
+    fixed: it FOLLOWED SYMLINKS, so it chmod'ed and appended mail to whatever a link pointed at, and a
+    DANGLING link created its target in another directory entirely. A passive disclosure had been turned
+    into an active write primitive.
+      · O_NOFOLLOW - the final component must not be a symlink. (No TOCTOU window: the check is the open.)
+      · owner + regular-file, checked on the FD we already hold, never by a second path lookup.
+      · fail CLOSED - callers convert InsecureFile into a failed delivery, never a crash and never a write.
+    """
+    # O_NONBLOCK matters as much as O_NOFOLLOW here: opening a FIFO for writing BLOCKS until a reader
+    # appears, so a FIFO planted at the events path would HANG the watcher forever - silently, with no
+    # crash to notice and no events to miss noticing. (Found when the regular-file test hung the suite.)
+    # On a regular file O_NONBLOCK is a no-op, so it costs nothing on the path we actually take.
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_APPEND
+             | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    try:
+        fd = os.open(path, flags, PRIVATE_FILE_MODE)
     except OSError as e:
-        sys.stderr.write("kijito-inbox-monitor: WARNING could not tighten permissions on %s (%s); it may be "
-                         "readable by other local users\n" % (path, e))
+        # ELOOP here means the path IS a symlink - report it as what it is, not as a generic open failure.
+        raise InsecureFile("refusing to open %s: %s" % (path, e))
+    try:
+        _assert_private_fd(fd, path)
+    except OSError:
+        os.close(fd)
+        raise
     return os.fdopen(fd, mode, encoding=encoding) if encoding else os.fdopen(fd, mode)
 
 
+def _repair_mode(path):
+    """Tighten an EXISTING artifact to 0600 in place. Returns True if it is now safe.
+
+    Repairing only the file we happen to open leaves every OTHER persisted artifact exactly as it was -
+    loom found pre-existing rotated archives still at 0644 after the round-8 fix (re-audit 9, H2). Opened
+    O_NOFOLLOW and validated on the fd, for the same reason as _open_private.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except FileNotFoundError:
+        return True                      # nothing there is nothing to leak
+    except OSError as e:
+        sys.stderr.write("kijito-inbox-monitor: WARNING refusing to repair %s: %s\n" % (path, e))
+        return False
+    try:
+        _assert_private_fd(fd, path)
+        return True
+    except OSError as e:
+        sys.stderr.write("kijito-inbox-monitor: WARNING %s may be readable by other local users: %s\n"
+                         % (path, e))
+        return False
+    finally:
+        os.close(fd)
+
+
 def _makedirs_private(path):
-    """Create a directory 0700 when WE create it. An existing directory is left alone deliberately -
-    silently re-permissioning a path the operator already owns is not ours to do, and the 0600 files
-    inside it are what actually protects the content."""
-    os.makedirs(path, mode=PRIVATE_DIR_MODE, exist_ok=True)
+    """Create EVERY missing level 0700, and warn about an existing level anyone else can write.
+
+    os.makedirs(mode=...) applies the mode to the LEAF only; intermediate directories get the umask
+    default, so a nested path left its parents 0755 (Loom re-audit 9, MEDIUM). An EXISTING directory is
+    still not re-permissioned - silently changing a path the operator already owns is not ours to do - but
+    a group/world-WRITABLE one is reported, because that is the condition under which someone else can
+    swap a file for a symlink underneath us. (_open_private then refuses it, which is the real defence;
+    this is the warning that tells you why events stopped.)
+    """
+    path = os.path.abspath(path)
+    missing = []
+    cur = path
+    while not os.path.isdir(cur):
+        missing.append(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    for d in reversed(missing):
+        try:
+            os.mkdir(d, PRIVATE_DIR_MODE)
+        except FileExistsError:
+            pass
+    # Check the WHOLE ancestor chain, not only the levels we created - loom's point was that an EXISTING
+    # directory is never validated, and an existing one is exactly where a hostile path would already be.
+    # A sticky directory (/tmp, mode 1777) is excluded: the sticky bit is precisely what makes a shared
+    # writable directory safe, and warning about it would train the reader to ignore this line.
+    seen = path
+    while True:
+        try:
+            st = os.stat(seen)
+        except OSError:
+            break
+        if (st.st_mode & 0o022) and not (st.st_mode & stat.S_ISVTX):
+            sys.stderr.write("kijito-inbox-monitor: WARNING directory %s is writable by other local users "
+                             "(mode %o); files there can be swapped for symlinks underneath us\n"
+                             % (seen, st.st_mode & 0o777))
+        parent = os.path.dirname(seen)
+        if parent == seen:
+            break
+        seen = parent
 
 
 def _fsync_dir(path):
@@ -812,6 +976,7 @@ class StateFile:
         # (mkstemp + os.replace) on every poll, which would orphan a flock held on it and let a second watcher
         # lock the new inode freely. The sidecar is never replaced, so the flock persists for the process
         # lifetime. flock is advisory + auto-released by the OS on exit (no stale lockfile to clean).
+        _repair_mode(self.path)          # the state file itself, if an older version left it permissive
         self._lockf = _open_private(self.path + ".lock", "a+")
         try:
             fcntl.flock(self._lockf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1245,6 +1410,7 @@ class WatchTarget:
         # discharges it instead. Persisted, because a release condition that dies on restart is not one.
         self.pin_release_at = None
         self.delivery_blocked = False  # an emit failed; the cursor is held below it until it succeeds
+        self.state_not_durable = False  # the last cursor write could not be proven durable
 
         self.count_url = NOTIFY_PENDING_URL
         cp = urllib.parse.urlsplit(url)
@@ -1332,6 +1498,20 @@ class WatchTarget:
         self.pin_forced = False
         self.pin_release_at = None
         self.state_corrupt = False
+
+    def _state_not_durable(self):
+        if self.state_not_durable:
+            return
+        self.state_not_durable = True
+        sys.stderr.write("kijito-inbox-monitor: WARNING the cursor for persona %r was written but its "
+                         "durability is UNPROVEN; a crash may replay mail from an older cursor (further "
+                         "reports suppressed until it persists cleanly)\n" % self.persona)
+
+    def _state_durable_again(self):
+        if not self.state_not_durable:
+            return
+        self.state_not_durable = False
+        sys.stderr.write("kijito-inbox-monitor: cursor persistence for persona %r recovered\n" % self.persona)
 
     def _delivery_failed(self, mid):
         """Report a failed hand-off ONCE, and say what the watcher is doing about it.
@@ -1763,12 +1943,20 @@ class WatchTarget:
                                    seconds=self.failures * args.poll_seconds)
 
         if self.state_file is not None:
-            self.state_file.save(self.cursor, self.fsm_state, self.failures,
+            durable = self.state_file.save(self.cursor, self.fsm_state, self.failures,
                                  self.emitted_above, self.gap_alerted,
                                  pin_forced=self.pin_forced,
                                  pin_evidence_intact=self.pin_evidence_intact,
                                  state_corrupt=self.state_corrupt,
                                  pin_release_at=self.pin_release_at)
+            # ★ CONSUME THE ANSWER (Loom re-audit 9, MEDIUM). Round 8 taught me to RETURN a durability
+            # status; this is the same defect one layer out - I produced an answer and then discarded it
+            # at the call site, which is the exact thing the previous round was about. A cursor whose
+            # persistence is unproven means a crash may replay mail, and the harm is the SILENCE.
+            if durable is False:
+                self._state_not_durable()
+            else:
+                self._state_durable_again()
 
         # §9 enable the fast-path once - on the first healthy poll where the count endpoint is available.
         # (Single enable point; the max-id cursor stays the source of truth for WHAT to emit, unread is only
