@@ -489,6 +489,7 @@ class BoundedWindowGapTest(unittest.TestCase):
         t.state_corrupt = False
         t.pin_release_at = None
         t.delivery_blocked = False
+        t.state_not_durable = False
         return t
 
     def test_window_reaching_back_past_the_cursor_is_safe(self):
@@ -528,6 +529,7 @@ class WalkBackTest(unittest.TestCase):
         t.state_corrupt = False
         t.pin_release_at = None
         t.delivery_blocked = False
+        t.state_not_durable = False
         return t
 
     def _pages(self, mapping, calls=None):
@@ -681,6 +683,7 @@ class BoundedWindowEndToEndTest(unittest.TestCase):
         t.state_corrupt = False
         t.pin_release_at = None
         t.delivery_blocked = False
+        t.state_not_durable = False
         return t
 
     def _fetch(self, main_items, omitted, walk=None, exact=True, walk_fail=False):
@@ -929,6 +932,7 @@ class CorruptPinStateTest(unittest.TestCase):
         t.state_corrupt = False
         t.pin_release_at = None
         t.delivery_blocked = False
+        t.state_not_durable = False
 
         # The walk must NOT succeed here, or it would legitimately close the span and release the pin -
         # which is a DIFFERENT property, tested separately below. Isolating them keeps this test about
@@ -1902,7 +1906,13 @@ class Loom7PoisonMessageTest(unittest.TestCase):
         buf, err = __import__("io").StringIO(), km.sys.stderr
         km.sys.stderr = buf
         try:
-            self.assertIs(sink.write("{}\n"), False)      # reported, not raised
+            # self.fail on escape, so this is a FAILURE not an ERROR: the mutation gate refuses to count
+            # an error-only mutant, and a test that "passes" by letting an exception fly teaches it nothing.
+            try:
+                result = sink.write("{}\n")
+            except Exception as e:
+                self.fail("write() raised %r instead of reporting a failed delivery" % (e,))
+            self.assertIs(result, False)
         finally:
             km.sys.stderr = err
         self.assertIn("holding the cursor", buf.getvalue())
@@ -2117,6 +2127,329 @@ class Loom8FilePermissionsTest(unittest.TestCase):
         sink = km.RotatingFileSink(os.path.join(nested, "events.ndjson"), 0, 5)
         self.addCleanup(sink.close)
         self.assertEqual(os.stat(nested).st_mode & 0o777, 0o700)
+
+
+class Loom9SafeOpenTest(unittest.TestCase):
+    """Loom re-audit 9, HIGH 1. THE SECURITY FIX WAS ITSELF A SECURITY DEFECT, and a worse one.
+
+    Round 8 stopped the event stream being world-READABLE. The repair it used followed symlinks, checked
+    neither owner nor file type, and - because I made it deliberately best-effort so "a file we do not own
+    cannot kill the watcher" - wrote the mail anyway when the chmod failed. That reasoning is exactly
+    backwards for a file we are about to append PRIVATE MAIL to: it converted a passive disclosure into an
+    active write primitive. Refusing is the only safe answer, and the caller turns a refusal into a FAILED
+    DELIVERY, so the cursor holds and nothing is lost.
+    """
+    def test_a_SYMLINK_in_place_of_the_events_file_is_REFUSED(self):
+        d = tempfile.mkdtemp()
+        target = os.path.join(d, "victim.txt")
+        link = os.path.join(d, "events.ndjson")
+        with open(target, "w") as f:
+            f.write("pre-existing victim content\n")
+        os.chmod(target, 0o644)
+        os.symlink(target, link)
+        with self.assertRaises(OSError):
+            km.RotatingFileSink(link, 0, 5)
+        self.assertEqual(os.stat(target).st_mode & 0o777, 0o644, "the target must not be chmod'ed")
+        self.assertNotIn("event", read_file(target), "the target must not receive our mail")
+
+    def test_a_DANGLING_symlink_does_not_create_its_target(self):
+        # loom: "dangling symlink created target in unsynced other dir" - O_CREAT through a link creates
+        # the TARGET, wherever that points, and it is not in a directory we sync or protect.
+        d = tempfile.mkdtemp()
+        victim = os.path.join(d, "created-elsewhere.txt")
+        os.symlink(victim, os.path.join(d, "events.ndjson"))
+        with self.assertRaises(OSError):
+            km.RotatingFileSink(os.path.join(d, "events.ndjson"), 0, 5)
+        self.assertFalse(os.path.exists(victim), "a dangling link must not be followed into a new file")
+
+    def test_a_file_we_CANNOT_tighten_is_REFUSED_not_written(self):
+        # loom's exact repro: "writable preexisting file stayed 0666 and received mail".
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "events.ndjson")
+        open(p, "w").close()
+        os.chmod(p, 0o666)
+        real = km.os.fchmod
+        km.os.fchmod = lambda fd, m: (_ for _ in ()).throw(OSError("EPERM"))
+        try:
+            with self.assertRaises(km.InsecureFile):
+                km.RotatingFileSink(p, 0, 5)
+        finally:
+            km.os.fchmod = real
+        self.assertNotIn("event", read_file(p), "mail must never land in a file we could not secure")
+
+    def test_a_file_owned_by_SOMEONE_ELSE_is_refused(self):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "events.ndjson")
+        real = km.os.fstat
+        class FakeStat:
+            st_mode = 0o100600      # regular file, right mode
+            st_uid = os.geteuid() + 1000
+        km.os.fstat = lambda fd: FakeStat()
+        try:
+            with self.assertRaises(km.InsecureFile):
+                km.RotatingFileSink(p, 0, 5)
+        finally:
+            km.os.fstat = real
+
+    def test_a_NON_REGULAR_file_WE_OWN_is_refused(self):
+        # ⚠️ ISOLATION MATTERS. /dev/null looks like the obvious case, but it is root-owned, so the OWNER
+        # check fires first and the regular-file branch is never reached - the mutation harness proved
+        # that by surviving a test built on it. This fakes a FIFO we own, so S_ISREG is the only check
+        # that can reject it. Without it the watcher would "deliver" every message into a device and
+        # advance its cursor over real mail.
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "events.ndjson")
+        real = km.os.fstat
+        class FifoWeOwn:
+            st_mode = 0o010600          # S_IFIFO | 0600
+            st_uid = os.geteuid()
+        km.os.fstat = lambda fd: FifoWeOwn()
+        try:
+            with self.assertRaises(km.InsecureFile):
+                km.RotatingFileSink(p, 0, 5)
+        finally:
+            km.os.fstat = real
+
+    def test_a_file_whose_chmod_SILENTLY_DOES_NOTHING_is_refused(self):
+        # Distinct from "chmod raises": some filesystems accept the call and change nothing. The mode must
+        # be RE-READ after tightening, or the repair is assumed rather than verified.
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "events.ndjson")
+        open(p, "w").close()
+        os.chmod(p, 0o644)
+        real = km.os.fchmod
+        km.os.fchmod = lambda fd, m: None          # accepts, does nothing
+        try:
+            with self.assertRaises(km.InsecureFile):
+                km.RotatingFileSink(p, 0, 5)
+        finally:
+            km.os.fchmod = real
+        self.assertNotIn("event", read_file(p))
+
+    def test_a_NON_REGULAR_file_is_refused_WITHOUT_BLOCKING(self):
+        # A FIFO is the sharp case: opening one O_WRONLY blocks until a reader appears, so without
+        # O_NONBLOCK the watcher HANGS - worse than crashing, because nothing reports it and the events
+        # simply stop. The alarm turns that hang into a FAILURE, which is what the mutation gate can
+        # actually count; a test that hangs teaches the gate nothing and stalls it besides.
+        import signal
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "events.ndjson")
+        os.mkfifo(p)
+        def _blocked(signum, frame):
+            raise AssertionError("opening a FIFO BLOCKED - O_NONBLOCK is missing")
+        old_handler = signal.signal(signal.SIGALRM, _blocked)
+        signal.alarm(3)
+        try:
+            with self.assertRaises(OSError):
+                km.RotatingFileSink(p, 0, 5)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+
+    def test_the_CONTROL_a_normal_file_still_opens_and_writes(self):
+        # Without this, every assertion above is satisfied by a sink that refuses everything.
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "events.ndjson")
+        sink = km.RotatingFileSink(p, 0, 5)
+        self.addCleanup(sink.close)
+        self.assertTrue(sink.write('{"event":"new"}\n'))
+        self.assertEqual(os.stat(p).st_mode & 0o777, 0o600)
+
+
+class Loom9RepairEveryArtifactTest(unittest.TestCase):
+    """Loom re-audit 9, HIGH 2 + MEDIUM. Repairing only the file you happen to open repairs almost nothing."""
+
+    def test_a_preexisting_ROTATED_ARCHIVE_is_repaired(self):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "events.ndjson")
+        with open(p + ".1", "w") as f:
+            f.write("old mail\n")
+        os.chmod(p + ".1", 0o644)
+        buf, err = __import__("io").StringIO(), km.sys.stderr
+        km.sys.stderr = buf
+        try:
+            km.RotatingFileSink(p, 0, 5).close()
+        finally:
+            km.sys.stderr = err
+        self.assertEqual(os.stat(p + ".1").st_mode & 0o777, 0o600,
+                         "an archive written by an older version is never reopened, so it leaks forever")
+
+    def test_the_STATE_FILE_is_repaired_when_the_lock_is_taken(self):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "hive.json")
+        with open(p, "w") as f:
+            f.write("{}")
+        os.chmod(p, 0o644)
+        sf = km.StateFile(p, "idx")
+        buf, err = __import__("io").StringIO(), km.sys.stderr
+        km.sys.stderr = buf
+        try:
+            sf.lock()
+        finally:
+            km.sys.stderr = err
+        self.addCleanup(sf.unlock)
+        self.assertEqual(os.stat(p).st_mode & 0o777, 0o600)
+
+    def test_0700_is_normalised_to_EXACTLY_0600(self):
+        # The round-8 test was `st_mode & 0o077`, which ignores a stray owner-EXECUTE bit; 0700 is a mode
+        # nothing here should ever have.
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "events.ndjson")
+        open(p, "w").close()
+        os.chmod(p, 0o700)
+        buf, err = __import__("io").StringIO(), km.sys.stderr
+        km.sys.stderr = buf
+        try:
+            km.RotatingFileSink(p, 0, 5).close()
+        finally:
+            km.sys.stderr = err
+        self.assertEqual(os.stat(p).st_mode & 0o777, 0o600)
+
+    def test_EVERY_directory_level_is_0700_not_just_the_leaf(self):
+        # os.makedirs(mode=...) applies the mode to the LEAF only; intermediates take the umask.
+        d = tempfile.mkdtemp()
+        try:
+            km._makedirs_private(os.path.join(d, "a", "b", "c"))
+        except Exception as e:
+            self.fail("_makedirs_private raised on a nested path: %r" % (e,))
+        for rel in (("a",), ("a", "b"), ("a", "b", "c")):
+            path = os.path.join(d, *rel)
+            if not os.path.isdir(path):
+                self.fail("%s was never created" % ("/".join(rel),))   # a FAILURE, not a stat ERROR
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o700, rel)
+
+    def test_a_WORLD_WRITABLE_parent_is_reported(self):
+        d = tempfile.mkdtemp()
+        os.chmod(d, 0o777)
+        buf, err = __import__("io").StringIO(), km.sys.stderr
+        km.sys.stderr = buf
+        try:
+            km._makedirs_private(os.path.join(d, "sub"))
+        finally:
+            km.sys.stderr = err
+        self.assertIn("writable by other local users", buf.getvalue())
+
+
+class Loom9FailedSinkIsAFailedDeliveryTest(unittest.TestCase):
+    """Loom re-audit 9, MEDIUM. A sink we cannot use must fail DELIVERY - never crash, never divert."""
+
+    def test_an_unusable_persona_sink_fails_delivery_and_does_NOT_fall_back_to_stdout(self):
+        # _sink_for returning None means "no sink configured, write to stdout". A sink we REFUSED must
+        # not take that path, or the mail we declined to file gets printed instead.
+        d = tempfile.mkdtemp()
+        os.symlink(os.path.join(d, "nowhere.txt"), os.path.join(d, "events.argus.ndjson"))
+        em = km.Emitter("stdout-jsonl", None, 220, False,
+                        sink_template=os.path.join(d, "events.{persona}.ndjson"))
+        self.addCleanup(em.close)
+        buf, err = __import__("io").StringIO(), km.sys.stderr
+        out, km.sys.stderr, km.sys.stdout = km.sys.stdout, buf, __import__("io").StringIO()
+        try:
+            delivered = em.new({"id": 1, "from": "river", "content": "secret", "_persona": "argus"})
+            printed = km.sys.stdout.getvalue()
+        finally:
+            km.sys.stderr, km.sys.stdout = err, out
+        self.assertIs(delivered, False, "an unusable sink is a FAILED delivery")
+        self.assertNotIn("secret", printed, "it must not be diverted to stdout")
+        self.assertFalse(em.sync("argus"), "and nothing about it is durable")
+
+    def test_ONE_broken_persona_does_not_break_the_others(self):
+        d = tempfile.mkdtemp()
+        os.symlink(os.path.join(d, "nowhere.txt"), os.path.join(d, "events.argus.ndjson"))
+        em = km.Emitter("stdout-jsonl", None, 220, False,
+                        sink_template=os.path.join(d, "events.{persona}.ndjson"))
+        self.addCleanup(em.close)
+        buf, err = __import__("io").StringIO(), km.sys.stderr
+        km.sys.stderr = buf
+        try:
+            self.assertIs(em.new({"id": 1, "from": "r", "_persona": "argus"}), False)
+            self.assertIs(em.new({"id": 2, "from": "r", "_persona": "loom"}), True)
+        finally:
+            km.sys.stderr = err
+
+    def test_a_failed_REOPEN_after_rotation_does_not_escape_the_poll_loop(self):
+        # An exception out of write() unwinds through poll_once and, under KeepAlive, is a crash loop.
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "events.ndjson")
+        sink = km.RotatingFileSink(p, 60, 2)
+        self.addCleanup(sink.close)
+        real = km._open_private
+        km._open_private = lambda *a, **k: (_ for _ in ()).throw(km.InsecureFile("simulated"))
+        buf, err = __import__("io").StringIO(), km.sys.stderr
+        km.sys.stderr = buf
+        try:
+            try:
+                result = sink.write('{"pad":"%s"}\n' % ("x" * 90))   # triggers rotation -> reopen fails
+            except Exception as e:
+                self.fail("a failed reopen escaped write(): %r" % (e,))
+            self.assertIn(result, (True, False))                  # it RETURNED rather than raising
+            # ...and while the path is still unusable, delivery FAILS rather than silently succeeding
+            try:
+                second = sink.write("{}\n")
+            except Exception as e:
+                self.fail("a write to a broken sink escaped: %r" % (e,))
+            self.assertIs(second, False, "a broken sink reports failed delivery")
+        finally:
+            km._open_private, km.sys.stderr = real, err
+        self.assertIn("unusable", buf.getvalue())
+        # and once the path works again it recovers on its own - fail-closed must not mean fail-forever
+        self.assertTrue(sink.write("{}\n"))
+
+    def test_a_broken_sink_RECOVERS_when_the_path_becomes_usable(self):
+        # Fail-closed must not mean fail-forever - the same rule as every pin in this file.
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "events.ndjson")
+        sink = km.RotatingFileSink(p, 0, 5)
+        self.addCleanup(sink.close)
+        sink._fh.close()                 # close it rather than orphaning the handle
+        sink._broken, sink._fh = "simulated", None
+        self.assertTrue(sink.write('{"event":"new"}\n'), "it must retry and recover")
+        self.assertIsNone(sink._broken)
+
+
+class Loom9CursorDurabilityIsConsumedTest(unittest.TestCase):
+    """Loom re-audit 9, MEDIUM. Round 8 made save() RETURN durability; the caller threw it away.
+
+    ★ That is the audit-8 finding one layer out - fixing "nobody reads the answer" by producing an answer
+    nobody reads. The harness could not see it because the mutation deleted the CALL, and the call was
+    still there; only mutating the CALL SITE's use of the RESULT catches this.
+    """
+    E2E = BoundedWindowEndToEndTest
+
+    class FlakyState:
+        def __init__(self, answers):
+            self.answers, self.calls = list(answers), 0
+        def save(self, *a, **k):
+            self.calls += 1
+            return self.answers[min(self.calls - 1, len(self.answers) - 1)]
+
+    def test_an_UNPROVEN_cursor_write_is_reported_once_and_self_clears(self):
+        em = self.E2E.RecordingEmitter()
+        t = self.E2E()._target(cursor=100, emitter=em)
+        t.state_file = self.FlakyState([False, False, True])
+        buf, err = __import__("io").StringIO(), km.sys.stderr
+        km.sys.stderr = buf
+        try:
+            self.E2E()._run(t, self.E2E()._fetch([{"id": 200}], 0), times=2)
+            self.assertEqual(buf.getvalue().count("durability is UNPROVEN"), 1, "reported once, not per poll")
+            self.assertTrue(t.state_not_durable)
+            self.E2E()._run(t, self.E2E()._fetch([{"id": 300}], 0))     # save() now succeeds
+            self.assertFalse(t.state_not_durable)
+            self.assertIn("recovered", buf.getvalue())
+        finally:
+            km.sys.stderr = err
+
+    def test_a_DURABLE_write_says_nothing(self):
+        em = self.E2E.RecordingEmitter()
+        t = self.E2E()._target(cursor=100, emitter=em)
+        t.state_file = self.FlakyState([True])
+        buf, err = __import__("io").StringIO(), km.sys.stderr
+        km.sys.stderr = buf
+        try:
+            self.E2E()._run(t, self.E2E()._fetch([{"id": 200}], 0))
+        finally:
+            km.sys.stderr = err
+        self.assertNotIn("UNPROVEN", buf.getvalue())
+        self.assertFalse(t.state_not_durable)
 
 
 class Loom8DurableDirectoryEntryTest(unittest.TestCase):
@@ -2774,7 +3107,13 @@ class Loom7StateFileHygieneTest(unittest.TestCase):
         with self.assertRaises(km.FatalConfig):
             b.lock()                                  # control: the lock really is exclusive
         a.unlock()
-        b.lock()                                      # and unlock really releases it
+        try:
+            b.lock()                                  # and unlock really releases it
+        except km.FatalConfig:
+            self.fail("unlock() did not release the lock")
+        # ⚠️ `self.fail`, not a bare call that raises: a test that passes by ERRORING is weaker than one
+        # that FAILS, and the mutation gate now refuses to count an error-only mutant as caught. This
+        # test was one of the two loom found being credited on errors alone.
         self.addCleanup(b.unlock)
 
     def test_unlock_is_idempotent_and_safe_on_an_unlocked_file(self):

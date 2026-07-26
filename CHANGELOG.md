@@ -6,6 +6,21 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 ## [Unreleased]
 
 ### Security
+- **The first fix for the permissions bug was itself a worse bug** (Loom re-audit 9, HIGH 1). The repair
+  introduced in the previous entry followed symlinks, validated neither owner nor file type, and - because
+  it was deliberately best-effort so that "a file we do not own cannot kill the watcher" - wrote the mail
+  anyway when the `chmod` failed. Measured: a pre-existing 0666 file stayed 0666 **and received mail**; a
+  symlink's target was chmod'ed and appended to; a *dangling* symlink caused its target to be created in
+  another directory. A passive disclosure had been turned into an active write primitive. Opens now use
+  `O_NOFOLLOW` and `O_NONBLOCK` (a FIFO at the path would otherwise block the writer forever - a hang,
+  which is worse than a crash because nothing reports it) and validate on the already-open descriptor that
+  the file is regular, owned by this user, and exactly 0600. Anything else is refused, and a refusal is a
+  **failed delivery**: the cursor holds and the mail is retried rather than written somewhere unsafe.
+- **Only the file being opened was repaired** (Loom re-audit 9, HIGH 2). Pre-existing rotated archives and
+  an existing state file kept their old modes, and a 0700 file was left alone because the check tested
+  `mode & 0o077` rather than requiring exactly 0600. All persisted artifacts are now repaired, and
+  directories are 0700 at **every** level (`os.makedirs(mode=)` applies the mode to the leaf only, so
+  nested paths left their parents 0755). A directory writable by other users is reported.
 - **The event stream was world-readable and it carries message bodies** (Loom re-audit 8, HIGH 1). Event
   files and the state-file lock sidecar were created with a plain `open()`, which takes the process umask -
   022 by default - so every `events.<persona>.ndjson` was mode 0644 and readable by any other local user,
@@ -50,6 +65,15 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
   pinned, the identical window was re-emitted on every poll and across every restart. The pin now carries a
   persisted release floor, and every delivered id the watermark does not cover is remembered whatever left it
   uncovered. (Repairing a fail-open into a permanent fail-closed is not a repair.)
+- **A cursor write whose durability was unproven was reported to nobody** (Loom re-audit 9, MEDIUM). The
+  previous entry made `save()` *return* a durability status; the call site then discarded it - the same
+  defect one layer out. The watcher now consumes that answer and reports an unproven cursor once, clearing
+  when persistence recovers.
+- **A sink that could not be opened safely crashed the poll loop or fell through to stdout** (Loom
+  re-audit 9, MEDIUM). A failed reopen after rotation raised out of `write()`, which under a supervisor is
+  a crash loop; and a refused per-persona sink returned `None`, which means "no sink configured, write to
+  stdout" - printing the very mail that had just been declined. Both are now failed deliveries, contained
+  to the affected persona, and a broken sink retries and recovers on its own.
 - **The events file's DIRECTORY ENTRY was never made durable** (Loom re-audit 8, HIGH 2). `fsync` on the
   file descriptor makes the *bytes* durable; the *name* lives in the directory. On create and on rotation
   the directory was left unsynced, so the state directory could persist an advanced cursor while the event
