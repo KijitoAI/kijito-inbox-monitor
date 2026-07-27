@@ -45,6 +45,8 @@ LONGPOLL_SLACK = 10  # client socket timeout = server hold (--wait) + this, so a
 LONGPOLL_BACKOFF_CAP = 30  # cap (s) on exponential backoff between failed long-poll attempts
 PIN_TRACKING_CAP = 5000    # max delivered ids remembered above a pinned watermark (bounds the state file)
 WALK_BACK_MAX_PAGES = 50   # page budget for an authoritative backward walk over an omitted span
+BROKEN_SINK_RETRY_S = 30   # cooldown before re-trying a persona sink we refused; the refusal's RELEASE
+                           # condition, so removing a hostile path recovers without a restart (re-audit 10, H2)
 IS_POSIX = os.name == "posix"
 
 
@@ -463,13 +465,37 @@ class RotatingFileSink:
         self._fh = _open_private(self.path, "a", encoding="utf-8")
         # EVERY persisted artifact, not just the one we opened (Loom re-audit 9, H2): rotated archives
         # written by an older version keep their 0644 forever otherwise, because they are never reopened.
-        for i in range(1, self.keep + 2):
-            _repair_mode("%s.%d" % (self.path, i))
+        # THE RANGE COMES FROM THE DIRECTORY, NOT FROM `keep` (Loom re-audit 10, M4). A bound derived from
+        # CURRENT retention cannot reach an artifact left by a LARGER FORMER retention - shrinking keep
+        # from 10 to 5 stranded .7 at 0644 permanently - and an increment-until-absent scan would stop at
+        # the first hole a hand-deleted archive leaves. Listing is the only bound config cannot outlive.
+        # ★ THE VERDICT IS DELIBERATELY IGNORED HERE (loom's class, half A - "who consumes this?"). It is
+        # consumed by _repair_mode itself, which warns per file. Escalating would be wrong in both
+        # directions: these are ARCHIVES, not the live sink, so refusing to open the events file because a
+        # months-old archive is unreadable converts a stale-permission leak into a total delivery outage.
+        for archive in self._archive_paths():
+            _repair_mode(archive)
         if not existed:
             # A NEW FILE NEEDS ITS DIRECTORY ENTRY SYNCED, NOT JUST ITS BYTES (Loom re-audit 8, HIGH 2).
             # fsync on the fd makes the CONTENT durable; the NAME lives in the directory. Deferred to
             # sync() so it lands before the cursor that acknowledges these events is persisted.
             self._dir_pending = True
+
+    def _archive_paths(self):
+        """Every rotated archive of this sink that EXISTS RIGHT NOW, found by listing the directory.
+
+        Deliberately not `range(1, keep + 2)`: that bound is CURRENT config, and the artifacts most likely
+        to be left at a permissive mode are exactly the ones a FORMER, larger retention wrote (Loom
+        re-audit 10, M4). Matches `<basename>.<digits>` only, so the `.lock` sidecar is never touched.
+        """
+        d = os.path.dirname(os.path.abspath(self.path)) or "."
+        base = os.path.basename(self.path)
+        try:
+            names = os.listdir(d)
+        except OSError:
+            return []          # unreadable directory: nothing to enumerate, and _open still has to proceed
+        return sorted(os.path.join(d, n) for n in names
+                      if n.startswith(base + ".") and n[len(base) + 1:].isdigit())
 
     def _reopen_or_break(self):
         """Reopen after a rotation. A failure here must NOT escape the poll loop (Loom re-audit 9,
@@ -607,7 +633,10 @@ class Emitter:
         self._max_bytes = max_bytes
         self._keep = keep
         self._sinks_by_persona = {}
-        self._broken_sinks = set()
+        # key -> monotonic deadline before which we will not retry. NOT a set (Loom re-audit 10, H2):
+        # membership alone has no release condition, so removing a hostile symlink never recovered without
+        # a restart. WHAT CLEARS THIS: the deadline expiring and the reopen SUCCEEDING (see _sink_for).
+        self._broken_sinks = {}
 
     def _sink_for(self, persona):
         """Route an event to its persona's sink (template mode), the single shared sink, or stdout (None).
@@ -622,16 +651,29 @@ class Emitter:
         key = persona or "_all"  # events with no persona (e.g. a bare --url target) land in one _all file
         s = self._sinks_by_persona.get(key)
         if s is None:
-            if key in self._broken_sinks:
+            # A REFUSAL IS A COOLDOWN, NOT A VERDICT (Loom re-audit 10, H2). Caching the refusal with no
+            # release meant a persona whose path was briefly hostile stayed undeliverable for the life of
+            # the process: the operator removed the symlink, the fault was gone, and mail kept being held
+            # with nothing left to fix. A permanent fail-closed is the same bug as a fail-open, facing the
+            # other way (invariant 2: every pin must be dischargeable).
+            retry_at = self._broken_sinks.get(key)
+            if retry_at is not None and _monotonic() < retry_at:
                 return _BROKEN_SINK
             path = self.sink_template.replace("{persona}", _state_safe_persona(key))
             try:
                 s = RotatingFileSink(path, self._max_bytes, self._keep)
             except OSError as e:
-                self._broken_sinks.add(key)
+                self._broken_sinks[key] = _monotonic() + BROKEN_SINK_RETRY_S
                 _warn_persona_once(key, "cannot open an events sink for %r safely (%s); its mail will be "
                                         "held, not written elsewhere" % (key, e))
                 return _BROKEN_SINK
+            if self._broken_sinks.pop(key, None) is not None:
+                # Re-arm the suppressed warning so a LATER break is reported instead of silently
+                # inheriting this one's suppression, and say so - a recovery nobody can see is the same
+                # invisibility this tool exists to remove.
+                _clear_persona_warning(key)
+                sys.stderr.write("kijito-inbox-monitor: events sink for persona %r recovered; its held "
+                                 "mail will be delivered\n" % key)
             self._sinks_by_persona[key] = s
         return s
 
@@ -966,6 +1008,11 @@ class StateFile:
         self.path = path
         self.identity = identity
         self._lockf = None
+        # Set by lock() when the state file could not be PROVEN private, and consumed by load(), which
+        # then fails closed. WHAT CLEARS THIS: nothing within the process - the condition is a property of
+        # the path on disk, re-evaluated from scratch on the next start. Recorded explicitly because "no
+        # release condition" is only acceptable when it is the ANSWER, not when it is an oversight.
+        self.unsafe = False
 
     def lock(self):
         if not IS_POSIX or fcntl is None:
@@ -976,7 +1023,15 @@ class StateFile:
         # (mkstemp + os.replace) on every poll, which would orphan a flock held on it and let a second watcher
         # lock the new inode freely. The sidecar is never replaced, so the flock persists for the process
         # lifetime. flock is advisory + auto-released by the OS on exit (no stale lockfile to clean).
-        _repair_mode(self.path)          # the state file itself, if an older version left it permissive
+        if not _repair_mode(self.path):  # the state file itself, if an older version left it permissive
+            # CONSUME THE VERDICT (Loom re-audit 10, H1). This was a bare statement, so a state file we
+            # could not prove private was then trusted anyway. It is the highest-value file here to
+            # subvert: whoever controls the CURSOR controls which mail counts as already delivered, and a
+            # cursor moved FORWARD is silent, permanent mail loss - the single failure this tool exists to
+            # prevent. Deliberately NOT fatal: one persona's hostile path must not take the whole producer
+            # down (the same reasoning as _sink_for). load() fails closed on it instead, which routes into
+            # the existing, tested "present but untrustworthy" path rather than inventing a new one.
+            self.unsafe = True
         self._lockf = _open_private(self.path + ".lock", "a+")
         try:
             fcntl.flock(self._lockf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1000,13 +1055,40 @@ class StateFile:
         is present but unparseable is EVIDENCE THAT A CURSOR EXISTED, so it must fail closed and re-emit
         rather than fail open and skip. Duplicates are recoverable; skips are not.
         """
-        if not os.path.exists(self.path):
-            return None
+        if self.unsafe:
+            # The verdict lock() computed and used to discard. Present-but-not-provably-ours is exactly
+            # the "evidence a cursor existed, but not one we can trust" case: fail closed, re-emit.
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file %s could not be proven private; "
+                             "refusing to trust its cursor and failing closed\n" % self.path)
+            return CORRUPT_STATE
+        # LET THE O_NOFOLLOW OPEN BE THE EXISTENCE TEST (Loom re-audit 10, H1). The WRITE path was given
+        # O_NOFOLLOW in re-audit 9 and the READ path was left behind, so a symlink planted at the state
+        # path was followed and its target read as our own state. os.path.exists() follows symlinks too,
+        # so it was answering for the TARGET rather than the link - and being a second path lookup it
+        # opened a TOCTOU window between the check and the open. One syscall now settles both questions.
         try:
-            with open(self.path, "r") as f:
-                raw = f.read()
+            fd = os.open(self.path,
+                         os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        except FileNotFoundError:
+            return None                  # genuinely ABSENT - the one case that may baseline
         except OSError as e:
+            # PRESENT, but not something we are willing to read: a symlink (ELOOP), a FIFO, a directory.
+            # Still EVIDENCE THAT A CURSOR EXISTED, so it takes the same fail-closed answer as an
+            # unparseable file. Reading it would be worse than not resuming; baselining would be worst.
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file %s exists but is not a file we will "
+                             "read (%s); failing closed and re-emitting rather than baselining\n"
+                             % (self.path, e))
+            return CORRUPT_STATE
+        try:
+            f = os.fdopen(fd, "r")
+        except OSError as e:
+            os.close(fd)                 # never leak the descriptor we just took (re-audit 10, L6's class)
             raise FatalConfig("state-file unreadable: %s" % e)
+        with f:
+            try:
+                raw = f.read()
+            except OSError as e:
+                raise FatalConfig("state-file unreadable: %s" % e)
         if not raw.strip():
             # PRESENT BUT EMPTY IS NOT ABSENT (Loom re-audit 6, HIGH 4). A zero-byte file is still
             # evidence that a cursor existed here; treating it as a first launch baselines over
@@ -1340,6 +1422,18 @@ def _warn_persona_once(persona, text):
                      % (text, persona))
 
 
+def _clear_persona_warning(persona):
+    """WHAT CLEARS THIS: the condition the warning described actually recovering.
+
+    Without a release, suppress-once is itself an instance of loom's class - a state set and never
+    cleared - and it fails in the dangerous direction: a persona whose sink broke, recovered, then broke
+    AGAIN would be silently suppressed forever, so the second outage arrives with no diagnostic at all.
+    Called from the recovery path, never on a timer: the warning is suppressed exactly as long as the
+    condition it reported is still true.
+    """
+    _WARNED_PERSONAS.discard(persona.casefold())
+
+
 def requested_personas(args, opener, headers):
     personas = []
     for p in (p.strip() for p in args.persona or []):
@@ -1452,10 +1546,15 @@ class WatchTarget:
         sys.stderr.write("self-test[%s]: source %s (%s)\n" % (
             label, "REACHABLE+healthy" if reach_ok else "UNHEALTHY", poll.reason or "ok"
         ))
-        emit_ok = True
+        # CONSUME THE EMITTER'S ANSWER (Loom re-audit 10, M3). This was `emit_ok = True` with the call as a
+        # bare statement, flipping only on an EXCEPTION - but emit() reports a failed delivery by RETURNING
+        # False, which is its documented, non-exceptional path (a refused sink, a failed write, a non-zero
+        # --exec). So a self-test against a sink that had just refused the write printed emit=OK. The one
+        # surface whose entire job is to tell an operator "this works before you trust it" was itself an
+        # instance of the class it exists to detect - which is why a sweep starts with the diagnostics.
         try:
-            self.emitter.new({"id": 0, "from": "self-test", "content": "synthetic emit OK",
-                              "created": _now_iso(), "_persona": self.persona})
+            emit_ok = bool(self.emitter.new({"id": 0, "from": "self-test", "content": "synthetic emit OK",
+                                             "created": _now_iso(), "_persona": self.persona}))
         except Exception as e:
             emit_ok = False
             sys.stderr.write("self-test[%s]: emit FAILED: %s\n" % (label, e))

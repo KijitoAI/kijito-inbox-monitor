@@ -520,3 +520,55 @@ questions about different systems. `CaseAsymmetryInvariantTest` is the defence, 
 
 The variant inbox remains unwatchable locally (layer 1) AND unwatched remotely (layer 2), which is precisely why
 it is ALARMED on rather than adopted - while layer 3 keeps a live cursor from being destroyed by a spelling change.
+
+### 14.8 The safety-state register: what SETS it, what CLEARS it (Loom re-audit 10, the class sweep)
+
+Ten consecutive RED audit rounds shared one generator, named by loom after round 10:
+
+> **Safety repair checks are locally correct but their RESULT/LIFECYCLE is not propagated end-to-end; test
+> or recovery surfaces then preserve the old unsafe state or create permanent liveness loss.**
+
+It has exactly two halves, and they are the same bug facing opposite ways - one loses the ANSWER, the other
+loses the EXIT:
+
+* **WHO CONSUMES THIS?** A check that computes a correct verdict which nobody reads.
+* **WHAT CLEARS THIS?** A safety STATE that is set and never released.
+
+Rather than patch instances (which produced the next round's findings three times running), the whole file
+was swept. **Two rules now bind, and both are mechanically checkable:**
+
+1. **A call to a bool-returning safety helper may not appear as a bare statement** unless the comment at
+   that site says the verdict is deliberately ignored AND why. There is exactly ONE such site today:
+   `_repair_mode(archive)` in `RotatingFileSink._open`, because refusing to open the live events file
+   because a months-old ARCHIVE is unreadable would convert a stale-permission leak into a delivery outage.
+2. **Every safety flag has a release condition, written here.** "Nothing releases it" is an acceptable
+   answer only when it is the ANSWER (a property re-evaluated from scratch at process start), never when
+   it is an oversight.
+
+| state | set when | **cleared when** |
+|---|---|---|
+| `RotatingFileSink._pending` | bytes written, not yet fsynced | a successful `sync()` |
+| `RotatingFileSink._dir_pending` | a directory ENTRY was created/rotated | the directory fsync succeeds |
+| `RotatingFileSink._sync_failed` | an fsync we can never retry failed (fd rotated away) | reopen - a new fd makes it retryable |
+| `RotatingFileSink._broken` | reopen after rotation failed | the next `write()` reopens successfully |
+| `Emitter._broken_sinks[key]` | a persona sink could not be opened safely | `BROKEN_SINK_RETRY_S` elapses **and** the reopen succeeds |
+| `_WARNED_PERSONAS` entry | a per-persona warning was emitted once | `_clear_persona_warning()` on that persona's recovery |
+| `_REPORTED_STRANDED` | a stranded inbox was alarmed on | `intersection_update` drops it when it is no longer stranded |
+| `StateFile.unsafe` | `_repair_mode` could not prove the state file private | *nothing in-process, deliberately* - it is a property of the path on disk, re-derived at next start |
+| `WatchTarget.delivery_blocked` | an emit failed; the cursor is held | the next successful delivery |
+| `WatchTarget.state_not_durable` | a cursor write could not be proven durable | the next durable cursor write |
+| `WatchTarget.pin_forced` / `state_corrupt` | a pin was forced / state was corrupt on load | the pin discharges against `_pin_release_floor()` |
+| `WatchTarget.pin_evidence_intact` | *(false)* pin tracking overflowed or was corrupt | an authoritative read only - never by counting (invariant 3) |
+| `WatchTarget.emitted_above` | ids delivered above a pinned watermark | reassigned empty when the pin releases |
+
+**Invariant 2 restated, because it is what half B protects:** every pin must be DISCHARGEABLE. A permanent
+fail-closed is the same defect as a fail-open - it just fails in the direction that looks responsible.
+
+**⚠️ The class does NOT cover everything audit 10 found, and pretending otherwise is how the next round
+gets missed.** H1, H2 and M3 are instances of the two halves above. M4 (a repair loop whose RANGE came from
+CURRENT config, so a shrunk `keep` stranded `.7` at 0644 forever), M5 (a gate whose fall-through arm was the
+optimistic one, so a mutant that killed the interpreter scored as CAUGHT) and L6 (a harness leaking the temp
+trees and descriptors it opened) are three DIFFERENT shapes. Sweeping for loom's two halves alone would have
+left all three in place. The mechanical detectors that do reach them: a loop bound derived from live config
+rather than from the directory; an if/elif chain whose terminal `else` is the success arm; an `open()`/
+`mkdtemp()` whose handle or tree is never released.
