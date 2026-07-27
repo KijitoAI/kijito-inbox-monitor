@@ -3124,5 +3124,184 @@ class Loom7StateFileHygieneTest(unittest.TestCase):
         sf.unlock()
 
 
+def _capture_stderr(test):
+    """Swap stderr for a buffer for the duration of ONE test, and return it."""
+    buf, err = __import__("io").StringIO(), km.sys.stderr
+    km.sys.stderr = buf
+    test.addCleanup(lambda: setattr(km.sys, "stderr", err))
+    return buf
+
+
+class Loom10ClassSweepTest(unittest.TestCase):
+    """Loom re-audit 10 - the CLASS, swept rather than patched one finding at a time.
+
+    "Safety repair checks are locally correct but their RESULT/LIFECYCLE is not propagated end-to-end."
+    Two halves: WHO CONSUMES THIS (an answer nobody reads) and WHAT CLEARS THIS (a state nothing releases).
+    Every test here asserts the half that a call-deletion mutation cannot reach - that the ANSWER is read
+    and that the STATE is released - because a test proving the call is present proved exactly that and no
+    more, which is how the same defect survived nine rounds.
+    """
+
+    # ---- half A: the answer is CONSUMED -------------------------------------------------------------
+    def test_M3_self_test_reports_FAIL_when_the_emitter_REFUSES_the_write(self):
+        # THE SELF-TEST MUST NOT LIE. emit() reports a failed delivery by RETURNING False - its normal,
+        # documented path - so a self-test that only catches exceptions reports emit=OK against a sink
+        # that just refused the mail. The surface whose whole job is "is this tool working?" was itself
+        # an instance of the class.
+        d = tempfile.mkdtemp()
+        os.symlink(os.path.join(d, "nowhere.txt"), os.path.join(d, "events.argus.ndjson"))
+        em = km.Emitter("stdout-jsonl", None, 220, False,
+                        sink_template=os.path.join(d, "events.{persona}.ndjson"))
+        self.addCleanup(em.close)
+        # WatchTarget.__init__ builds openers and state files; self_test needs only these five attributes.
+        wt = object.__new__(km.WatchTarget)
+        wt.opener, wt.url, wt.headers, wt.persona, wt.emitter = None, "https://x/api/inbox", {}, "argus", em
+        real_fetch = km.fetch
+        km.fetch = lambda *a, **k: km.Poll(True, [])          # the SOURCE is healthy; only the SINK is not
+        self.addCleanup(lambda: setattr(km, "fetch", real_fetch))
+        buf = _capture_stderr(self)
+        ok = wt.self_test()
+        self.assertIs(ok, False, "a self-test whose emit was REFUSED must not report success")
+        self.assertIn("emit=FAIL", buf.getvalue())
+        self.assertNotIn("emit=OK", buf.getvalue())
+
+    def test_H1_an_unrepairable_state_file_is_marked_unsafe_rather_than_used(self):
+        # The verdict of _repair_mode() at the lock site was DISCARDED. A symlink at the state path is the
+        # real, reachable form of "cannot be proven private": _repair_mode opens O_NOFOLLOW, gets ELOOP,
+        # and answers False.
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "hive.json")
+        os.symlink(os.path.join(d, "elsewhere.json"), p)
+        sf = km.StateFile(p, "idx")
+        _capture_stderr(self)
+        sf.lock()
+        self.addCleanup(sf.unlock)
+        self.assertIs(sf.unsafe, True, "_repair_mode answered False and the answer must be CONSUMED")
+
+    def test_H1_an_unsafe_state_file_fails_CLOSED_instead_of_being_trusted(self):
+        # A file we cannot prove private must not supply a cursor - whoever controls the cursor controls
+        # which mail counts as delivered, and a cursor moved forward is silent, permanent loss.
+        # _repair_mode is stubbed because the portable ways to make a REAL file untightenable need another
+        # uid; the condition itself is entirely reachable (a file owned by someone else at our state path).
+        # The file on disk is deliberately VALID and loadable, so the assertion can only pass because the
+        # unsafe verdict was consumed - never because the read failed anyway.
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "hive.json")
+        km.StateFile(p, "idx").save(200, "UP", 0)
+        self.assertIsInstance(km.StateFile(p, "idx").load(), dict, "precondition: this file IS loadable")
+        real = km._repair_mode
+        km._repair_mode = lambda path: False
+        self.addCleanup(lambda: setattr(km, "_repair_mode", real))
+        sf = km.StateFile(p, "idx")
+        _capture_stderr(self)
+        sf.lock()
+        self.addCleanup(sf.unlock)
+        self.assertIs(sf.load(), km.CORRUPT_STATE,
+                      "an unprovable state file must fail closed and re-emit, never resume")
+
+    def test_H1_the_state_file_READ_path_does_not_follow_a_SYMLINK(self):
+        # The WRITE path got O_NOFOLLOW in re-audit 9; the READ path was left following links, so a link
+        # planted at the state path was read as our own state. The target here is a genuinely valid,
+        # identity-matching state file - so if the read followed the link it would RESUME from it, and
+        # this test would be the only thing standing between that and a forged cursor.
+        d = tempfile.mkdtemp()
+        target = os.path.join(d, "attacker.json")
+        km.StateFile(target, "idx").save(999, "UP", 0)
+        self.assertIsInstance(km.StateFile(target, "idx").load(), dict, "precondition: target is valid")
+        p = os.path.join(d, "hive.json")
+        os.symlink(target, p)
+        sf = km.StateFile(p, "idx")            # note: no lock(), so `unsafe` is False and cannot mask this
+        self.assertIs(sf.unsafe, False)
+        _capture_stderr(self)
+        self.assertIs(sf.load(), km.CORRUPT_STATE,
+                      "a symlink at the state path must be refused, not resumed from")
+
+    def test_H1_a_genuinely_ABSENT_state_file_still_baselines(self):
+        # The fail-closed path must not swallow the ordinary first-launch case: absent is still None.
+        sf = km.StateFile(os.path.join(tempfile.mkdtemp(), "hive.json"), "idx")
+        self.assertIsNone(sf.load(), "a first launch must still baseline, not re-emit")
+
+    # ---- half B: the state is RELEASED --------------------------------------------------------------
+    def test_H2_a_refused_persona_sink_RECOVERS_once_the_path_is_usable(self):
+        # A refusal cached with no release meant the operator removed the hostile symlink and mail was
+        # still held, with nothing left to fix, for the life of the process. A permanent fail-closed is
+        # the same defect as a fail-open, facing the other way.
+        d = tempfile.mkdtemp()
+        link = os.path.join(d, "events.argus.ndjson")
+        os.symlink(os.path.join(d, "nowhere.txt"), link)
+        em = km.Emitter("stdout-jsonl", None, 220, False,
+                        sink_template=os.path.join(d, "events.{persona}.ndjson"))
+        self.addCleanup(em.close)
+        clock = [1000.0]
+        real = km._monotonic
+        km._monotonic = lambda: clock[0]
+        self.addCleanup(lambda: setattr(km, "_monotonic", real))
+        buf = _capture_stderr(self)
+        km.sys.stdout, out = __import__("io").StringIO(), km.sys.stdout
+        self.addCleanup(lambda: setattr(km.sys, "stdout", out))
+        self.assertIs(em.new({"id": 1, "from": "r", "_persona": "argus"}), False, "refused while hostile")
+        os.unlink(link)                                   # the operator fixes the path
+        clock[0] += km.BROKEN_SINK_RETRY_S + 1            # and the cooldown expires
+        self.assertIs(em.new({"id": 2, "from": "r", "_persona": "argus"}), True,
+                      "the refusal must RELEASE once the condition that caused it is gone")
+        self.assertTrue(em.sync("argus"), "and its events are durable again")
+        self.assertIn("recovered", buf.getvalue(), "a recovery nobody can see is still invisibility")
+
+    def test_H2_a_recovered_sink_RE_ARMS_its_suppressed_warning(self):
+        # warn-once is itself a state that is set and never cleared. Left unreleased, a persona that
+        # broke, recovered, then broke AGAIN would be suppressed forever - the second outage arriving
+        # with no diagnostic at all. Fixing one half of the class must not create a new instance of it.
+        d = tempfile.mkdtemp()
+        link = os.path.join(d, "events.argus.ndjson")
+        os.symlink(os.path.join(d, "nowhere.txt"), link)
+        em = km.Emitter("stdout-jsonl", None, 220, False,
+                        sink_template=os.path.join(d, "events.{persona}.ndjson"))
+        self.addCleanup(em.close)
+        km._WARNED_PERSONAS.discard("argus")
+        self.addCleanup(lambda: km._WARNED_PERSONAS.discard("argus"))
+        clock = [1000.0]
+        real = km._monotonic
+        km._monotonic = lambda: clock[0]
+        self.addCleanup(lambda: setattr(km, "_monotonic", real))
+        _capture_stderr(self)
+        km.sys.stdout, out = __import__("io").StringIO(), km.sys.stdout
+        self.addCleanup(lambda: setattr(km.sys, "stdout", out))
+        em.new({"id": 1, "from": "r", "_persona": "argus"})
+        self.assertIn("argus", km._WARNED_PERSONAS, "precondition: the warning was suppressed")
+        os.unlink(link)
+        clock[0] += km.BROKEN_SINK_RETRY_S + 1
+        em.new({"id": 2, "from": "r", "_persona": "argus"})
+        self.assertNotIn("argus", km._WARNED_PERSONAS,
+                         "a recovered persona must be able to warn again if it breaks a second time")
+
+    # ---- the shapes loom's one-sentence class does NOT cover ----------------------------------------
+    def test_M4_an_archive_left_by_a_LARGER_former_retention_is_still_repaired(self):
+        # The repair loop's range came from CURRENT config, so shrinking keep from 10 to 5 stranded .7 at
+        # 0644 permanently. A bound taken from config cannot reach what a former config wrote.
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "events.ndjson")
+        for suffix in (".1", ".7"):
+            with open(p + suffix, "w") as f:
+                f.write("old mail\n")
+            os.chmod(p + suffix, 0o644)
+        _capture_stderr(self)
+        km.RotatingFileSink(p, 0, 5).close()              # keep=5 - .7 is BEYOND the old range
+        self.assertEqual(os.stat(p + ".1").st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(p + ".7").st_mode & 0o777, 0o600,
+                         "an archive from a larger former retention leaks forever otherwise")
+
+    def test_M4_the_lock_sidecar_is_not_mistaken_for_an_archive(self):
+        # Listing the directory widens the range on purpose; it must not widen it onto the wrong files.
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "events.ndjson")
+        sink = km.RotatingFileSink(p, 0, 5)
+        self.addCleanup(sink.close)
+        self.assertEqual([os.path.basename(x) for x in sink._archive_paths()], [])
+        for name in ("events.ndjson.lock", "events.ndjson.bak", "events.ndjson.2"):
+            with open(os.path.join(d, name), "w") as f:
+                f.write("x")
+        self.assertEqual([os.path.basename(x) for x in sink._archive_paths()], ["events.ndjson.2"])
+
+
 if __name__ == "__main__":
     unittest.main()
