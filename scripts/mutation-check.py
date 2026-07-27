@@ -206,11 +206,46 @@ M=[
   "        if again != PRIVATE_FILE_MODE:\n            raise InsecureFile",
   "        if False:\n            raise InsecureFile"),
  ("L9-H2: pre-existing rotated archives are not repaired",
-  "        for i in range(1, self.keep + 2):\n            _repair_mode(",
-  "        for i in []:\n            _repair_mode("),
- ("L9-H2: the state file itself is not repaired",
-  "        _repair_mode(self.path)          # the state file itself",
-  "        pass  # the state file itself"),
+  "        for archive in self._archive_paths():\n            _repair_mode(archive)",
+  "        for archive in []:\n            _repair_mode(archive)"),
+ # L10-M4: the CALL survives, only its RANGE narrows back to current retention. [[22206]] - deleting a
+ # call proves the call is present; it does not prove the range it walks is the right one.
+ ("L10-M4: archive repair is bounded by CURRENT retention again (a shrunk `keep` strands the rest)",
+  "        return sorted(os.path.join(d, n) for n in names\n"
+  "                      if n.startswith(base + \".\") and n[len(base) + 1:].isdigit())",
+  "        return sorted(os.path.join(d, \"%s.%d\" % (base, i)) for i in range(1, self.keep + 2)\n"
+  "                      if \"%s.%d\" % (base, i) in names)"),
+ # L10-H1: two mutations on ONE fix. The first deletes the CALL, the second keeps the call and discards
+ # only its ANSWER - which is the exact defect loom found, and the one a call-deletion cannot detect.
+ ("L10-H1: the state file itself is not repaired (call deleted)",
+  "        if not _repair_mode(self.path):  # the state file itself",
+  "        if False:  # the state file itself"),
+ ("L10-H1: ★ _repair_mode's verdict is DISCARDED again at the call site (result-mutation)",
+  "        if not _repair_mode(self.path):  # the state file itself",
+  "        _repair_mode(self.path)\n        if False:  # the state file itself"),
+ ("L10-H1: the state-file READ path follows symlinks again (O_NOFOLLOW dropped)",
+  "            fd = os.open(self.path,\n"
+  "                         os.O_RDONLY | getattr(os, \"O_NOFOLLOW\", 0) | getattr(os, \"O_NONBLOCK\", 0))",
+  "            fd = os.open(self.path, os.O_RDONLY | getattr(os, \"O_NONBLOCK\", 0))"),
+ ("L10-H1: an unsafe state file is trusted instead of failing closed",
+  "        if self.unsafe:",
+  "        if False:"),
+ # L10-H2: the release condition. A permanent fail-closed is the same bug as a fail-open, facing the
+ # other way - so the mutation restores the PERMANENT refusal and the suite must notice the recovery
+ # never happens.
+ ("L10-H2: ★ a refused persona sink is cached PERMANENTLY again (no release condition)",
+  "            retry_at = self._broken_sinks.get(key)\n            if retry_at is not None and _monotonic() < retry_at:",
+  "            retry_at = self._broken_sinks.get(key)\n            if retry_at is not None:"),
+ ("L10-H2: a recovered sink never clears its warning suppression",
+  "                _clear_persona_warning(key)",
+  "                pass"),
+ # L10-M3: the self-test. Call-mutation AND result-mutation, because the defect was purely in the result.
+ ("L10-M3: ★ self_test discards the emitter's answer again and reports emit=OK (result-mutation)",
+  "            emit_ok = bool(self.emitter.new({\"id\": 0, \"from\": \"self-test\", \"content\": \"synthetic emit OK\",\n"
+  "                                             \"created\": _now_iso(), \"_persona\": self.persona}))",
+  "            emit_ok = True\n"
+  "            self.emitter.new({\"id\": 0, \"from\": \"self-test\", \"content\": \"synthetic emit OK\",\n"
+  "                              \"created\": _now_iso(), \"_persona\": self.persona})"),
  ("L9-M3: makedirs goes back to leaf-only",
   "    for d in reversed(missing):\n        try:\n            os.mkdir(d, PRIVATE_DIR_MODE)",
   "    for d in reversed(missing[:1]):\n        try:\n            os.mkdir(d, PRIVATE_DIR_MODE)"),
@@ -240,21 +275,30 @@ M=[
   "    elif False:"),
 ]
 def run(src):
-    d=tempfile.mkdtemp(); shutil.copy(TESTS, os.path.join(d,"test_kijito_monitor.py"))
-    open(os.path.join(d,"kijito_inbox_monitor.py"),"w").write(src)
-    # PIN THE WARNING FILTER. Inherited PYTHONWARNINGS=error turns a mutant's leaked fd into an ERROR,
-    # which silently converts "survived" into "caught" - a gate whose verdict depends on the caller's
-    # environment is not a gate (Loom re-audit 9, MEDIUM: 55+ ResourceWarnings under warnings=error).
-    env=dict(os.environ); env["PYTHONWARNINGS"]="default"
+    # RELEASE WHAT WE ACQUIRE (Loom re-audit 10, L6). The temp tree was never removed and the source file
+    # was written through an unbound handle, so a full gate run leaked one directory per mutant plus a
+    # descriptor each. In a tool whose whole purpose is to catch resource and lifecycle defects, leaking
+    # both is not merely untidy - it is the harness exhibiting the class it is meant to detect.
+    d=tempfile.mkdtemp()
     try:
-        p=subprocess.run([sys.executable,"-m","unittest","test_kijito_monitor"],cwd=d,capture_output=True,
-                         text=True,env=env,timeout=MUTANT_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        # A mutant that HANGS is not caught - nothing asserted anything, the suite simply stopped. It also
-        # used to stall the gate itself indefinitely, which is how a quality tool becomes one nobody runs.
-        return None, "HUNG"
-    return p.returncode, p.stderr
-base=open(SRC).read()
+        shutil.copy(TESTS, os.path.join(d,"test_kijito_monitor.py"))
+        with open(os.path.join(d,"kijito_inbox_monitor.py"),"w") as fh:
+            fh.write(src)
+        # PIN THE WARNING FILTER. Inherited PYTHONWARNINGS=error turns a mutant's leaked fd into an ERROR,
+        # which silently converts "survived" into "caught" - a gate whose verdict depends on the caller's
+        # environment is not a gate (Loom re-audit 9, MEDIUM: 55+ ResourceWarnings under warnings=error).
+        env=dict(os.environ); env["PYTHONWARNINGS"]="default"
+        try:
+            p=subprocess.run([sys.executable,"-m","unittest","test_kijito_monitor"],cwd=d,capture_output=True,
+                             text=True,env=env,timeout=MUTANT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            # A mutant that HANGS is not caught - nothing asserted anything, the suite simply stopped. It also
+            # used to stall the gate itself indefinitely, which is how a quality tool becomes one nobody runs.
+            return None, "HUNG"
+        return p.returncode, p.stderr
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+with open(SRC) as fh: base=fh.read()
 rc,_=run(base)
 if rc!=0: print("BASELINE NOT GREEN"); sys.exit(1)
 print("baseline: GREEN\n")
@@ -269,10 +313,20 @@ for label,pat,rep in M:
     rc,err=run(mut)
     if rc is None:
         print("!! HUNG, not a catch:",label); surv.append(label); continue
-    m=re.search(r"FAILED \((.*)\)",err); det=m.group(1) if m else "error"
+    m=re.search(r"FAILED \((.*)\)",err); det=m.group(1) if m else None
     total=re.search(r"Ran (\d+) tests",err)
-    nerr=re.search(r"errors=(\d+)",det); nfail=re.search(r"failures=(\d+)",det)
+    nerr=re.search(r"errors=(\d+)",det or ""); nfail=re.search(r"failures=(\d+)",det or "")
     if rc==0: print("SURVIVED ",label); surv.append(label)
+    elif total is None or det is None:
+        # A RUN THAT PRODUCED NO TEST VERDICT IS NOT A CATCH (Loom re-audit 10, M5). `det` used to default
+        # to the string "error" when no summary matched, and the chain's terminal `else` was the OPTIMISTIC
+        # arm - so a mutant that killed the interpreter outright (a signal, os._exit, an import-time crash)
+        # matched no failure pattern and was recorded as CAUGHT. Nothing asserted anything; the process
+        # merely died, which proves the mutation is DETECTABLE but not that any TEST detects it.
+        # `total` was computed here and never read - the same dropped-answer half of the class, inside the
+        # gate itself. It is now the liveness precondition: no "Ran N tests" means the suite never ran, and
+        # a check that could not run must never be scored as a check that passed.
+        print("!! NO TEST VERDICT (crash/signal/exit %s), not a catch:"%rc,label); surv.append(label)
     elif nfail is None and nerr:
         # STRICTLY: no FAILURES means no test NOTICED the behaviour - it only noticed the program
         # breaking. The old form allowed this whenever errors were under half the suite, which is how
