@@ -5,6 +5,51 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-28
+
+⚠️ **WHAT THIS RELEASE DOES AND DOES NOT ESTABLISH.** Two audit rounds swept a defect CLASS rather than
+patching instances: *a safety check whose result nobody consumes, a safety state nothing clears, and - added
+in the second round - a state committed as if an action succeeded before it did.* **It establishes that the
+KNOWN INSTANCES ARE FIXED. It does NOT establish that no further shapes exist.** That distinction is not
+boilerplate: widening the class immediately surfaced two more sites AND a blind spot in the detector itself
+(bool-return detection was not transitive, so one function was invisible and another was caught only by the
+accident of an unrelated `return True`). A class derived from N instances cannot be validated by
+rediscovering those N.
+⚠️ **PROVENANCE OF THE REVIEW.** The final verdict came from the author of the acceptance criteria, who was
+also a party to the technical dispute it adjudicated. She disclosed both conflicts and held the
+do-not-ship outcome as genuinely reachable - and returned it once before this release. The independent
+reviewer originally assigned never read the request.
+
+### Fixed (re-audit 11 - the alarm path)
+- **An alarm could be recorded as raised when it was never delivered.** Every alarm committed its
+  "already alarmed" state BEFORE emitting and discarded the emit's answer, and three of the four had no
+  second channel. An undelivered alarm was never re-raised - not when the channel recovered, and not after
+  a restart, because `gap_alerted` is persisted. **Mail was never at risk** (the cursor holds correctly
+  throughout); it was the ALARMS that vanished, which matters because the headline promise is that a walk
+  which cannot complete pins *loudly* rather than in silence. `WatchTarget.lifecycle` now returns delivery,
+  and alarms go through `_alarm()`, which falls back to **stderr** - never a retry down the channel that
+  just failed. A pure announcement latch (`gap_alerted`) commits only on delivery; behavioural state
+  (`fsm_state`, `pin_evidence_intact`) commits regardless, because refusing to record evidence loss would
+  trade a lost alarm for a lost invariant. Lifecycle events remain unacknowledged and ungated (DESIGN.md
+  §170 unchanged); the guaranteed/informational split is now documented as §14.9.
+- **The recovery edge failed the same way, facing the other way** - both `recovered` sites committed
+  `fsm_state = "UP"` and discarded the emit, leaving a consumer that saw the DOWN alert holding an alarm it
+  could never clear.
+- **The dead-man's switch had no test at all.** Deleting the liveness DOWN alert outright left the entire
+  suite green - the one event the README sells as the headline feature was undefended. It now has tests and
+  its own mutation.
+- **Two case-variant personas could refuse to start the whole producer.** `requested_personas()` deduped
+  exactly while `new_personas()` casefolds, so `--persona Loom --persona loom` resolved to one state path;
+  the second `flock` raised out of an uncaught list comprehension and killed startup for *every* persona,
+  blaming "another watcher" for a collision with itself.
+
+### Fixed (documentation)
+- `RELEASING.md` claimed the producer "does not run this package (yet)" and "executes the WORKING TREE
+  directly", four lines after the preceding section said the opposite. It had been stale since the producer
+  was pinned to a read-only artifact, and the stale half was the dangerous one: a reader who trusted it
+  would edit the tree, restart, and **deploy nothing while believing they deployed**.
+
+
 ### Security
 - **The first fix for the permissions bug was itself a worse bug** (Loom re-audit 9, HIGH 1). The repair
   introduced in the previous entry followed symlinks, validated neither owner nor file type, and - because
