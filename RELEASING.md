@@ -55,20 +55,30 @@ anywhere. Pushing a version tag publishes to both PyPI and npm, with provenance 
    ★ **THIS IS DONE-WHEN #7 AND THE RELEASE IS NOT COMPLETE WITHOUT IT.** Items 1-6 can all pass while the
    fleet's only mail producer still runs the PRE-RELEASE artifact.
 
-## The producer does not run this package (yet)
+## The producer runs a PINNED ARTIFACT - a restart deploys NOTHING
 
-⚠️ The fleet's supervised producer (`com.kijito.inbox-monitor`) currently executes the WORKING TREE
-directly - `plutil -p ~/Library/LaunchAgents/com.kijito.inbox-monitor.plist` shows the path. So a green
-publish tells you nothing about what the fleet runs, and any crash restarts it on whatever is on disk.
-★ ✔ REPOINTING IT AT A PINNED ARTIFACT IS AUTHORISED (Jason, 2026-07-27: "fully authed to merge, deploy,
-use any server at our disposal") and is STEP 2 of the recovery plan. An older note here said it "needs his
-go-ahead, so it is flagged rather than done" - that gate is DEAD, do not re-derive it.
-⚠️ "Released artifact" does NOT mean a PyPI release. Reading it that way made the plan circular (repoint
-needs a release -> release needs a GREEN audit -> the audit was meant to follow the repoint). Install the
-audited SHA as a LOCAL versioned artifact: a built wheel, or a read-only checkout at the tag.
+✔ DONE 2026-07-27. `com.kijito.inbox-monitor` executes a read-only artifact under
+`~/.local/share/kijito-inbox-monitor/versions/<sha>/`, extracted with `git show <sha>:...` and checksum-
+asserted equal to the commit; both `ProgramArguments[2]` and `WorkingDirectory` point there. Confirm with
+`plutil -p ~/Library/LaunchAgents/com.kijito.inbox-monitor.plist`.
+⚠️⚠️ **THE CONSEQUENCE INVERTS THE OLD RULE, AND THIS IS THE DANGEROUS PART.** Editing the working tree,
+switching branches or committing changes NOTHING about what the fleet runs, and neither does a restart.
+**Anyone acting on the old "a restart IS the deploy" rule will deploy nothing and believe they deployed** -
+a no-op deploy and a successful one produce identical evidence (process up, status 0, heartbeat fresh,
+mail flowing), because those are properties of whatever is running, not of what you intended to run.
+★ TO DEPLOY: rebuild the artifact at the NEW sha, repoint BOTH plist paths, `bootout` -> wait for the pid
+to VANISH (~50s) -> `bootstrap`, then **assert the running process is that sha**:
+    ../bin/producer-health.sh <new-sha>     # non-zero unless the RUNNING argv carries that sha
+Health alone cannot tell a successful deploy from a no-op one; only naming the expected sha can.
 Before touching launchctl: `bootout` + `bootstrap` (never `kickstart`), never back-to-back (they race ->
 "Bootstrap failed: 5" leaving NO service), SIGTERM takes ~50s, copy the current plist aside as a rollback
 FIRST, and announce the restart to the hive - this is the fleet's only mail producer.
+⚠️ "Released artifact" does NOT mean a PyPI release. Reading it that way made the plan circular (repoint
+needs a release -> release needs a GREEN audit -> the audit was meant to follow the repoint). Install the
+audited SHA as a LOCAL versioned artifact: a built wheel, or a read-only checkout at the tag.
+(This section previously said the producer "does not run this package (yet)" and "currently executes the
+WORKING TREE directly", four lines after item 8 said the opposite. It was stale from the moment step 2
+landed, and the stale half was the one that would cause a silent no-op deploy - re-audit 11, F4.)
 
 ## One-time setup (already done for 0.1.0)
 
