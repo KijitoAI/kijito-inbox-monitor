@@ -273,6 +273,36 @@ M=[
  ("L6-MEDIUM: uninterpretable truncation reads as no-omission",
   "    elif trunc is not _MISSING and trunc is not False:",
   "    elif False:"),
+ # ---- re-audit 11 (river): acknowledge-before-deliver in the ALARM path -------------------------
+ # ★ A1 is the one that mattered: this exact mutation SURVIVED all 242 tests before this round,
+ # because the dead-man's switch - the event README sells as the headline feature - had no test.
+ ("L11-A1: ★ the liveness DOWN alert is deleted outright (it survived 242 tests before)",
+  '                    down_reason = poll.reason or "unreachable"\n'
+  '                    self._alarm("alert", "source is DOWN: %s" % down_reason,\n'
+  '                                reason=down_reason,\n'
+  '                                consecutive_failures=self.failures,\n'
+  '                                seconds=self.failures * args.poll_seconds)',
+  '                    pass'),
+ ("L11-F1: the DOWN alert loses its stderr fallback (undelivered == silent again)",
+  '            sys.stderr.write("kijito-inbox-monitor: %s EVENT UNDELIVERED (persona %r): %s\\n"\n'
+  '                             % (event.upper(), self.persona, log_text))',
+  '            pass'),
+ ("L11-F1: ★ the gap alarm latches BEFORE delivery again (an undelivered alarm never re-raises)",
+  '                        if self._alarm("alert", gap_reason,',
+  '                        self.gap_alerted = cursor_at\n'
+  '                        if self._alarm("alert", gap_reason,'),
+ ("L11-F1: WatchTarget.lifecycle drops the emitter's answer again",
+  "        return self.emitter.lifecycle(event, **fields)",
+  "        self.emitter.lifecycle(event, **fields)"),
+ ("L11-F1: the FAST-PATH recovered edge stops reporting an undelivered event",
+  '                self._alarm("recovered", "source recovered", cursor=self.cursor)',
+  '                self.lifecycle("recovered", cursor=self.cursor)'),
+ ("L11-F1: the MAIN-PATH recovered edge stops reporting an undelivered event",
+  '                    self._alarm("recovered", "source recovered", cursor=self.cursor)',
+  '                    self.lifecycle("recovered", cursor=self.cursor)'),
+ ("L11-F3: the startup persona list dedupes EXACTLY again (case-variants self-deadlock)",
+  "        key = p.casefold()\n        if p and key not in seen:",
+  "        key = p\n        if p and key not in seen:"),
 ]
 def run(src):
     # RELEASE WHAT WE ACQUIRE (Loom re-audit 10, L6). The temp tree was never removed and the source file

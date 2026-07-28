@@ -572,3 +572,40 @@ trees and descriptors it opened) are three DIFFERENT shapes. Sweeping for loom's
 left all three in place. The mechanical detectors that do reach them: a loop bound derived from live config
 rather than from the directory; an if/elif chain whose terminal `else` is the success arm; an `open()`/
 `mkdtemp()` whose handle or tree is never released.
+
+### 14.9 Which lifecycle events are GUARANTEED, and which are deliberately not (re-audit 11, F1)
+
+§14.8 required every safety VERDICT to have a consumer. Re-audit 11 found a third half of the class that
+neither of those questions reaches:
+
+> **(C) What did we WRITE DOWN as if the action had succeeded?** - a state committed as if an operation
+> succeeded, ordered before and independently of whether it did.
+
+Every alarm committed its "already alarmed" state BEFORE emitting and discarded the emit's answer, and
+three of the four had no second channel. So an alarm that was never delivered was never re-raised - not
+when the channel recovered, and not after a restart, because `gap_alerted` is persisted. **Mail was never
+at risk** (the cursor holds correctly throughout); the ALARMS vanished. That is worse than it sounds,
+because the headline promise is that a walk which cannot complete pins **loudly** rather than in silence.
+
+★ **The class as previously stated did not merely miss this - it CLEARED it.** Asked "who consumes
+`lifecycle()`'s answer?", the correct answer is "nobody, deliberately" (§14.7 / §170 below). A satisfying
+answer to the class's question sat directly on top of the defect.
+
+**THE RULE NOW, and it is a two-tier one:**
+
+| tier | events | contract |
+|---|---|---|
+| **GUARANTEED** | `alert`, `recovered` | emitted via `WatchTarget._alarm`, which RETURNS delivery. An undelivered one is written to **stderr** - never retried down the event channel, which is the thing that just failed. A **pure announcement latch** (`gap_alerted`) commits ONLY on delivery; a **behavioural** state (`fsm_state`, `pin_evidence_intact`) commits regardless, because refusing to record evidence loss would trade a lost alarm for a lost invariant. |
+| **INFORMATIONAL** | `armed`, `heartbeat`, `persona_added`, `seed_ahead`, `replay_capped`, `state_corrupt` | deliberately NOT acknowledged and NOT gated (§170 stands). They record something that already happened; nothing latches "we announced it", so a lost one costs a notification, not a fact. |
+
+`stranded-mail` is a third case: its unconditional `stderr` write happens BEFORE the event, so an
+undelivered alert is already on the record.
+
+⚠️ **"Do not gate the cursor on a lifecycle event" and "do not record that you alarmed when you did not"
+are DIFFERENT propositions, and only the first was ever documented.** §170 is unchanged and correct; it
+was never a licence for the second.
+
+★ AND THE IRONY THAT MAKES THIS WORTH REMEMBERING: this codebase gets acknowledge-before-deliver **exactly
+right for MAIL** - the cursor IS the acknowledgement, delivery stops at the first failure, the durability
+barrier retracts wholesale - and got it **exactly backwards for its own ALARMS**. The architecture knew the
+principle by name and did not apply it to itself.
