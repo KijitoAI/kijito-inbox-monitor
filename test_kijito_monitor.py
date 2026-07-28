@@ -3124,6 +3124,165 @@ class Loom7StateFileHygieneTest(unittest.TestCase):
         sf.unlock()
 
 
+class Loom11AlarmDeliveryTest(unittest.TestCase):
+    """Re-audit 11, F1/F2 - AN ALARM MUST NOT RECORD ITSELF AS RAISED UNLESS IT WAS DELIVERED.
+
+    Every alarm used to commit its "already alarmed" state BEFORE emitting and discard the emit's
+    answer, so an alarm that was never delivered was never re-raised - not after the channel recovered
+    and not after a restart (`gap_alerted` is persisted). Mail was never at risk; the ALARMS vanished.
+    F2 is why it stayed invisible: the liveness alert had NO test at all, and deleting it outright left
+    all 242 tests green.
+    """
+
+    class Recorder:
+        """Emitter double whose lifecycle delivery can be switched off mid-test."""
+        def __init__(self, deliver=True):
+            self.deliver, self.events, self.new_ids = deliver, [], []
+
+        def new(self, m):
+            self.new_ids.append(m["id"])
+            return True
+
+        def lifecycle(self, event, **f):
+            self.events.append((event, f))
+            return self.deliver          # False = the sink refused it, exactly like a broken sink
+
+        def sync(self, persona=None):
+            return True
+
+    def _target(self, emitter, cursor=100, fsm="UP"):
+        t = km.WatchTarget.__new__(km.WatchTarget)
+        t.persona, t.url, t.headers = "argus", "http://x/api/inbox?persona=argus", {}
+        t.opener, t.emitter = None, emitter
+        t.args = BoundedWindowEndToEndTest.FullArgs()
+        t.cursor, t.armed, t.fsm_state, t.failures = cursor, True, fsm, 0
+        t.state_file = t.last_unread = None
+        t.fast_path = False
+        t.skips = t.first_poll = 0
+        t.last_heartbeat = km._monotonic()
+        t.count_url, t.unread_persona = km.NOTIFY_PENDING_URL, "argus"
+        t.emitted_above, t.gap_alerted = set(), None
+        t.pin_evidence_intact, t.pin_forced = True, False
+        t.state_corrupt = t.delivery_blocked = t.state_not_durable = False
+        t.pin_release_at = None
+        return t
+
+    def _run(self, t, fetch_fn, times=1):
+        orig, km.fetch = km.fetch, fetch_fn
+        try:
+            for _ in range(times):
+                t.poll_once()
+        finally:
+            km.fetch = orig
+
+    @staticmethod
+    def _down_fetch(reason="http 502"):
+        return lambda opener, url, headers: km.Poll(False, reason=reason)
+
+    # ---- F2: the dead-man's switch had NO test. These are it. --------------------------------------
+    def test_the_liveness_DOWN_alert_IS_EMITTED_after_alert_after_failures(self):
+        # THE GAP A1 EXPOSED: deleting this alert entirely left all 242 tests green, because nothing
+        # asserted the one event README sells as the dead-man's switch.
+        em = self.Recorder()
+        t = self._target(em)
+        self._run(t, self._down_fetch(), times=t.args.alert_after)
+        alerts = [f for e, f in em.events if e == "alert"]
+        self.assertEqual(len(alerts), 1, "the source went down and no alert was emitted")
+        self.assertEqual(alerts[0]["reason"], "http 502")
+        self.assertEqual(alerts[0]["consecutive_failures"], t.args.alert_after)
+        self.assertEqual(t.fsm_state, "DOWN")
+
+    def test_the_DOWN_alert_does_not_fire_before_the_threshold(self):
+        em = self.Recorder()
+        t = self._target(em)
+        self._run(t, self._down_fetch(), times=t.args.alert_after - 1)
+        self.assertEqual([f for e, f in em.events if e == "alert"], [])
+        self.assertEqual(t.fsm_state, "UP")
+
+    def test_an_UNDELIVERED_DOWN_alert_still_reaches_stderr(self):
+        # The FSM transition must commit (the firing condition is an EQUALITY on `failures`, so the
+        # edge is crossed exactly once and a reverted transition would never re-fire). So the
+        # announcement gets the guaranteed second channel instead.
+        em = self.Recorder(deliver=False)
+        t = self._target(em)
+        buf = _capture_stderr(self)
+        self._run(t, self._down_fetch(), times=t.args.alert_after)
+        self.assertEqual(t.fsm_state, "DOWN")
+        self.assertIn("UNDELIVERED", buf.getvalue())
+        self.assertIn("http 502", buf.getvalue())
+
+    # ---- my own finding: the RECOVERY edge fails the same way, facing the other way ----------------
+    def test_the_RECOVERED_event_is_emitted_when_the_source_comes_back(self):
+        em = self.Recorder()
+        t = self._target(em, fsm="DOWN")
+        self._run(t, BoundedWindowEndToEndTest()._fetch([{"id": 101}], 0))
+        self.assertEqual([e for e, f in em.events if e == "recovered"], ["recovered"])
+        self.assertEqual(t.fsm_state, "UP")
+
+    def test_an_UNDELIVERED_RECOVERED_event_still_reaches_stderr(self):
+        # Symmetric to the DOWN case and arguably worse: a consumer that saw the alert is left holding
+        # an alarm it can NEVER clear, because this edge is also crossed exactly once.
+        em = self.Recorder(deliver=False)
+        t = self._target(em, fsm="DOWN")
+        buf = _capture_stderr(self)
+        self._run(t, BoundedWindowEndToEndTest()._fetch([{"id": 101}], 0))
+        self.assertEqual(t.fsm_state, "UP")
+        self.assertIn("UNDELIVERED", buf.getvalue())
+        self.assertIn("recovered", buf.getvalue().lower())
+
+    def test_the_FAST_PATH_recovery_edge_also_reports_an_undelivered_event(self):
+        # THE TWIN. There are TWO recovery edges - the fast-path skip and the full-poll path - and
+        # fixing only the one the first test happened to exercise would be the exact trap of "my fix
+        # for the last finding was the next finding". A mutation on this site survived until this test.
+        em = self.Recorder(deliver=False)
+        t = self._target(em, fsm="DOWN")
+        t.args.no_fast_path = False
+        t.fast_path, t.last_unread = True, 5
+        buf = _capture_stderr(self)
+        t.poll_once(counts_available=True, unread_counts={"argus": 5})   # no increase -> skip_full
+        self.assertEqual(t.fsm_state, "UP")
+        self.assertIn("UNDELIVERED", buf.getvalue())
+        self.assertEqual([e for e, f in em.events if e == "recovered"], ["recovered"])
+
+    # ---- F1 core: a pure announcement latch must not commit on a failed delivery -------------------
+    def test_an_UNDELIVERED_gap_alarm_does_NOT_latch_and_RE_RAISES_next_poll(self):
+        em = self.Recorder(deliver=False)
+        t = self._target(em, cursor=1100)
+        fetch = BoundedWindowEndToEndTest()._fetch([{"id": 1200}], 4, walk_fail=True)
+        buf = _capture_stderr(self)
+        self._run(t, fetch)
+        self.assertIn("UNDELIVERED", buf.getvalue(), "and it must still reach stderr")
+        self.assertIsNone(t.gap_alerted, "an alarm nobody received must not be recorded as raised")
+        first = len([e for e, f in em.events if e == "alert"])
+        self.assertEqual(first, 1)
+        em.deliver = True                      # the sink recovers; the gap is still open
+        self._run(t, fetch)
+        self.assertEqual(len([e for e, f in em.events if e == "alert"]), first + 1,
+                         "the alarm must be RE-RAISED once the channel recovers")
+        self.assertEqual(t.gap_alerted, 1100, "and only now may it latch")
+
+    def test_a_DELIVERED_gap_alarm_latches_and_does_not_spam(self):
+        # The positive control for the test above: without this, a latch that never commits would look
+        # identical to a working one.
+        em = self.Recorder()
+        t = self._target(em, cursor=1100)
+        fetch = BoundedWindowEndToEndTest()._fetch([{"id": 1200}], 4, walk_fail=True)
+        self._run(t, fetch, times=3)
+        self.assertEqual(t.gap_alerted, 1100)
+        self.assertEqual(len([e for e, f in em.events if e == "alert"]), 1,
+                         "a delivered alarm must be announced exactly once per unresolved span")
+
+    # ---- F3: the startup path must dedupe case-variants like rediscovery does ----------------------
+    def test_requested_personas_DEDUPES_CASE_VARIANTS(self):
+        # Two spellings casefold to ONE state path, so the second flock raises FatalConfig out of the
+        # uncaught list comprehension in run() and the producer refuses to start FOR EVERY persona.
+        args = km.build_parser().parse_args(["--persona", "Loom", "--persona", "loom"])
+        got = km.requested_personas(args, None, {})
+        self.assertEqual(got, ["Loom"], "case-variants share one state file; keep the first spelling")
+        self.assertEqual(len({km._state_safe_persona(p) for p in got}), len(got),
+                         "no two watched personas may resolve to the same state path")
+
+
 def _capture_stderr(test):
     """Swap stderr for a buffer for the duration of ONE test, and return it."""
     buf, err = __import__("io").StringIO(), km.sys.stderr

@@ -1435,18 +1435,31 @@ def _clear_persona_warning(persona):
 
 
 def requested_personas(args, opener, headers):
+    # ⚠️ CASE-INSENSITIVE DEDUPE, THE SAME RULE AS new_personas() (re-audit 11, F3). This used to be an
+    # EXACT `p not in personas`, so `--persona Loom --persona loom` survived as two entries - but
+    # _state_safe_persona() CASEFOLDS the state path, so both resolve to ONE state file. The second
+    # flock then raises FatalConfig("state-file in use") out of the UNCAUGHT list comprehension in
+    # run(), and the producer refuses to start FOR EVERY PERSONA. That breaks the containment rule this
+    # file states twice ("one persona's hostile path must not take the whole producer down"), and the
+    # error blamed "another watcher" when the collision was with itself.
+    # Keeps the FIRST spelling seen, exactly like new_personas(), so nothing about the normal path moves.
     personas = []
-    for p in (p.strip() for p in args.persona or []):
-        if p and p not in personas:
+    seen = set()
+
+    def add(p):
+        key = p.casefold()
+        if p and key not in seen:
+            seen.add(key)
             personas.append(p)
+
+    for p in (p.strip() for p in args.persona or []):
+        add(p)
     for group in args.personas or []:
         for p in (part.strip() for part in group.split(",")):
-            if p and p not in personas:
-                personas.append(p)
+            add(p)
     if args.all_personas or not personas:
         for p in fetch_personas(opener, headers):
-            if p not in personas:
-                personas.append(p)
+            add(p)
     return personas
 
 
@@ -1564,9 +1577,41 @@ class WatchTarget:
         return reach_ok and emit_ok
 
     def lifecycle(self, event, **fields):
+        """Emit a lifecycle event. RETURNS whether it was delivered (Loom/river re-audit 11, F1).
+
+        This used to drop `Emitter.lifecycle`'s bool on the floor, which made every caller structurally
+        unable to know whether the thing it had just recorded as announced was in fact announced.
+        """
         if self.persona:
             fields["persona"] = self.persona
-        self.emitter.lifecycle(event, **fields)
+        return self.emitter.lifecycle(event, **fields)
+
+    def _alarm(self, event, log_text, **fields):
+        """Emit an edge event and GUARANTEE it reaches a human, returning whether it was DELIVERED.
+
+        `log_text` is the stderr wording ONLY; it is deliberately NOT injected into the event, so this
+        adds no field to any event's schema (§6.1). Callers that want `reason` on the wire pass it in
+        **fields like any other field.
+
+        THE DEFECT THIS CLOSES (re-audit 11, F1): every alarm committed its "already alarmed" state
+        BEFORE emitting and discarded the emit's answer, so an alarm that was never delivered was never
+        re-raised - not after the channel recovered, and not after a restart, because `gap_alerted` is
+        PERSISTED. Mail was never at risk (the cursor holds correctly throughout); it was the ALARMS
+        that vanished, which is worse than it sounds because the tool's headline promise is that it
+        pins LOUDLY rather than in silence.
+
+        The fallback is stderr, NOT a retry down the event channel - that channel is the thing that
+        just failed, and reporting a fault through the faulty channel is how the fault stays invisible
+        (DESIGN.md §176, the same reasoning as _delivery_failed). Deliberately does NOT gate the cursor
+        on a lifecycle event: DESIGN.md §170 says lifecycle events are not acknowledged and not gated,
+        and that stays true. "Do not gate the watermark on it" and "do not record that you alarmed when
+        you did not" are different propositions, and only the first was ever documented.
+        """
+        delivered = self.lifecycle(event, **fields)
+        if not delivered:
+            sys.stderr.write("kijito-inbox-monitor: %s EVENT UNDELIVERED (persona %r): %s\n"
+                             % (event.upper(), self.persona, log_text))
+        return delivered
 
     def _pin_release_floor(self):
         """The reach a COMPLETE window must achieve to discharge a pin.
@@ -1768,8 +1813,13 @@ class WatchTarget:
         if skip_full:
             # count endpoint reachable + no unread increase = a HEALTHY poll with no new items
             if self.fsm_state == "DOWN":
+                # THE RECOVERY EDGE IS THE SAME DEFECT FACING THE OTHER WAY (argus, re-audit 11 - a
+                # site the review did not name). Committing "UP" and discarding the emit means a
+                # consumer that saw the DOWN alert never learns the source came back: it is left
+                # holding an alarm it can NEVER clear, because this edge is crossed exactly once.
+                # The transition must commit (it is the FSM); the announcement gets stderr.
                 self.fsm_state = "UP"
-                self.lifecycle("recovered", cursor=self.cursor)
+                self._alarm("recovered", "source recovered", cursor=self.cursor)
             self.failures = 0
         else:
             self.skips = 0
@@ -1849,7 +1899,10 @@ class WatchTarget:
                 if self.pin_forced and self.state_corrupt and self.pin_release_at is None and items:
                     self.pin_release_at = min(m["id"] for m in items)
                 if recovered:
-                    self.lifecycle("recovered", cursor=self.cursor)
+                    # Same recovery edge as the fast path above, and the commit is 60+ lines earlier
+                    # (`fsm_state = "UP"; recovered = True`), which is why a block-local detector could
+                    # not pair them - it was found by reading, prompted by its twin.
+                    self._alarm("recovered", "source recovered", cursor=self.cursor)
                 if diag:
                     self.lifecycle(diag[0], **diag[1])
                 if do_arm:
@@ -1912,16 +1965,22 @@ class WatchTarget:
                     # the watermark is stable for exactly as long as the gap is unresolved. Persisted, so a
                     # restart does not re-announce it either.
                     if pinned and self.gap_alerted != cursor_at:
-                        self.gap_alerted = cursor_at
-                        self.lifecycle("alert",
-                                       reason=("bounded-window: server omitted %d message(s) and the window "
-                                               "started at id %s above cursor %s; a backward walk recovered %d "
-                                               "from inside the span but did not reach the watermark, so "
-                                               "it stays PINNED at %s"
-                                               % (omitted, window_floor, cursor_at, len(gap_recovered),
-                                                  cursor_at)),
+                        # ★ LATCH ONLY ON DELIVERY (re-audit 11, F1). `gap_alerted` is a PURE
+                        # ANNOUNCEMENT MARKER - it drives no behaviour, it only records "this span was
+                        # announced" - and it is PERSISTED, so committing it before the emit meant an
+                        # undelivered alarm was suppressed for the life of the span AND across restarts.
+                        # The gap condition is re-derived every poll, so re-raising costs nothing and
+                        # self-clears the moment it is genuinely delivered.
+                        gap_reason = ("bounded-window: server omitted %d message(s) and the window "
+                                      "started at id %s above cursor %s; a backward walk recovered %d "
+                                      "from inside the span but did not reach the watermark, so "
+                                      "it stays PINNED at %s"
+                                      % (omitted, window_floor, cursor_at, len(gap_recovered), cursor_at))
+                        if self._alarm("alert", gap_reason,
+                                       reason=gap_reason,
                                        omitted=omitted, window_floor=window_floor, cursor_at=cursor_at,
-                                       reconciled=len(gap_recovered), pinned=True)
+                                       reconciled=len(gap_recovered), pinned=True):
+                            self.gap_alerted = cursor_at
 
                 # DELIVERY IS ACKNOWLEDGED, NOT ASSUMED (Loom re-audit 7, HIGH 1). The cursor IS the
                 # acknowledgement - once it advances past an id, that message is never fetched again - so
@@ -2021,25 +2080,41 @@ class WatchTarget:
                         # both re-emit AND be counted as recovery - manufacturing evidence out of our own
                         # amnesia. From here the gap can only be closed by an authoritative read.
                         if self.pin_evidence_intact:
+                            # ⚠️ THIS COMMIT IS NOT AN ANNOUNCEMENT LATCH - it is a CORRECTNESS state that
+                            # governs how the span may ever be closed, so it MUST be committed whether or
+                            # not the alarm is delivered. Only the ANNOUNCEMENT needs the second channel,
+                            # which _alarm provides (re-audit 11, F1). Getting this backwards - refusing to
+                            # record evidence loss because a sink was broken - would trade a lost alarm for
+                            # a lost invariant.
                             self.pin_evidence_intact = False
                             # A durable event, not just stderr: this is a correctness degradation somebody
-                            # has to act on, and stderr is not something a consumer watches.
-                            self.lifecycle("alert",
-                                           reason=("bounded-window: pin at cursor %s outlived its tracking "
-                                                   "budget and forgot %d delivered id(s). Some mail may be "
-                                                   "re-emitted, and this span can no longer be closed by "
-                                                   "reconciliation - it needs an authoritative backward read"
-                                                   % (self.cursor, dropped)),
-                                           cursor_at=self.cursor, forgot=dropped,
-                                           pinned=True, evidence_lost=True)
+                            # has to act on, and stderr is not something a consumer watches. _alarm still
+                            # falls back to stderr, so an undelivered one is not silent.
+                            pin_reason = ("bounded-window: pin at cursor %s outlived its tracking "
+                                          "budget and forgot %d delivered id(s). Some mail may be "
+                                          "re-emitted, and this span can no longer be closed by "
+                                          "reconciliation - it needs an authoritative backward read"
+                                          % (self.cursor, dropped))
+                            self._alarm("alert", pin_reason, reason=pin_reason,
+                                        cursor_at=self.cursor, forgot=dropped,
+                                        pinned=True, evidence_lost=True)
 
             else:
                 self.failures += 1
                 if self.failures == args.alert_after and self.fsm_state == "UP":
+                    # THE DEAD-MAN'S SWITCH. The FSM transition MUST commit (it drives the whole
+                    # liveness model, and the firing condition is an EQUALITY on `failures`, so a
+                    # reverted transition would never re-fire - the edge is crossed exactly once).
+                    # So the state commits and the ANNOUNCEMENT gets the guaranteed second channel
+                    # (re-audit 11, F1/A1). Before this, a broken sink meant the source could go down
+                    # and NOTHING was ever emitted or logged - the one event README sells as the
+                    # dead-man's switch, silently absent.
                     self.fsm_state = "DOWN"
-                    self.lifecycle("alert", reason=poll.reason or "unreachable",
-                                   consecutive_failures=self.failures,
-                                   seconds=self.failures * args.poll_seconds)
+                    down_reason = poll.reason or "unreachable"
+                    self._alarm("alert", "source is DOWN: %s" % down_reason,
+                                reason=down_reason,
+                                consecutive_failures=self.failures,
+                                seconds=self.failures * args.poll_seconds)
 
         if self.state_file is not None:
             durable = self.state_file.save(self.cursor, self.fsm_state, self.failures,
