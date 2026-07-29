@@ -696,9 +696,12 @@ success.)
 
 ### 14.6 Still open (not blocking; tracked elsewhere)
 - **Name decided** (Kijito Inbox Monitor, §13) and pushed private (`KijitoAI/kijito-inbox-monitor`, 2026-06-20).
-  Remaining: the public flip when ready (confirm PyPI/npm `kijito-inbox-monitor` first); and the README links to
-  `../docs/DESIGN.md`, which is repo-external (this spec lives in the workspace, not the repo), so vendor this spec
-  into the repo before the public flip so the link resolves on GitHub.
+  ✔ **DONE, all three parts, verified 2026-07-29** - this item read as open long after it was finished, which is
+  its own lesson: a "still open" list is a claim like any other and nothing re-checks it. The repository is PUBLIC;
+  this spec is VENDORED into the repo and tracked at `docs/DESIGN.md`; and the README link is the in-repo relative
+  `docs/DESIGN.md`, which resolves on GitHub. An older copy of this spec also survives in the private workspace that
+  hosts this repo; it is a STALE rev, and the in-repo file is the only spec. Read the rev from a file's own header
+  rather than from any prose that claims one.
 - **Marketplace** surfacing, at launch-time.
 - **Codex-side consumer bridge:** Codex sessions aren't yet woken by their event file; the Claude harness Monitor
   tool is the native consumer (done).
