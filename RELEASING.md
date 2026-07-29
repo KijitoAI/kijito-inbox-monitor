@@ -67,9 +67,28 @@ switching branches or committing changes NOTHING about what the fleet runs, and 
 a no-op deploy and a successful one produce identical evidence (process up, status 0, heartbeat fresh,
 mail flowing), because those are properties of whatever is running, not of what you intended to run.
 ★ TO DEPLOY: rebuild the artifact at the NEW sha, repoint BOTH plist paths, `bootout` -> wait for the pid
-to VANISH (~50s) -> `bootstrap`, then **assert the running process is that sha**:
-    ../bin/producer-health.sh <new-sha>     # non-zero unless the RUNNING argv carries that sha
+to VANISH (~50s) -> `bootstrap`, then **assert the running process is that sha**. State the requirement as a
+PROPERTY, because the operator's own tooling is not part of this package:
+    THE RUNNING ARGV MUST CARRY THE EXPECTED SHA. Nothing else settles it.
+A self-contained check, which needs only a shell and a running producer:
+```sh
+sha=<new-sha>
+procs=$(pgrep -f 'kijito_inbox_monitor\.py' || true)
+n=$(printf '%s' "$procs" | grep -c . || true)
+[ "$n" -eq 1 ] || { echo "FAIL: expected exactly 1 producer, found $n"; exit 1; }
+ps -o command= -p "$procs" | grep -q "/versions/$sha/" \
+  && echo "ok: the single running producer carries $sha" \
+  || { echo "FAIL: the running argv does not carry $sha"; exit 1; }
+```
+⚠️ The process COUNT is asserted first and is not decoration: with an old and a new producer both alive, a
+bare match on the expected sha SUCCEEDS while the fleet is still partly serving the old bytes. Verified in
+all three directions (right sha, wrong sha, two processes) before being written down.
 Health alone cannot tell a successful deploy from a no-op one; only naming the expected sha can.
+⚠️ This file previously named a helper script by a RELATIVE PATH that pointed OUTSIDE the repository, so a
+clone could not run the gate this document mandates - and the path would silently resolve to whatever
+happened to sit above the checkout. The fleet operator's richer health tool lives in the private workspace
+alongside this repo, deliberately outside it; it is not required to perform a release, and no public
+instruction may depend on a path a clone does not contain.
 Before touching launchctl: `bootout` + `bootstrap` (never `kickstart`), never back-to-back (they race ->
 "Bootstrap failed: 5" leaving NO service), SIGTERM takes ~50s, copy the current plist aside as a rollback
 FIRST, and announce the restart to the hive - this is the fleet's only mail producer.
