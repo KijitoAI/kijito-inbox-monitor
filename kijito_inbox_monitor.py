@@ -2171,8 +2171,10 @@ class WatchTarget:
                         # and it is PERSISTED - so committing it before the emit would suppress an
                         # UNDELIVERED alarm for the life of the condition AND across restarts. The
                         # condition is re-derived every poll, so re-raising costs nothing and self-clears
-                        # the moment it is genuinely delivered. See [[22470]] for the discriminating
-                        # question (announcement latch vs behavioural state).
+                        # the moment it is genuinely delivered. THE DISCRIMINATING QUESTION: does
+                        # this state DRIVE behaviour, or does it only RECORD that something was
+                        # announced? Behavioural state must commit either way; a pure announcement
+                        # latch must commit only on delivery. They take opposite answers.
                         if self._alarm("alert", unread_reason,
                                        reason=unread_reason,
                                        unread_not_shown=poll.unread_not_shown,
@@ -2343,7 +2345,16 @@ def discover_persona_targets(args, headers, emitter, targets, opener_by_origin, 
     for persona in new_personas(current, discovered):
         try:
             target = build_persona_target(persona, opener_by_origin, headers, args, emitter)
-        except FatalConfig as e:
+        except (FatalConfig, OSError) as e:
+            # ★ THE CATCH'S TYPE MUST COVER THE THROW, not merely exist.
+            # This arm read as containment for two rounds and was not: `build_persona_target` reaches
+            # `StateFile.lock()` -> `_open_private(path + ".lock")`, which raises `InsecureFile` - and
+            # `InsecureFile` subclasses **OSError, not FatalConfig** (deliberately, so the SINK path can
+            # turn it into a failed delivery instead of a crash). So ONE persona with a hostile or
+            # un-tightenable lock sidecar escaped this arm and killed the whole producer. `InsecureFile`
+            # is raised by security code and SOUNDS like a config fatality, which is exactly why
+            # "FatalConfig covers it" was the natural and wrong assumption. A guard naming the wrong
+            # exception type is indistinguishable at a glance from one that works.
             _warn_persona_once(persona, "cannot add persona %r: %s" % (persona, e))
             continue
         targets.append(target)
@@ -2369,7 +2380,11 @@ def discover_from_counts(args, counts, targets, opener_by_origin, headers, emitt
         if persona and persona.casefold() not in current:
             try:
                 target = build_persona_target(persona, opener_by_origin, headers, args, emitter)
-            except FatalConfig as e:
+            except (FatalConfig, OSError) as e:
+                # Same widening, same reason as discover_persona_targets: `InsecureFile` is an OSError,
+                # so a FatalConfig-only arm never contained it. This is the LATE-ADD path a
+                # brand-new persona arrives on, so it is reached by anyone who can get a name into the
+                # inbox counts - the containment matters more here, not less.
                 _warn_persona_once(persona, "cannot add persona %r from counts: %s" % (persona, e))
                 continue
             targets.append(target)
@@ -2820,7 +2835,24 @@ def run(args):
     personas = requested_personas(args, directory_opener, headers)
     if not personas:
         raise FatalConfig("at least one persona is required")
-    targets = [build_persona_target(p, opener_by_origin, headers, args, emitter) for p in personas]
+    # ★ THE STARTUP PATH NEEDS THE SAME CONTAINMENT AS THE LATE-ADD PATHS, and it is the one place the
+    # original fix note did not name (it specified the two discover arms plus main()). An
+    # arm in main() only converts the traceback into a clean exit: the producer STILL dies, so one
+    # persona's hostile lock sidecar still stops every other persona's mail. That is precisely the
+    # property this fix exists to deny, so containment belongs HERE, per-persona, exactly like
+    # discover_persona_targets. This used to be a bare list comprehension with no try at all.
+    targets = []
+    for p in personas:
+        try:
+            targets.append(build_persona_target(p, opener_by_origin, headers, args, emitter))
+        except (FatalConfig, OSError) as e:
+            _warn_persona_once(p, "cannot watch persona %r: %s" % (p, e))
+    if not targets:
+        # FAIL CLOSED. Skipping a persona is a real degradation, and skipping ALL of them would leave a
+        # process that is up, heartbeat-less and watching nothing - the silent-success shape this repo
+        # keeps finding. A watcher with no targets must not look like a running watcher.
+        raise FatalConfig("no persona could be watched: every one of %d target(s) failed to initialise "
+                          "(see the warnings above)" % len(personas))
     # The DIRECTORY namespace, kept separate from `targets` on purpose: targets also accumulate personas
     # discovered from the inbox counts, so diffing against targets would silently absorb the very phantom
     # inboxes the stranded-mail check exists to find.
@@ -3041,6 +3073,15 @@ def main(argv=None):
         return run(args)
     except FatalConfig as e:
         sys.stderr.write("kijito-inbox-monitor: FATAL %s\n" % e)
+        return 2
+    except OSError as e:
+        # THE BACKSTOP, and deliberately only that. `InsecureFile` is an OSError, so before
+        # this arm an escaping one exited via a TRACEBACK - which under launchd KeepAlive means a crash
+        # loop with the cause buried in monitor.err rather than a stated fatal condition. Containment
+        # that keeps the OTHER personas running lives at the three per-persona sites; this arm exists so
+        # that ANY OSError that still reaches the top exits with a diagnosis instead of a stack trace.
+        # It must stay LAST-RESORT: if this is what caught your fault, a per-persona guard was missing.
+        sys.stderr.write("kijito-inbox-monitor: FATAL unhandled file/OS error: %s\n" % e)
         return 2
     except KeyboardInterrupt:
         return 0

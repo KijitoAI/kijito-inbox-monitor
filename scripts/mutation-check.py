@@ -303,6 +303,29 @@ M=[
  ("L11-F3: the startup persona list dedupes EXACTLY again (case-variants self-deadlock)",
   "        key = p.casefold()\n        if p and key not in seen:",
   "        key = p\n        if p and key not in seen:"),
+
+ # ---- the containment residual ([[22388]]): InsecureFile is an OSError, NOT a FatalConfig ----------
+ # Each arm gets its OWN entry, deliberately: river's binding condition on this fix, because a
+ # containment guard with no mutation is EXACTLY how this defect stayed invisible for two rounds. The
+ # narrowing below is the original bug, restored verbatim - a guard that names the wrong exception type
+ # is indistinguishable at a glance from one that works, so only a mutation can tell them apart.
+ ("R0-arm1: DIRECTORY rediscovery catches FatalConfig only, so a hostile lock kills the producer",
+  "except (FatalConfig, OSError) as e:\n            # \u2605 THE CATCH",
+  "except FatalConfig as e:\n            # \u2605 THE CATCH"),
+ ("R0-arm2: COUNTS discovery catches FatalConfig only, so a hostile lock kills the producer",
+  "except (FatalConfig, OSError) as e:\n                # Same widening",
+  "except FatalConfig as e:\n                # Same widening"),
+ ("R0-arm3: the STARTUP path catches FatalConfig only, so one hostile persona stops all the others",
+  'except (FatalConfig, OSError) as e:\n            _warn_persona_once(p, "cannot watch persona',
+  'except FatalConfig as e:\n            _warn_persona_once(p, "cannot watch persona'),
+ # A duplicate FatalConfig arm compiles and is simply unreachable, so this deletes the backstop
+ # without introducing a SyntaxError the harness would refuse to count.
+ ("R0-arm4: the top-level OSError backstop is gone, so an escaping one is a traceback again",
+  "    except OSError as e:\n        # THE BACKSTOP",
+  "    except FatalConfig as e:\n        # THE BACKSTOP"),
+ ("R0: containment degrades into a watcher that is UP and watching nothing (fail-closed removed)",
+  "    if not targets:\n        # FAIL CLOSED.",
+  "    if False:\n        # FAIL CLOSED."),
 ]
 def run(src):
     # RELEASE WHAT WE ACQUIRE (Loom re-audit 10, L6). The temp tree was never removed and the source file

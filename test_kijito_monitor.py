@@ -4288,5 +4288,156 @@ class Loom10ClassSweepTest(unittest.TestCase):
         self.assertEqual([os.path.basename(x) for x in sink._archive_paths()], ["events.ndjson.2"])
 
 
+class ContainmentResidualTest(unittest.TestCase):
+    """The containment residual: ONE persona's hostile lock sidecar killed the WHOLE producer.
+
+    THE CHAIN: `build_persona_target` -> `WatchTarget.__init__` -> `StateFile.lock()` ->
+    `_open_private(path + ".lock")`, which raises `InsecureFile`. `InsecureFile` subclasses **OSError,
+    not FatalConfig** - deliberately, so the SINK path can turn it into a failed delivery rather than a
+    crash. Every containment arm caught `FatalConfig` ONLY, so the throw went straight past all of them.
+
+    ★ WHY IT SURVIVED AN EARLIER FIX, AND WHAT THESE TESTS ARE THEREFORE FOR: I checked that the CATCH
+    EXISTED and never checked that its TYPE COVERED THE THROW. A guard naming the wrong exception type is
+    indistinguishable at a glance from one that works, so every test below raises the REAL `InsecureFile`
+    through the REAL code path. A test that raised a bare `FatalConfig` would pass against the broken arm
+    and prove nothing - which is the entire failure mode being closed here.
+    """
+
+    def _tokenfile(self, d):
+        p = os.path.join(d, "token")
+        with open(p, "w") as f:
+            f.write("t0ken")
+        os.chmod(p, 0o600)
+        return p
+
+    def _args(self, d, personas):
+        argv = []
+        for p in personas:
+            argv += ["--persona", p]
+        argv += ["--state-file", os.path.join(d, "hive.json"),
+                 "--events-file-template", os.path.join(d, "events.{persona}.ndjson"),
+                 "--token-file", self._tokenfile(d)]
+        return km.build_parser().parse_args(argv)
+
+    def _poison(self, victim):
+        """Make ONLY `victim`'s lock sidecar raise the real InsecureFile; everyone else opens normally."""
+        real = km._open_private
+        marker = "." + km._state_safe_persona(victim) + "."
+
+        def fake(path, mode="a", encoding=None):
+            if path.endswith(".lock") and marker in os.path.basename(path):
+                raise km.InsecureFile("%s is not a regular file" % path)
+            return real(path, mode, encoding)
+        km._open_private = fake
+        self.addCleanup(lambda: setattr(km, "_open_private", real))
+
+    def _survives(self, what, fn, *a, **kw):
+        """Call `fn`, turning an ESCAPING OSError into an assertion FAILURE that names the property.
+
+        ★ WHY THIS WRAPPER EXISTS, and it is the point of the whole test class: letting the exception
+        escape into unittest records the mutant as an ERROR, and `scripts/mutation-check.py` REFUSES to
+        count an errors-only mutant as a catch (an error normally means the mutant crashed the program
+        rather than misbehaved). So the first version of these tests detected the defect and the gate
+        correctly declined to credit it - the evidence was real but the WRONG KIND. Asserting the
+        property explicitly is also simply better: "the producer died" is the claim, not a traceback.
+        """
+        try:
+            return fn(*a, **kw)
+        except OSError as e:
+            self.fail("%s: an OSError escaped containment and took the producer down: %r" % (what, e))
+
+    def _no_loop(self):
+        """Stub the wake seam so run() builds its targets and then falls straight out of the poll loop."""
+        class Seam:
+            stop = True
+            def install(self):  # noqa: E301
+                pass
+            def drain(self):
+                pass
+        real = km.WakeSeam
+        km.WakeSeam = Seam
+        self.addCleanup(lambda: setattr(km, "WakeSeam", real))
+
+    # ---- arm 1: the STARTUP path (run) -------------------------------------------------------------
+    def test_a_hostile_lock_for_ONE_persona_does_not_stop_the_OTHERS_at_startup(self):
+        d = tempfile.mkdtemp()
+        self._poison("bad")
+        self._no_loop()
+        err = _capture_stderr(self)
+        self._survives("startup", km.run, self._args(d, ["good1", "bad", "good2"]))
+        # The others are genuinely watched: each holds its own lock sidecar on disk.
+        for p in ("good1", "good2"):
+            self.assertTrue(os.path.exists(os.path.join(d, "hive.%s.json.lock" % p)),
+                            "%s must still be watched when a SIBLING's lock path is hostile" % p)
+        self.assertFalse(os.path.exists(os.path.join(d, "hive.bad.json.lock")))
+        self.assertIn("bad", err.getvalue())
+
+    def test_startup_fails_CLOSED_when_EVERY_persona_is_hostile(self):
+        # Containment must not degrade into a watcher that is up, watching nothing, and looks healthy -
+        # the silent-success shape. Skipping one persona is contained; skipping ALL of them is fatal.
+        d = tempfile.mkdtemp()
+        real = km._open_private
+        km._open_private = lambda p, mode="a", encoding=None: (_ for _ in ()).throw(
+            km.InsecureFile("hostile")) if p.endswith(".lock") else real(p, mode, encoding)
+        self.addCleanup(lambda: setattr(km, "_open_private", real))
+        self._no_loop()
+        _capture_stderr(self)
+        with self.assertRaises(km.FatalConfig):
+            km.run(self._args(d, ["a", "b"]))
+
+    # ---- arm 2: the late-add path from the persona DIRECTORY ----------------------------------------
+    def test_a_hostile_lock_for_ONE_persona_does_not_stop_the_others_on_DIRECTORY_rediscovery(self):
+        d = tempfile.mkdtemp()
+        args = self._args(d, ["seed"])
+        self._poison("bad")
+        _capture_stderr(self)
+        em = km.Emitter("stdout-jsonl", None, 200, True,
+                        sink_template=os.path.join(d, "events.{persona}.ndjson"))
+        self.addCleanup(em.close)
+        real_fetch = km.fetch_personas
+        km.fetch_personas = lambda o, h: ["bad", "later"]
+        self.addCleanup(lambda: setattr(km, "fetch_personas", real_fetch))
+        added, _ = self._survives("directory rediscovery",
+                                  km.discover_persona_targets, args, {}, em, [], {}, None)
+        self.assertEqual(added, ["later"],
+                         "a hostile sibling must be skipped, not abort the whole rediscovery pass")
+
+    # ---- arm 3: the late-add path from the unread COUNTS --------------------------------------------
+    def test_a_hostile_lock_for_ONE_persona_does_not_stop_the_others_on_COUNTS_discovery(self):
+        d = tempfile.mkdtemp()
+        args = self._args(d, [])
+        args.all_personas = True
+        self._poison("bad")
+        _capture_stderr(self)
+        em = km.Emitter("stdout-jsonl", None, 200, True,
+                        sink_template=os.path.join(d, "events.{persona}.ndjson"))
+        self.addCleanup(em.close)
+        added = self._survives("counts discovery",
+                               km.discover_from_counts, args, {"bad": 1, "later": 2}, [], {}, {}, em)
+        self.assertEqual(added, ["later"],
+                         "one hostile inbox must not stop a NEW persona being picked up from counts")
+
+    # ---- arm 4: the top-level backstop --------------------------------------------------------------
+    def test_an_OSError_reaching_main_exits_2_with_a_DIAGNOSIS_not_a_traceback(self):
+        real = km.run
+        km.run = lambda a: (_ for _ in ()).throw(km.InsecureFile("hostile sidecar"))
+        self.addCleanup(lambda: setattr(km, "run", real))
+        real_v, km.validate_args = km.validate_args, lambda a: None
+        self.addCleanup(lambda: setattr(km, "validate_args", real_v))
+        err = _capture_stderr(self)
+        d = tempfile.mkdtemp()
+        rc = self._survives("main backstop",
+                            km.main, ["--persona", "x", "--token-file", self._tokenfile(d)])
+        self.assertEqual(rc, 2, "an escaping OSError must be a stated fatal condition, not a crash")
+        self.assertIn("FATAL", err.getvalue())
+
+    # ---- the type-coverage assertion itself --------------------------------------------------------
+    def test_InsecureFile_is_an_OSError_and_NOT_a_FatalConfig(self):
+        # The fact the whole residual turns on, asserted directly so a future refactor that "tidies"
+        # InsecureFile under FatalConfig cannot silently make the widened arms look unnecessary.
+        self.assertTrue(issubclass(km.InsecureFile, OSError))
+        self.assertFalse(issubclass(km.InsecureFile, km.FatalConfig))
+
+
 if __name__ == "__main__":
     unittest.main()
