@@ -165,8 +165,12 @@ below): those are owned, size-rotated logs that the producer reopens after its o
 `tail -F` by name. Without a state file, run a single instance and use `--heartbeat N` to drive an external
 dead-man's switch (healthchecks.io, Dead Man's Snitch).
 
-The repo ships `com.kijito.inbox-monitor.plist`, a macOS user LaunchAgent (RunAtLoad + KeepAlive) as a starting
-point - edit its paths, persona, and `--token-file` for your setup.
+The repo ships `com.kijito.inbox-monitor.plist.template`, a macOS user LaunchAgent (RunAtLoad + KeepAlive).
+It is a **template, not a loadable plist**: substitute `__PYTHON__`, `__PROGRAM__` and `__HOME__` (the header
+carries a one-line `sed` that does it) and write the result to `~/Library/LaunchAgents/`. It used to ship with one
+operator's absolute home baked into seven paths, which is useless to anyone else. Point `__PROGRAM__` at a pinned,
+read-only artifact rather than a working tree - otherwise publishing a package "deploys" nothing and a restart
+does not change that.
 
 ## Watching your whole account (multi-persona)
 

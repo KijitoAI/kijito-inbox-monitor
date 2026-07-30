@@ -14,9 +14,9 @@ anywhere. Pushing a version tag publishes to both PyPI and npm, with provenance 
    release, and server-side logs then attribute traffic to a version that is not running.
    Verify with: `grep -n '^version\|"version"\|^__version__' pyproject.toml package.json kijito_inbox_monitor.py`
 2. Add a section for the new version to `CHANGELOG.md`.
-3. Run the pre-publish gates. ALL THREE (typography, memory-ids, path-escapes) must report clean, and
-   the canary must prove the gate can still fire - a gate that cannot fail is worse than no gate,
-   because it certifies:
+3. Run the pre-publish gates. ALL FOUR (typography, memory-ids, path-escapes, private-detail) must report
+   clean, the exemption line must show nothing you expected to be inspected, and the canary must prove
+   the gate can still fire - a gate that cannot fail is worse than no gate, because it certifies:
    ```sh
    ./scripts/prepublish-gate.sh
    ```
@@ -47,7 +47,7 @@ anywhere. Pushing a version tag publishes to both PyPI and npm, with provenance 
    last line, or check the rendered release before you walk away.
 8. ⚠️ **PUBLISHING DOES NOT UPDATE THE FLEET, AND AFTER STEP 2 A RESTART ALONE DOES NOTHING EITHER.**
    ⚠️ "STEP 2" HERE MEANS THE RECOVERY PLAN'S STEP 2 (repoint the launchd plist at a pinned artifact),
-   NOT step 2 of this file - see the current-state pointer, sentinel ARGUS_CURRENT_STATE_POINTER_V1.
+   NOT step 2 of this file.
    Once the plist points at a pinned artifact, the producer no longer reads the working tree, so a green PyPI/npm publish AND a restart both leave it on the OLD bytes. You must REBUILD /
    REINSTALL the pinned artifact at the new version, repoint the plist, restart, and RE-VERIFY the health
    block (exactly one process, `launchctl list` status 0, no PINNED/CORRUPT state files, zero
