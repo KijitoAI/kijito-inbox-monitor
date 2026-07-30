@@ -81,6 +81,11 @@ v1 ships one adapter (`http-poll`, the Kijito reference). Future adapters are ex
   Verified live across 14 pages including the exactly-at-limit edge (a page returning exactly `limit` rows with more
   behind it declares `truncated: true`; one that exactly exhausts the mailbox declares nothing and terminates), so
   the check cannot fire on healthy traffic. Emit only the diff (id > cursor); never dump the body.
+- **The window ALSO declares `unread_not_shown`** - how much unread mail the inbox holds that this response did
+  not hand over. It is a separate axis from the omission/continuation pair above: those describe THIS WINDOW's
+  completeness, while `unread_not_shown` counts unread mail anywhere in the inbox, including messages already
+  emitted to the stream that the agent simply has not read. So it is an OBSERVATION, never a diagnosis of missed
+  mail, and coverage of an un-emitted span is proven by the backward walk, never by this count (§5.2).
 - **Auth:** a Kijito API token is **required** (the API is authenticated). Supply it via `$KIJITOMON_TOKEN` or
   `--token-file` (file wins over env); it is injected as `Authorization: Bearer <token>`, or with `--auth-header NAME`
   as `NAME: <token>` verbatim. The header name (`--auth-header`) and the token-value source are independent axes. A
@@ -98,6 +103,178 @@ v1 ships one adapter (`http-poll`, the Kijito reference). Future adapters are ex
 - **Config:** `poll_seconds` (default 60). The destination is the hard-baked Kijito API inbox URL including
   `mark_read=false`; only the persona varies.
 
+### 5.1 A bounded window must not silently swallow mail (fail closed)
+
+The cursor is a **confirmed-contiguous watermark**: everything at or below it is known delivered. It may only
+advance over a span the watcher has actually seen.
+
+- **The discriminator.** If the returned window reaches back *past* the cursor, every omitted message is older
+  than the watermark and was already delivered - the ordinary case, since long-polling keeps the backlog to a
+  message or two. If the window starts *above* the cursor while the server admits it dropped rows, the span
+  between them may hold mail never emitted.
+- **Coverage comes from EXHAUSTION, not arithmetic.** `truncated` says rows were withheld without saying how
+  many, so no count can prove a span empty - a single recovered message would "close" an unbounded hole. The
+  watcher instead pages BACKWARD with `before_id` until it reaches the watermark or the chain ends. Walking
+  terminates; counting cannot. This is also what makes an *inexact* omission closable at all, and it reaches
+  mail someone has already read, which an unread-only reconcile structurally cannot see.
+- **A walk that does not complete is not coverage.** Transient failure, a non-advancing cursor, or the
+  `WALK_BACK_MAX_PAGES` budget leaves the watermark **PINNED** and raises an `alert`. Visible mail keeps
+  flowing while pinned; ids emitted above the pin are remembered (and persisted) so nothing is re-delivered.
+- **Pagination contract:** pass the OLDEST id you were returned as `before_id`; repeat until the page is empty
+  or `next_before_id` is null; OMIT the parameter for the newest page, because `0` is a real cursor rather
+  than "no cursor". A malformed cursor is a hard 400, never a silent fallback to the newest page - that
+  loudness is what makes a completed walk usable as evidence. Order by **`id`**, never `created`: timestamps
+  are stamped pre-lock while ids are assigned under it, so concurrent senders invert.
+
+### 5.2 `unread_not_shown`: a cheap alarm, never a coverage mechanism
+
+`unread_not_shown` reports how many unread messages the server holds that this response did not hand back
+(`max(0, unread_count - rows_returned_still_unread)`, evaluated after this fetch's `mark_read`). Above zero,
+the watcher raises an `alert`; it is a superset of "withheld by the budget", which is the right answer for an
+alarm because you want to know regardless of *why* mail is absent.
+
+Three properties keep it honest:
+
+- **It is an observation, not a diagnosis.** The count covers unread mail anywhere in the inbox, including
+  messages this watcher already delivered that the agent never read, so it is not by itself evidence of missed
+  mail. The event carries `above_watermark` - whether the window floor sits above the cursor - as the
+  discriminating fact, and leaves the interpretation to the reader. Coverage stays with §5.1's walk: this is a
+  COUNT with no cursor of its own, so it can say THAT something is out of view but never WHICH rows.
+- **A zero is not self-justifying.** The server computes the field ONLY when it withheld something;
+  otherwise it is `0` **by construction**. So the negative answer requires positive evidence - either the zero
+  was genuinely computed (`next_before_id` is not null), or the window is structurally complete (nothing older
+  and nothing withheld). A count the server never stated at all is a THIRD state, and asserts nothing in
+  either direction; coercing that silence to `0` would manufacture an all-clear.
+- **Evaluate it on the NEWEST-PAGE poll only.** On a backward-walk page, `next_before_id is null` means
+  merely "nothing older than this page". Measured live against an inbox holding four unread: the newest page
+  reported `0` (correct - all four were in it), a mid-walk page reported `4` (the whole inbox's unread, not
+  that window's), and the terminal page reported `0` with all four sitting above it. Feeding walk pages to the
+  check would invent alarms and clear real ones.
+
+It is evaluated on full inbox polls only, so the §9 fast path (which skips the inbox fetch while the unread
+count is not rising) can delay it by at most `--resync-every` skips. That is acceptable for an alarm whose
+whole point is cheapness: the condition it reports is not one anybody can act on faster for hearing sooner.
+
+Routing follows the stranded-mail alarm - an `alert` rather than a new event name, no ack, self-clearing when
+the condition goes away - but fails the OPPOSITE way on an unknown directory. The stranded alarm withholds,
+because alarming with no directory would flag every persona; this one concerns the target's own inbox, where
+the worst case of firing is a line in a stream nobody reads and the worst case of withholding is the silent
+wake gap the tool exists to prevent.
+
+### 5.4 Authorship: an attributable liveness signal, collected for free
+
+`--activity-file PATH` publishes, refreshed each tick, the newest message id each persona has been observed
+to have AUTHORED. It exists so a harness can answer "has X been active since my message?" without inventing
+its own scan.
+
+**Why authorship and not the obvious signals.** Two seemingly better sources are both forgeable by accident:
+
+- **inbox read-state** - any agent calling the inbox with the default `mark_read=true` produces X's read
+  bit, so "X read their mail" only means "somebody read X's mail". It also fails the other way: a member
+  consuming its `events.<persona>.ndjson` stream reads its mail without ever touching read-state.
+- **`/api/presence`** - a GET carrying `?persona=X` BEATS X into the active roster, so any observer probing
+  X makes X look alive. A diagnostic read that writes the state being diagnosed.
+
+Only B produces B's outbound, and no third party can manufacture or erase it. That is the whole selection
+criterion: a liveness check built on a bit any observer can flip is not a check.
+
+**It costs nothing.** All-personas mode already fetches every inbox every tick, the URL already hardcodes
+`mark_read=false`, and every row already carries `from`. The alternative - a client polling every inbox on a
+timer to reconstruct this - is not merely wasteful but dangerous: one missing `mark_read=false` in that loop
+destroys read-state fleet-wide, on a schedule.
+
+**Two coverage limits, both published, because a claim of silence is only as good as the watching.**
+
+- `observed_since` - this process saw nothing before it started.
+- `observation_floor_id` - the **MAXIMUM** of the per-inbox window floors, deliberately not the minimum. A
+  persona's outbound lands in whichever inbox they wrote to, so "they authored nothing" is only as strong as
+  the WORST-covered inbox; between the lowest and highest floor there are inboxes we have not seen into.
+  Measured live: the watcher had seen ids down to 1160 in one inbox while another reached only 1179, which
+  made a question about id 1165 look answerable when it was not.
+
+So `activity_since()` is a TRI-STATE - active / no-activity-in-a-span-we-covered / **NOT OBSERVABLE** - the
+same discipline as §5.2. Absence of evidence is evidence of absence only if you were actually watching.
+
+**Evaluating it: `--check-activity PERSONA --since-id N [--waits K]`.** A one-shot read of a published
+report, with no token, no network and no watch loop, so a shell heartbeat can call it. The exit codes are the
+contract, and 1 and 2 are distinct on purpose:
+
+| exit | meaning |
+|------|---------|
+| 0 | evidence of activity - nothing to report |
+| 1 | no activity in a span this report actually covered; the observation is printed |
+| 2 | NOT OBSERVABLE, or the report is missing/corrupt - no claim in either direction |
+
+Collapsing 2 into 1 would turn "I was not watching" into "they were silent", which is the false assertion the
+whole signal exists to refuse. Both the running watcher and the one-shot go through the same
+`evaluate_activity()`, because a second implementation of a tri-state this subtle is a second chance to get
+it wrong.
+
+**The observation states what was seen, never why.** `activity_observation()` renders the finding with the
+wait count and the last-evidence stamp alongside it, and a test asserts the text contains none of
+`FORBIDDEN_DIAGNOSES` - deadlocked, unreachable and still-working are indistinguishable from this data and
+need opposite responses (one wants a ping, one wants a human to restart a bridge). That rule lives in the
+code, not only here, because a rule that lives only in prose does not run.
+
+### 5.5 Urgent-unanswered: escalated mail nobody is answering
+
+    ALARM IF  unread_urgent > 0  AND  activity_since(persona) is False
+
+**Why this alarm can exist at all.** "Is this member stuck?" normally cannot be answered from outside,
+because a member idle BY DESIGN and one that is wedged look identical - so the alarm fires on every dormant
+persona and rots into noise, which is worse than not having it. What breaks the tie is a declared
+EXPECTATION. `unread_urgent` is one: not the recipient declaring liveness, but a **sender** declaring that
+this needs attention now. Silence only means something once something was expected, and this is the only
+place the hive records an expectation.
+
+The consequence is that a quiet persona with no urgent mail NEVER trips it. The alarm fires exactly where
+somebody escalated and nothing happened, which is the population worth waking a human for.
+
+**Both halves must be positive.** `activity_since` is a tri-state (§5.4) and only an explicit `False`
+qualifies - a NOT-OBSERVABLE answer means the watcher was not running for the span in question, and
+reporting that as silence would be the fabrication the tri-state exists to refuse.
+
+**It costs nothing.** `unread_urgent` arrives on the same `/api/notify/pending` row as the unread count the
+fast path already fetches every tick; the field was previously parsed and discarded.
+
+**Kept disjoint from stranded-mail (§ above) on purpose:** that alarm is for inboxes nobody OWNS, this one
+for real directory members who are not responding. Two alarms covering one inbox drift apart and then
+disagree about it, so this one skips any persona the directory does not know and lets the stranded check own
+that case.
+
+Routing and honesty follow the same rules as every other alarm here: an `alert` rather than a new event
+name, one summarising event per watcher so discovering several at once cannot become a wake storm, the
+OBSERVATION and never the diagnosis, and self-clearing when **either** half of the predicate clears - with
+no ack, since an ack would let someone silence "nobody is answering escalated mail" while it stayed true.
+
+> **Known uncovered property.** The alarm is evaluated AFTER the per-target polls, so this tick's authorship
+> is already recorded when it judges. That ordering is asserted by a comment and by review, not by a test -
+> it is a property of the run loop's composition that the unit suite does not reach. Its failure mode is
+> benign and self-correcting: a member who authored mail during the same tick could be reported quiet once,
+> and the next tick clears it.
+
+### 5.6 Alarm routing: evidence of a consumer, not just a name
+
+Account-level alarms (stranded-mail, urgent-unanswered) go to watchers, and "every directory persona" is the
+wrong list: a directory accumulates names, and long-dead test personas keep receiving alerts into streams
+nobody reads. That is the same defect as a broadcast amplifying phantoms, so it is fixed ONCE here rather
+than separately in each alarm - two predicates for one question drift apart and then disagree.
+
+`has_consumer_evidence(persona)` is POSITIVE and mirrors the stranded-mail ownership test deliberately:
+observed authorship, or memories the directory says they own. Authorship alone suffices, because a brand-new
+persona that has written mail but owns no memories yet is real - excluding it would break first contact. An
+unreported memory count leaves a persona eligible: no data is not evidence of absence.
+
+**It fails open, and that matters more than the filtering.** If the predicate would leave NOBODY, every
+directory watcher is used instead. An alarm delivered to a stream nobody reads costs one line; an alarm
+delivered to nobody is the silent failure this tool exists to prevent, and a filter that can silence every
+recipient at once is a worse bug than the noise it removes.
+
+Measured on a live account: recipients fell from 25 to 18. The seven dropped own zero memories and were
+never observed authoring; two remaining test personas own two memories each, so they carry positive evidence
+someone worked under those names and the same predicate keeps them - consistent with the ownership rule that
+decides whether an inbox is stranded.
+
 ## 6. Emit modes (portability)
 
 "NDJSON-on-stdout is universal" is false on ingestion: Claude Code ingests per-event (hooks: JSON-on-stdin,
@@ -106,7 +283,7 @@ event ingestion). So `exec-per-event` is the more portable primitive; `stdout-js
 
 ### 6.1 Event schema (stdout-jsonl)
 
-One object per line; every event carries `event`, `source`, `ts` (emit-time UTC ISO).
+One object per line; every event carries `event`, `source`, `ts` (emit-time UTC ISO) and `event_id` (§6.3).
 ```
 {"event":"new",         "source":"kijito-inbox","ts":"<iso>","id":246,"from":"river","content":"<≤N or omitted>","created":"<iso>"}
 {"event":"armed",       "source":"kijito-inbox","ts":"<iso>","cursor":250}
@@ -138,6 +315,34 @@ Every event invokes `CMD`; inapplicable env vars are unset:
 
 The spawned command has a 10s timeout; a non-zero exit or timeout is logged to stderr and is non-fatal (and never
 holds the cursor back, per §7.0).
+
+### 6.3 `event_id`: the producer owns event identity
+
+Every emitted event carries an `event_id`, stamped at the single `Emitter.emit()` chokepoint so a future event
+kind cannot forget one. It exists because leaving identity absent does not remove the need for it - it
+relocates the problem into N consumers, each of whom invents a key and some of whom get it wrong. The observed
+case: a consumer deduping ID-less events by `event+ts`, which is unique only while two events never land inside
+one clock tick, and our `ts` is stamped at emit time.
+
+Two identities, because messages and signals need opposite guarantees:
+
+| kind | id | guarantee |
+|------|----|-----------|
+| `new` | `<persona>:new:<message id>` | the SAME message always yields the SAME id - across a restart, a re-delivery after state loss, and two watchers of one inbox |
+| everything else | `<persona>:<event>:<run>-<n>` | unique to that emission; a recurrence is a different event and does not collapse into its earlier self |
+
+The asymmetry follows from the cost of being wrong in each direction: a duplicated message is duplicated WORK,
+while a duplicated signal is only noise - and conversely, collapsing two outages into one hides the second.
+Repeated announcements of an *unchanged* condition are suppressed at the source (the alarms are edge-triggered
+and self-clearing, §5.2), which is where suppression belongs.
+
+`<run>` is 8 random bytes per process. A bare in-process counter is specifically ruled out: it restarts at 1 and
+issues ids a consumer has already seen to brand-new events, so a correct consumer DROPS live mail - a worse
+failure than the duplicate the id was introduced to prevent.
+
+Deliberately NOT a hash of the emitted line. Byte-hashing couples the consumer to our serialisation, so a change
+to key order, spacing, or `--content-chars` silently changes the dedupe key and re-delivers old events. Verified
+by emitting the same mail from two processes with different `--content-chars`: the `new` ids are identical.
 
 ## 7. Robustness contract
 
@@ -491,9 +696,12 @@ success.)
 
 ### 14.6 Still open (not blocking; tracked elsewhere)
 - **Name decided** (Kijito Inbox Monitor, §13) and pushed private (`KijitoAI/kijito-inbox-monitor`, 2026-06-20).
-  Remaining: the public flip when ready (confirm PyPI/npm `kijito-inbox-monitor` first); and the README links to
-  `../docs/DESIGN.md`, which is repo-external (this spec lives in the workspace, not the repo), so vendor this spec
-  into the repo before the public flip so the link resolves on GitHub.
+  ✔ **DONE, all three parts, verified 2026-07-29** - this item read as open long after it was finished, which is
+  its own lesson: a "still open" list is a claim like any other and nothing re-checks it. The repository is PUBLIC;
+  this spec is VENDORED into the repo and tracked at `docs/DESIGN.md`; and the README link is the in-repo relative
+  `docs/DESIGN.md`, which resolves on GitHub. An older copy of this spec also survives in the private workspace that
+  hosts this repo; it is a STALE rev, and the in-repo file is the only spec. Read the rev from a file's own header
+  rather than from any prose that claims one.
 - **Marketplace** surfacing, at launch-time.
 - **Codex-side consumer bridge:** Codex sessions aren't yet woken by their event file; the Claude harness Monitor
   tool is the native consumer (done).

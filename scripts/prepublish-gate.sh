@@ -1,9 +1,21 @@
 #!/bin/sh
 # Pre-publish gates for a release. Run from anywhere in the repo; see RELEASING.md step 3.
 #
-# Two checks over the PUBLIC surface:
+# Three checks over the PUBLIC surface:
 #   1. typography  - em/en dashes, curly quotes, ellipsis
 #   2. leakage     - internal Kijito memory ids ([[12345]] / [12345])
+#   3. escapes     - references to paths ABOVE the repository root (../)
+#
+# Why check 3 exists (added 2026-07-29, after finding two live instances): RELEASING.md instructed the
+# reader to run `../bin/producer-health.sh`, a helper that lives in the private workspace ALONGSIDE this
+# repo and is not part of the package. A clone therefore could not run the gate its own release document
+# mandated, and `../bin/...` would resolve to whatever happened to sit above the checkout - so the
+# instruction was not merely broken, it was ambiguous in a way that depends on the reader's directory
+# layout. The second instance was a stale "still open" note in docs/DESIGN.md pointing at a repo-external
+# copy of itself. Both are the same class: THE PUBLIC SURFACE DESCRIBING THINGS THAT ARE NOT IN IT.
+# NOTE ON SCOPE: this bans `../` across the whole surface, code included. There is no legitimate use
+# today. If one ever arises - a JS require, say - that should be a deliberate, visible decision at this
+# gate, not a quietly loosened regex.
 #
 # Three properties this script exists to guarantee, each of which has failed in practice:
 #
@@ -27,19 +39,20 @@ cd "$(git rev-parse --show-toplevel)"
 
 TYPOGRAPHY='—|–|[“”‘’]|…'
 MEMORY_IDS='\[\[[0-9]+\]\]|\[[0-9]{4,5}\]'
+PATH_ESCAPES='\.\./'
 
 canary=$(mktemp)
 trap 'rm -f "$canary"' EXIT
-printf 'a — b “c” d…\n[[12345]] [1234]\n' > "$canary"
+printf 'a — b “c” d…\n[[12345]] [1234]\n    ../bin/some-helper.sh\n' > "$canary"
 
-for pattern in "$TYPOGRAPHY" "$MEMORY_IDS"; do
+for pattern in "$TYPOGRAPHY" "$MEMORY_IDS" "$PATH_ESCAPES"; do
     if ! grep -qE "$pattern" "$canary"; then
         echo "ABORT: the gate cannot detect a known-bad line. Pattern is broken, so a clean result"
         echo "       from it would mean nothing. Fix the pattern before releasing."
         exit 2
     fi
 done
-echo "canary: both patterns fire on known-bad input"
+echo "canary: all three patterns fire on known-bad input"
 
 # The public surface: everything tracked except the test suite and CI workflows.
 files=$(git ls-files -z | tr '\0' '\n' | grep -vE '^(test_|tests/|scripts/|\.github/)' || true)
@@ -51,7 +64,7 @@ count=$(printf '%s\n' "$files" | wc -l | tr -d ' ')
 echo "surface: $count file(s)"
 
 status=0
-for label_pattern in "typography:$TYPOGRAPHY" "memory-ids:$MEMORY_IDS"; do
+for label_pattern in "typography:$TYPOGRAPHY" "memory-ids:$MEMORY_IDS" "path-escapes:$PATH_ESCAPES"; do
     label=${label_pattern%%:*}
     pattern=${label_pattern#*:}
     hits=$(printf '%s\n' "$files" | tr '\n' '\0' | xargs -0 grep -nE "$pattern" || true)

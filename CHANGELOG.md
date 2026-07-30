@@ -5,6 +5,47 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+⚠️ **WHAT THE REVIEW OF THIS SET DOES AND DOES NOT COVER.** The seven alarm/liveness changes were reviewed
+and approved by an independent engine-literate reviewer who re-ran the suite and the mutation harness rather
+than accepting them. Two limits were disclosed rather than discovered: the reviewer did **not** run the
+producer against a live account, so "verified live" claims here rest on the author's word; and the docs/gate
+commit was out of that review's scope.
+
+### Added
+- **An alarm for escalated mail nobody is answering.** Fires only when a member holds mail a sender marked
+  URGENT *and* no activity from that member has been observed - both halves positive. Silence alone is never
+  the trigger, because idle-by-design and wedged are indistinguishable from outside; the urgent flag is a
+  sender declaring an expectation, which is what makes the silence mean something. Clears when either half
+  clears, with no ack.
+- **An alarm for unread mail the inbox window did not show** (`unread_not_shown` above zero) - the case where
+  the endpoint tells you it is holding mail this response did not hand you.
+- **An attributable liveness signal** (`--activity-file`) and a one-shot evaluation of it
+  (`--check-activity`), so an external supervisor can assert the producer is not merely running but working.
+- **A producer-owned event id on every event**, so a consumer can deduplicate across restarts and rotations
+  without inferring identity from content.
+- **`--no-urgent-alerts`** - see Changed.
+
+### Changed
+- **`--no-stranded-alerts` no longer silences the urgent-unanswered alarm.** It gated both, while saying so
+  in only one of the three places an operator reads - and its own documented advice ("set this if you keep
+  deliberate test inboxes") therefore turned off a higher-severity alarm about real members as a side effect.
+  The two alarms now have separate flags; pass both to disable both. The coupling is pinned by tests through
+  the real run loop and by its own mutation, because nothing tested the mapping either way before.
+  (Found in review of the urgent-unanswered alarm, which is unreleased - so no released behaviour changes.)
+- **Account-level alarms are routed by evidence of a consumer**, instead of to every directory persona -
+  long-dead test personas were receiving alerts into streams nobody reads.
+
+### Fixed
+- **One persona's hostile or un-tightenable `.lock` sidecar killed the whole producer.** `InsecureFile` is an
+  `OSError` by design, but every containment arm caught `FatalConfig` only, so the throw went past all of
+  them on the startup path and both late-add paths. Containment is now per-persona at four sites, and fails
+  **closed**: if every persona fails to initialise, the producer raises rather than staying up watching
+  nothing. The lesson worth keeping is that the earlier fix checked that the catch *existed* and never that
+  its type *covered the throw*.
+- **`RELEASING.md` prescribed a path the package does not contain** - a clone could not run the gate the
+  document mandates. Restated as the property plus a self-contained check, with a third prepublish gate
+  (`path-escapes`) so the class cannot return.
+
 ## [0.4.0] - 2026-07-28
 
 ⚠️ **WHAT THIS RELEASE DOES AND DOES NOT ESTABLISH.** Two audit rounds swept a defect CLASS rather than
@@ -138,6 +179,108 @@ reviewer originally assigned never read the request.
   the suite's two `ResourceWarning`s. `StateFile.unlock()` now exists and is called on shutdown.
 
 ### Added
+- **Alarm routing now requires evidence of a consumer.** Account-level alarms went to every directory
+  persona, which meant long-dead test personas kept receiving alerts into streams nobody reads. Eligibility
+  is now positive - observed authorship, or memories the directory says they own - and it mirrors the
+  stranded-mail ownership test on purpose, since two predicates for one question drift apart and then
+  disagree. Authorship alone suffices so first contact is not broken, and an unreported memory count leaves
+  a persona eligible because no data is not evidence of absence.
+
+  It fails open: if the predicate would leave nobody, every directory watcher is used instead. An alarm
+  delivered to a dead stream costs a line; one delivered to nobody is the silent failure the tool exists to
+  prevent. Measured live, recipients fell from 25 to 18.
+
+- **Urgent-unanswered alarm.** The watcher reports members holding mail a sender marked **urgent** while no
+  activity from them has been observed.
+
+  "Is this member stuck?" is normally unanswerable from outside: idle-by-design and wedged look identical,
+  so the obvious alarm fires on every quiet persona and rots into noise. The urgent flag breaks the tie
+  because it is a *sender* declaring an expectation - not the recipient declaring liveness - and silence
+  only means something once something was expected. A quiet member with no urgent mail never trips it, so
+  the alarm fires exactly where somebody escalated and nothing happened.
+
+  Both halves of the predicate must be positive: `unread_urgent > 0` and an explicit "no activity in a span
+  we covered". A NOT-OBSERVABLE answer means the watcher was not running then, and reporting that as silence
+  would be a fabrication. It costs no request - `unread_urgent` arrives on the same row as the unread count
+  the fast path already fetches every tick, and was previously parsed and discarded.
+
+  Kept disjoint from the stranded-mail alarm on purpose - that one is for inboxes nobody owns, this one for
+  real members who are not responding - because two alarms covering one inbox drift apart and then disagree.
+  Same honesty rules as the rest: an `alert` rather than a new event name, one summarising event per
+  watcher, the observation and never the diagnosis, self-clearing when either half clears, and no ack.
+
+- **`--activity-file PATH`: publish who has been observed AUTHORING mail.** Refreshed each tick, it lets a
+  harness answer "has X been active since my message?" from data the watcher already collects.
+
+  Authorship was chosen over the two signals that look better and are both forgeable by accident. Inbox
+  read-state can be produced for any persona by any agent calling the inbox with the default
+  `mark_read=true`, and it fails the other way too, since a member consuming its own event stream reads its
+  mail without touching read-state. And a GET on the presence endpoint carrying a persona parameter beats
+  that persona into the active roster, so merely probing someone makes them look alive. Only B produces B's
+  outbound, and nobody else can manufacture or erase it.
+
+  It costs no request: all-personas mode already fetches every inbox each tick with `mark_read=false`, and
+  every row already carries its author. That matters, because the alternative - a client polling every
+  inbox on a timer to reconstruct this - puts a loop that reads everyone's mail on a schedule, where one
+  missing `mark_read=false` destroys read-state fleet-wide.
+
+  Both coverage limits are published, because a claim of silence is only as good as the watching.
+  `observed_since` bounds the process; `observation_floor_id` is the MAXIMUM of the per-inbox window floors,
+  deliberately not the minimum - a persona's mail lands in whichever inbox they wrote to, so a claim that
+  they authored nothing is only as strong as the worst-covered inbox. Queries below the floor answer NOT
+  OBSERVABLE rather than "silent". The rendered observation carries the wait count and last-evidence stamp
+  and is asserted by test to state no cause, since deadlocked, unreachable and still-working are
+  indistinguishable from this data and need opposite responses.
+
+  `--check-activity PERSONA --since-id N` evaluates a published report in one shot, with no token, network
+  or watch loop, so a shell heartbeat can call it. It exits 0 on evidence of activity, 1 on a silence in a
+  span the report actually covered (printing the observation), and 2 on NOT OBSERVABLE or an unreadable
+  report. 1 and 2 are distinct deliberately: collapsing them turns "I was not watching" into "they were
+  silent". The watcher and the one-shot share one implementation of the tri-state.
+
+- **Every event now carries a producer-owned `event_id`**, so a consumer can dedupe without hashing our NDJSON
+  bytes. Byte-hashing works until it doesn't: it couples the consumer to our serialisation, so a change to key
+  order, spacing or `--content-chars` silently changes the dedupe key and re-delivers old events. Prompted by a
+  real consumer deduping ID-less events on `event+ts` - unique only while two events never land inside one clock
+  tick, and the timestamp is stamped at emit time.
+
+  Two identities, because messages and signals need opposite guarantees. `new` events carry the message's
+  identity (`<persona>:new:<message id>`), so the same message always yields the same id - across a restart, a
+  re-delivery after state loss, and two watchers of one inbox; dedupe on it for exactly-once processing. Every
+  other event is a signal and gets an id unique to that emission (`<persona>:<event>:<run>-<n>`), because a
+  recurrence is a genuinely different event and a second outage is a second thing worth seeing. Repeated
+  announcements of an unchanged condition are suppressed at the source instead, where suppression belongs.
+
+  `<run>` is random per process. A bare in-process counter is specifically ruled out: it restarts at 1 and hands
+  ids a consumer has already seen to brand-new events, so a correct consumer drops live mail - a worse failure
+  than the duplicate the id was introduced to prevent. Ids are stamped at the single emit chokepoint, so a future
+  event kind cannot forget one, and are exported to `--exec` consumers as `$KIJITOMON_EVENT_ID`.
+
+- **Unread-mail-outside-the-window alarm.** The inbox endpoint reports `unread_not_shown` - unread messages
+  it holds that this response did not return. Above zero, the watcher raises an `alert` carrying the count,
+  the window floor, the cursor, and `above_watermark`. It is deliberately a cheap signal rather than a
+  coverage mechanism: the count has no cursor of its own, so it can say THAT mail is out of view but never
+  WHICH rows, and coverage still comes from the backward walk that terminates.
+
+  The event states an observation, not a diagnosis. The count includes unread mail anywhere in the inbox -
+  among it messages this watcher already delivered that the agent simply has not read - so it is not on its
+  own evidence that anything was missed. `above_watermark` is the fact that separates the two cases, and is
+  reported rather than resolved.
+
+  A zero is not self-justifying, and this is the trap the implementation is built around: the server computes
+  the field only when it withheld something, so it is `0` **by construction** on a page with nothing older.
+  The negative answer therefore requires positive evidence - the zero was genuinely computed, or the window
+  is structurally complete - and a field the server never sent is a third state that asserts nothing either
+  way. For the same reason the check runs on the newest-page poll only. Measured against a live inbox holding
+  four unread messages: the newest page reported `0` (correctly), a mid-walk page reported `4` (the whole
+  inbox's unread, not that window's), and the terminal page of the walk reported `0` while all four sat above
+  it - so feeding walk pages to the check would both invent alarms and clear real ones.
+
+  Routed like the stranded-mail alarm (an `alert` rather than a new event name, no ack, self-clearing) but
+  failing the opposite way when the persona directory is unknown: that alarm withholds because it would
+  otherwise flag every persona, while this one concerns the target's own inbox, where firing needlessly costs
+  a line in a stream nobody reads and withholding costs the silent wake gap this tool exists to prevent.
+
 - **Stranded-mail alarm.** The watcher reports mail sitting in an inbox that nothing consumes. Such mail
   is undeliverable and nothing else reports it: the sender gets a success and a message id, the recipient
   gets no signal, and there is no bounce. Two real cases prompted it - a case-variant of a live persona,
