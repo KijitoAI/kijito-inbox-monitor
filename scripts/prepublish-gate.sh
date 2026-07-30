@@ -83,6 +83,20 @@ TYPOGRAPHY='—|–|[“”‘’]|…'
 MEMORY_IDS='\[\[[0-9]+\]\]|\[[0-9]{4,5}\]'
 PATH_ESCAPES='\.\./'
 
+# THE SCOPE. Everything tracked is inspected MINUS these, each justified here and DECLARED at run time:
+#   test_* , tests/   - the suite is not published surface
+#   .github/          - CI configuration is not published surface
+#   scripts/prepublish-gate.sh - THIS FILE, and the only one that HAS to be exempt: it necessarily
+#                       CONTAINS the literals it bans, because they are its patterns and its own
+#                       documentation. Any other way of sparing them would mean weakening the patterns.
+#
+# ⚠️ IT USED TO EXEMPT THE WHOLE `scripts/` PREFIX, and that was a silent scope hole (assay's review,
+# 2026-07-30 - M184). Narrowing it to the one file that needs it immediately surfaced TWO REAL LEAKS
+# that had been invisible the whole time: internal Kijito memory ids in `scripts/mutation-check.py`,
+# published to a public remote. A prefix is a cheap way to SPELL an exemption and an expensive way to
+# MEAN one - it silently covers every file added under that prefix later, forever.
+EXEMPT='^(test_|tests/|\.github/|scripts/prepublish-gate\.sh$)'
+
 fixture=$(mktemp)
 trap 'rm -f "$fixture"' EXIT
 
@@ -124,7 +138,23 @@ for label_pattern in "typography:$TYPOGRAPHY" "memory-ids:$MEMORY_IDS" "path-esc
         exit 2
     fi
 done
+# ---- canary, direction 3: the SCOPE, not the patterns (M184) --------------------------------------
+# A pattern that works proves nothing about a file the gate never opens. Two of the three checks above
+# were passing for years while `scripts/` was wholly exempt and leaking. So: assert that a leak planted
+# under scripts/ WOULD be inspected, and that the one file spared is spared by an exemption this script
+# DECLARES. Silence about a skipped path is the failure, not the skipping.
+for planted in "scripts/leak-canary.md" "scripts/mutation-check.py" "docs/DESIGN.md" "README.md"; do
+    if printf '%s\n' "$planted" | grep -qE "$EXEMPT"; then
+        printf 'ABORT: %s would be EXEMPT from every check, so a leak planted there is invisible.\n' "$planted" >&2
+        exit 2
+    fi
+done
+if ! printf '%s\n' "scripts/prepublish-gate.sh" | grep -qE "$EXEMPT"; then
+    printf 'ABORT: the gate no longer exempts ITSELF, so it will condemn its own pattern literals.\n' >&2
+    exit 2
+fi
 echo "canary: every pattern fires on each known-bad shape and stays silent on known-good input"
+echo "canary: scope holds - a leak under scripts/ is inspected; only this file is exempt, and it is declared"
 
 if [ "$canary_only" -eq 1 ]; then
     echo "CANARY CLEAN - the gate can still tell good from bad. (No surface inspected: --canary.)"
@@ -142,14 +172,24 @@ if [ ! -f kijito_inbox_monitor.py ] || [ ! -f RELEASING.md ]; then
 fi
 echo "specimen: $root"
 
-# The public surface: everything tracked except the test suite, this script's directory, and CI workflows.
-files=$(git ls-files -z | tr '\0' '\n' | grep -vE '^(test_|tests/|scripts/|\.github/)' || true)
+tracked=$(git ls-files -z | tr '\0' '\n')
+files=$(printf '%s\n' "$tracked" | grep -vE "$EXEMPT" || true)
+excluded=$(printf '%s\n' "$tracked" | grep -E "$EXEMPT" || true)
 if [ -z "$files" ]; then
     echo "ABORT: re-derived file list is EMPTY - refusing to report a clean gate over nothing." >&2
     exit 2
 fi
 count=$(printf '%s\n' "$files" | wc -l | tr -d ' ')
 echo "surface: $count file(s)"
+# DECLARE THE EXEMPTIONS. Silence about what was skipped is the failure mode; a reader must be able to
+# tell "clean" from "not looked at" without reading this script.
+if [ -n "$excluded" ]; then
+    printf 'exempt: %s file(s) NOT inspected -' "$(printf '%s\n' "$excluded" | wc -l | tr -d ' ')"
+    printf ' %s' $(printf '%s\n' "$excluded")
+    printf '\n'
+else
+    echo "exempt: none"
+fi
 
 status=0
 for label_pattern in "typography:$TYPOGRAPHY" "memory-ids:$MEMORY_IDS" "path-escapes:$PATH_ESCAPES"; do

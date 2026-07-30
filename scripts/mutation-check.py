@@ -208,8 +208,8 @@ M=[
  ("L9-H2: pre-existing rotated archives are not repaired",
   "        for archive in self._archive_paths():\n            _repair_mode(archive)",
   "        for archive in []:\n            _repair_mode(archive)"),
- # L10-M4: the CALL survives, only its RANGE narrows back to current retention. [[22206]] - deleting a
- # call proves the call is present; it does not prove the range it walks is the right one.
+ # L10-M4: the CALL survives, only its RANGE narrows back to current retention. Deleting a call proves
+ # the call is present; it does not prove the range it walks is the right one.
  ("L10-M4: archive repair is bounded by CURRENT retention again (a shrunk `keep` strands the rest)",
   "        return sorted(os.path.join(d, n) for n in names\n"
   "                      if n.startswith(base + \".\") and n[len(base) + 1:].isdigit())",
@@ -304,7 +304,7 @@ M=[
   "        key = p.casefold()\n        if p and key not in seen:",
   "        key = p\n        if p and key not in seen:"),
 
- # ---- the containment residual ([[22388]]): InsecureFile is an OSError, NOT a FatalConfig ----------
+ # ---- the containment residual: InsecureFile is an OSError, NOT a FatalConfig ---------------------
  # Each arm gets its OWN entry, deliberately: river's binding condition on this fix, because a
  # containment guard with no mutation is EXACTLY how this defect stayed invisible for two rounds. The
  # narrowing below is the original bug, restored verbatim - a guard that names the wrong exception type
