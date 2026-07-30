@@ -5,6 +5,47 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+⚠️ **WHAT THE REVIEW OF THIS SET DOES AND DOES NOT COVER.** The seven alarm/liveness changes were reviewed
+and approved by an independent engine-literate reviewer who re-ran the suite and the mutation harness rather
+than accepting them. Two limits were disclosed rather than discovered: the reviewer did **not** run the
+producer against a live account, so "verified live" claims here rest on the author's word; and the docs/gate
+commit was out of that review's scope.
+
+### Added
+- **An alarm for escalated mail nobody is answering.** Fires only when a member holds mail a sender marked
+  URGENT *and* no activity from that member has been observed - both halves positive. Silence alone is never
+  the trigger, because idle-by-design and wedged are indistinguishable from outside; the urgent flag is a
+  sender declaring an expectation, which is what makes the silence mean something. Clears when either half
+  clears, with no ack.
+- **An alarm for unread mail the inbox window did not show** (`unread_not_shown` above zero) - the case where
+  the endpoint tells you it is holding mail this response did not hand you.
+- **An attributable liveness signal** (`--activity-file`) and a one-shot evaluation of it
+  (`--check-activity`), so an external supervisor can assert the producer is not merely running but working.
+- **A producer-owned event id on every event**, so a consumer can deduplicate across restarts and rotations
+  without inferring identity from content.
+- **`--no-urgent-alerts`** - see Changed.
+
+### Changed
+- **`--no-stranded-alerts` no longer silences the urgent-unanswered alarm.** It gated both, while saying so
+  in only one of the three places an operator reads - and its own documented advice ("set this if you keep
+  deliberate test inboxes") therefore turned off a higher-severity alarm about real members as a side effect.
+  The two alarms now have separate flags; pass both to disable both. The coupling is pinned by tests through
+  the real run loop and by its own mutation, because nothing tested the mapping either way before.
+  (Found in review of the urgent-unanswered alarm, which is unreleased - so no released behaviour changes.)
+- **Account-level alarms are routed by evidence of a consumer**, instead of to every directory persona -
+  long-dead test personas were receiving alerts into streams nobody reads.
+
+### Fixed
+- **One persona's hostile or un-tightenable `.lock` sidecar killed the whole producer.** `InsecureFile` is an
+  `OSError` by design, but every containment arm caught `FatalConfig` only, so the throw went past all of
+  them on the startup path and both late-add paths. Containment is now per-persona at four sites, and fails
+  **closed**: if every persona fails to initialise, the producer raises rather than staying up watching
+  nothing. The lesson worth keeping is that the earlier fix checked that the catch *existed* and never that
+  its type *covered the throw*.
+- **`RELEASING.md` prescribed a path the package does not contain** - a clone could not run the gate the
+  document mandates. Restated as the property plus a self-contained check, with a third prepublish gate
+  (`path-escapes`) so the class cannot return.
+
 ## [0.4.0] - 2026-07-28
 
 ⚠️ **WHAT THIS RELEASE DOES AND DOES NOT ESTABLISH.** Two audit rounds swept a defect CLASS rather than

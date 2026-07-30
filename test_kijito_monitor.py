@@ -4439,5 +4439,106 @@ class ContainmentResidualTest(unittest.TestCase):
         self.assertFalse(issubclass(km.InsecureFile, km.FatalConfig))
 
 
+class AlarmFlagsAreIndependentTest(unittest.TestCase):
+    """Each alarm is gated by its OWN flag, pinned through the REAL run() loop.
+
+    ★ WHY THIS EXISTS (ladybug review of c6e1699): `--no-stranded-alerts` used to gate BOTH alarms, and
+    nothing tested the mapping either way - so the coupling was invisible to the suite and visible in only
+    one of the three places an operator reads. The hazard was not the coupling itself but that the stranded
+    flag's own documented advice ("set this if you keep deliberate test inboxes") ALSO silenced the
+    higher-severity urgent-unanswered alarm. A flag that is safe to follow by its description must be safe
+    to follow in fact.
+
+    These assert through `run()` rather than by re-reading the guard expression, because the defect being
+    closed was precisely a guard naming the wrong flag - a test that restated the condition would have
+    agreed with the bug.
+    """
+
+    def _one_tick(self):
+        """A wake seam that permits exactly ONE pass of the poll loop, then stops it."""
+        test = self
+
+        class Seam:
+            def __init__(self):
+                self.stop = False
+
+            def install(self):
+                pass
+
+            def drain(self):
+                self.stop = True   # body still completes; the `if seam.stop: break` at the end exits
+        real = km.WakeSeam
+        km.WakeSeam = Seam
+        test.addCleanup(lambda: setattr(km, "WakeSeam", real))
+
+    def _run_one_tick(self, argv_extra):
+        """Run one loop pass with the network stubbed; return which alarms were REPORTED."""
+        d = tempfile.mkdtemp()
+        tok = os.path.join(d, "token")
+        with open(tok, "w") as f:
+            f.write("t0ken")
+        os.chmod(tok, 0o600)
+        argv = ["--persona", "argus",
+                "--state-file", os.path.join(d, "hive.json"),
+                "--events-file-template", os.path.join(d, "events.{persona}.ndjson"),
+                "--token-file", tok] + list(argv_extra)
+        args = km.build_parser().parse_args(argv)
+
+        called = {"stranded": False, "urgent": False}
+        counts = {"argus": 1}
+
+        def patch(name, fn):
+            real = getattr(km, name)
+            setattr(km, name, fn)
+            self.addCleanup(lambda: setattr(km, name, real))
+
+        # counts_available must be True or neither alarm is reachable - stub BOTH count paths so the
+        # test does not silently depend on the --wait default choosing one of them.
+        patch("fetch_unread_counts", lambda o, u, h: (True, counts))
+        patch("fetch_unread_counts_longpoll", lambda o, h, w, c: (True, counts, None))
+        patch("discover_from_counts", lambda *a, **k: None)
+        patch("refresh_directory_backing", lambda *a, **k: None)
+        patch("report_stranded_inboxes", lambda *a, **k: called.__setitem__("stranded", True))
+        patch("report_urgent_unanswered", lambda *a, **k: called.__setitem__("urgent", True))
+        real_poll = km.WatchTarget.poll_once
+        km.WatchTarget.poll_once = lambda self_, *a, **k: None
+        self.addCleanup(lambda: setattr(km.WatchTarget, "poll_once", real_poll))
+
+        self._one_tick()
+        _capture_stderr(self)
+        km.run(args)
+        return called
+
+    def test_both_alarms_fire_by_default(self):
+        # The baseline the other three are measured against: if this ever goes quiet, the cases below
+        # would pass for the wrong reason (nothing firing looks identical to correct suppression).
+        self.assertEqual(self._run_one_tick([]), {"stranded": True, "urgent": True})
+
+    def test_no_stranded_alerts_does_NOT_silence_the_urgent_alarm(self):
+        # The actual defect. Following the stranded flag's own advice must not disable the alarm about
+        # real members - that is the higher-severity one, and river reopened it deliberately.
+        self.assertEqual(self._run_one_tick(["--no-stranded-alerts"]),
+                         {"stranded": False, "urgent": True})
+
+    def test_no_urgent_alerts_does_NOT_silence_the_stranded_alarm(self):
+        # The mirror direction, asserted separately: a decoupling verified in only one direction is the
+        # dominant failure mode, and one flag gating nothing is as wrong as one flag gating both.
+        self.assertEqual(self._run_one_tick(["--no-urgent-alerts"]),
+                         {"stranded": True, "urgent": False})
+
+    def test_passing_both_flags_silences_both(self):
+        self.assertEqual(self._run_one_tick(["--no-stranded-alerts", "--no-urgent-alerts"]),
+                         {"stranded": False, "urgent": False})
+
+    def test_the_flags_are_distinct_parser_destinations(self):
+        # Cheap, but it pins the thing a rename would break: two names, two dests, neither aliasing.
+        a = km.build_parser().parse_args(["--persona", "x", "--no-stranded-alerts"])
+        self.assertTrue(a.no_stranded_alerts)
+        self.assertFalse(a.no_urgent_alerts)
+        b = km.build_parser().parse_args(["--persona", "x", "--no-urgent-alerts"])
+        self.assertFalse(b.no_stranded_alerts)
+        self.assertTrue(b.no_urgent_alerts)
+
+
 if __name__ == "__main__":
     unittest.main()

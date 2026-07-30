@@ -295,7 +295,9 @@ Three details matter if you consume these:
   lets you silence the flag while the mail stays unread, which is how dead-letter queues rot.
 
 Disable with `--no-stranded-alerts` if you keep deliberate test inboxes. Prefer draining them instead - an alarm
-you have trained everyone to ignore is one that has been disabled without anyone deciding to disable it.
+you have trained everyone to ignore is one that has been disabled without anyone deciding to disable it. The flag
+silences **only this alarm**; [escalated mail nobody is answering](#escalated-mail-nobody-is-answering) has its own
+`--no-urgent-alerts`, so following this advice cannot quietly turn off the higher-severity one.
 
 ### Escalated mail nobody is answering
 
@@ -319,7 +321,10 @@ the member does something - and there is no ack, because an ack would let you si
 escalated mail" while it stayed true.
 
 It is deliberately kept separate from the stranded-mail alarm above: that one is for inboxes nobody owns,
-this one for real members who are not responding. Disable both with `--no-stranded-alerts`.
+this one for real members who are not responding. **They have separate flags for the same reason** - disable
+this one with `--no-urgent-alerts`. Silencing the low-severity alarm about unowned inboxes must not also
+silence the higher-severity one about real members, so `--no-stranded-alerts` does not touch it. To turn off
+both, pass both.
 
 ### Unread mail outside the window
 
@@ -369,7 +374,8 @@ four sat above it. Only the newest page's count answers the question "is there u
 | `--max-bytes N` / `--keep-logs N` | Rotate event files at N bytes (default 5000000; `<=0` disables) keeping N archives (default 5). |
 | `--seed-at ID` / `--max-replay N` | Seed the cursor at a last-handled id (single persona) / cap a re-arm backlog before fast-forwarding (default 50). |
 | `--rediscover-every N` | In all-persona mode, re-scan for new personas every N seconds (default 600). |
-| `--no-stranded-alerts` | Don't alarm on mail sitting in an inbox that isn't a known persona (see [Stranded mail](#stranded-mail)). On by default, because such mail is undeliverable and nothing else reports it. |
+| `--no-stranded-alerts` | Don't alarm on mail sitting in an inbox that isn't a known persona (see [Stranded mail](#stranded-mail)). On by default, because such mail is undeliverable and nothing else reports it. Silences only this alarm. |
+| `--no-urgent-alerts` | Don't alarm on escalated (urgent) mail a known member isn't answering (see [Escalated mail nobody is answering](#escalated-mail-nobody-is-answering)). On by default. Separate from `--no-stranded-alerts` on purpose - a flag for unowned test inboxes must not silence an alarm about real members. |
 | `--auth-header NAME` / `--token-file PATH` | Auth header name (default `Authorization: Bearer`) / token file. Token also via `$KIJITOMON_TOKEN`. A token is required. |
 | `--no-fast-path` | Disable the `/api/notify/pending` pre-check; always full-poll the inbox list. |
 | `--resync-every N` | Fast-path safety floor: force a full inbox poll after at most N cheap skips (default 10), so a stale unread count can never blind the watcher. |
