@@ -14,8 +14,9 @@ anywhere. Pushing a version tag publishes to both PyPI and npm, with provenance 
    release, and server-side logs then attribute traffic to a version that is not running.
    Verify with: `grep -n '^version\|"version"\|^__version__' pyproject.toml package.json kijito_inbox_monitor.py`
 2. Add a section for the new version to `CHANGELOG.md`.
-3. Run the pre-publish gates. BOTH must report clean, and the canary must prove the gate can still
-   fire - a gate that cannot fail is worse than no gate, because it certifies:
+3. Run the pre-publish gates. ALL THREE (typography, memory-ids, path-escapes) must report clean, and
+   the canary must prove the gate can still fire - a gate that cannot fail is worse than no gate,
+   because it certifies:
    ```sh
    ./scripts/prepublish-gate.sh
    ```
@@ -72,7 +73,10 @@ PROPERTY, because the operator's own tooling is not part of this package:
     THE RUNNING ARGV MUST CARRY THE EXPECTED SHA. Nothing else settles it.
 A self-contained check, which needs only a shell and a running producer:
 ```sh
-sha=<new-sha>
+# SHORT sha - the artifact directories are 7-char. A full 40-char rev-parse of the CORRECT running
+# commit FAILS this check, and it fails mid-release, which is exactly when a false alarm gets
+# "fixed" by loosening the check that was right.
+sha=$(git rev-parse --short <ref>)
 procs=$(pgrep -f 'kijito_inbox_monitor\.py' || true)
 n=$(printf '%s' "$procs" | grep -c . || true)
 [ "$n" -eq 1 ] || { echo "FAIL: expected exactly 1 producer, found $n"; exit 1; }
