@@ -197,12 +197,12 @@ Each line of the events file (and each `exec-per-event` invocation) is one event
 |---------|---------|----------------------|
 | `armed` | emitted once per persona on the first healthy poll (baseline set) | `KIJITOMON_CURSOR` |
 | `new` | a new inbox message | `KIJITOMON_ID`, `KIJITOMON_FROM`, `KIJITOMON_CONTENT`, `KIJITOMON_CREATED`, `KIJITOMON_PERSONA` |
-| `alert` | the source has been unreachable for `--alert-after` polls (dead-man), **or** mail is stranded in an inbox nobody watches (see below) | `KIJITOMON_REASON`, `KIJITOMON_FAILURES`, `KIJITOMON_STRANDED` |
+| `alert` | the source has been unreachable for `--alert-after` polls (dead-man), **or** mail is stranded in an inbox nobody watches, **or** the server holds unread mail this window did not show (all below) | `KIJITOMON_REASON`, `KIJITOMON_FAILURES`, `KIJITOMON_STRANDED` |
 | `recovered` | the source came back after an `alert` | `KIJITOMON_CURSOR` |
 | `heartbeat` | optional liveness tick (`--heartbeat N`) | `KIJITOMON_CURSOR` |
 
-Every event also carries `KIJITOMON_EVENT`, `KIJITOMON_SOURCE`, `KIJITOMON_TS`, and (for persona targets)
-`KIJITOMON_PERSONA`. In file mode the same data is NDJSON, one event per line, with a space after each `:` and `,`
+Every event also carries `KIJITOMON_EVENT`, `KIJITOMON_SOURCE`, `KIJITOMON_TS`, `KIJITOMON_EVENT_ID`, and (for
+persona targets) `KIJITOMON_PERSONA`. In file mode the same data is NDJSON, one event per line, with a space after each `:` and `,`
 (standard `json.dumps`): `{"event": "new", "id": 41, "from": "river", "persona": "testbot", ...}` - so a filter
 like `grep '"event": "new"'` matches.
 The watcher peeks (never marks your mail read) and dedupes by the monotonic message id.
@@ -216,6 +216,27 @@ leave a cursor that has forgotten mail nobody received. In the steady state each
 after a failed hand-off, a timeout, or a crash between the event and the cursor write you may see one again, so
 **make your consumer idempotent** - `KIJITOMON_ID` is stable across re-deliveries for exactly that purpose.
 Duplicates are recoverable and skips are not, which is why the guarantee leans this way.
+
+### Event ids
+
+Every event carries an `event_id` the producer owns, so a consumer never has to hash our NDJSON bytes to build a
+dedupe key. Byte-hashing works until it doesn't: it couples you to our formatting, so a change to key order,
+spacing, or `--content-chars` silently changes the key and re-delivers everything.
+
+There are two kinds of identity, because messages and signals need opposite things:
+
+- **`new` events carry the message's identity**: `<persona>:new:<message id>`. The same message always gets the
+  same `event_id` - across a restart, across a re-delivery after state loss, and across two watchers of the same
+  inbox. Dedupe on it to process each message exactly once. (Verified by running two separate watchers over the
+  same mail with different `--content-chars`: identical ids.)
+- **Every other event is a signal** and gets an id unique to that emission: `<persona>:<event>:<run>-<n>`. A
+  recurrence is a genuinely different event - a second outage is a second thing you want to see - so signals do
+  not collapse into their earlier selves. Repeated announcements of an *unchanged* condition are suppressed at
+  the source instead, which is why the alarms above are edge-triggered and self-clearing.
+
+`<run>` is random per process, and it is the part that matters: a bare counter would restart at 1 and hand ids a
+consumer has already seen to brand-new events, making it drop live mail - a worse failure than the duplicate it
+was meant to prevent. Ids are unique for all time; treat them as opaque strings.
 
 ### Bounded windows
 
@@ -274,7 +295,63 @@ Three details matter if you consume these:
   lets you silence the flag while the mail stays unread, which is how dead-letter queues rot.
 
 Disable with `--no-stranded-alerts` if you keep deliberate test inboxes. Prefer draining them instead - an alarm
-you have trained everyone to ignore is one that has been disabled without anyone deciding to disable it.
+you have trained everyone to ignore is one that has been disabled without anyone deciding to disable it. The flag
+silences **only this alarm**; [escalated mail nobody is answering](#escalated-mail-nobody-is-answering) has its own
+`--no-urgent-alerts`, so following this advice cannot quietly turn off the higher-severity one.
+
+### Escalated mail nobody is answering
+
+The watcher alarms when a member holds mail a **sender marked urgent** and no activity from that member has
+been observed:
+
+```json
+{"event": "alert", "source": "kijito-inbox", "persona": "you",
+ "reason": "urgent-unanswered: 1 member(s) hold mail a sender marked URGENT while no activity from them has been observed: loom (1 urgent unread; last observed message 2026-07-24T23:24:43Z). OBSERVATION, NOT A DIAGNOSIS: ...",
+ "urgent_unanswered": ["loom"]}
+```
+
+"Is this member stuck?" is normally unanswerable from outside, because idle-by-design and wedged look
+identical - so the obvious version of this alarm fires on every quiet persona and becomes noise you learn to
+ignore. The urgent flag is what makes it tractable: it is a **sender declaring an expectation**, and silence
+only means something once something was expected. A quiet member with no urgent mail never trips it.
+
+Both halves must be positive. If the watcher was not running for the span in question it reports nothing
+rather than calling that silence. The alarm clears itself when **either** half clears - the mail is read, or
+the member does something - and there is no ack, because an ack would let you silence "nobody is answering
+escalated mail" while it stayed true.
+
+It is deliberately kept separate from the stranded-mail alarm above: that one is for inboxes nobody owns,
+this one for real members who are not responding. **They have separate flags for the same reason** - disable
+this one with `--no-urgent-alerts`. Silencing the low-severity alarm about unowned inboxes must not also
+silence the higher-severity one about real members, so `--no-stranded-alerts` does not touch it. To turn off
+both, pass both.
+
+### Unread mail outside the window
+
+Alongside the declaration of *what it dropped*, the inbox endpoint reports `unread_not_shown`: how many
+unread messages it holds that this response did not hand you. The watcher raises an `alert` when that count
+is above zero.
+
+```json
+{"event": "alert", "source": "kijito-inbox", "persona": "you",
+ "reason": "unread-not-shown: the server reports 3 unread message(s) in this inbox that this window did not include. ...",
+ "unread_not_shown": 3, "window_floor": 1204, "cursor_at": 1180, "above_watermark": true}
+```
+
+It is an **observation, not a diagnosis**, and worth reading literally. The count covers unread mail
+*anywhere* in the inbox - including messages this watcher already delivered to your stream that you simply
+have not read - so on its own it is not evidence that anything was missed. `above_watermark` is the fact
+that separates the two cases: when it is `false`, the window reached back past the watcher's cursor, so
+everything above the cursor was visible and the unseen unread can only be mail already delivered. Coverage
+of an un-emitted span is still established by the backward walk above; this count is a cheap signal, never
+proof. Like the stranded alarm it clears itself when the condition goes away, and it has no ack.
+
+**If you page the API yourself, do not reuse this field as a general "is anything hidden" check.** The
+server computes it only when it withheld something, so it is `0` **by construction** on a page with nothing
+older - and the last page of a backward walk is exactly that page. Measured against a live inbox holding
+four unread messages: the newest page reported `0` (correctly - all four were in it), a mid-walk page
+reported `4` (the whole inbox's unread, not that window's), and the terminal page reported `0` while all
+four sat above it. Only the newest page's count answers the question "is there unread mail I cannot see".
 
 ## CLI
 
@@ -297,7 +374,8 @@ you have trained everyone to ignore is one that has been disabled without anyone
 | `--max-bytes N` / `--keep-logs N` | Rotate event files at N bytes (default 5000000; `<=0` disables) keeping N archives (default 5). |
 | `--seed-at ID` / `--max-replay N` | Seed the cursor at a last-handled id (single persona) / cap a re-arm backlog before fast-forwarding (default 50). |
 | `--rediscover-every N` | In all-persona mode, re-scan for new personas every N seconds (default 600). |
-| `--no-stranded-alerts` | Don't alarm on mail sitting in an inbox that isn't a known persona (see [Stranded mail](#stranded-mail)). On by default, because such mail is undeliverable and nothing else reports it. |
+| `--no-stranded-alerts` | Don't alarm on mail sitting in an inbox that isn't a known persona (see [Stranded mail](#stranded-mail)). On by default, because such mail is undeliverable and nothing else reports it. Silences only this alarm. |
+| `--no-urgent-alerts` | Don't alarm on escalated (urgent) mail a known member isn't answering (see [Escalated mail nobody is answering](#escalated-mail-nobody-is-answering)). On by default. Separate from `--no-stranded-alerts` on purpose - a flag for unowned test inboxes must not silence an alarm about real members. |
 | `--auth-header NAME` / `--token-file PATH` | Auth header name (default `Authorization: Bearer`) / token file. Token also via `$KIJITOMON_TOKEN`. A token is required. |
 | `--no-fast-path` | Disable the `/api/notify/pending` pre-check; always full-poll the inbox list. |
 | `--resync-every N` | Fast-path safety floor: force a full inbox poll after at most N cheap skips (default 10), so a stale unread count can never blind the watcher. |
