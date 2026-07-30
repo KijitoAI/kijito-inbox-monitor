@@ -2916,7 +2916,11 @@ def run(args):
             target.poll_once(counts_available, unread_counts)
         # AFTER the polls, so this tick's authorship is already recorded - evaluating before them would
         # judge a member silent using a view that predates the very message proving they are not.
-        if counts_available and not args.no_stranded_alerts:
+        # ITS OWN FLAG, NOT THE STRANDED ONE (ladybug review of c6e1699): these are different severities
+        # with different audiences, and the stranded flag's own documented advice is "set this if you keep
+        # deliberate test inboxes" - following that must not silently disable the higher-severity alarm
+        # about real members. Coupling them made the safe-sounding instruction the dangerous one.
+        if counts_available and not args.no_urgent_alerts:
             report_urgent_unanswered(directory_personas, targets, emitter)
         if args.activity_file:
             write_activity_file(args.activity_file)
@@ -2950,9 +2954,15 @@ def build_parser():
     p.add_argument("--all-personas", action="store_true",
                    help="Watch every persona in your Kijito account (default).")
     p.add_argument("--no-stranded-alerts", action="store_true",
-                   help="do not alarm on mail sitting in an inbox that is not a known persona. Off by "
-                        "default because such mail is UNDELIVERABLE and nothing else reports it; set this "
-                        "only if you keep deliberate test inboxes and expect the alarm.")
+                   help="do not alarm on mail sitting in an inbox that is not a known persona. The alarm is "
+                        "ON by default because such mail is UNDELIVERABLE and nothing else reports it; set "
+                        "this only if you keep deliberate test inboxes and expect the alarm. It silences "
+                        "ONLY this alarm - urgent-unanswered has its own flag (--no-urgent-alerts).")
+    p.add_argument("--no-urgent-alerts", action="store_true",
+                   help="do not alarm on escalated (URGENT) mail that a known member is not answering. The "
+                        "alarm is ON by default. Deliberately a SEPARATE flag from --no-stranded-alerts: "
+                        "silencing a low-severity alarm about inboxes nobody owns must not also silence a "
+                        "higher-severity one about real members who are not responding.")
     p.add_argument("--rediscover-every", type=int, default=600,
                    help="In all-persona mode, re-scan your account every N seconds and add newly-created personas "
                         "(default 600, min 1). Explicit persona subsets are not expanded.")

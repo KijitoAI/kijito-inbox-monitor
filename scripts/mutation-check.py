@@ -326,6 +326,12 @@ M=[
  ("R0: containment degrades into a watcher that is UP and watching nothing (fail-closed removed)",
   "    if not targets:\n        # FAIL CLOSED.",
   "    if False:\n        # FAIL CLOSED."),
+ # ladybug's review finding on c6e1699: the urgent alarm was gated by --no-stranded-alerts, so the
+ # stranded flag's own advice ("set this if you keep deliberate test inboxes") silenced a
+ # higher-severity alarm about real members. Re-coupling them is the regression worth pinning.
+ ("A1: the urgent-unanswered alarm is re-coupled to --no-stranded-alerts (one flag silences both again)",
+  "        if counts_available and not args.no_urgent_alerts:",
+  "        if counts_available and not args.no_stranded_alerts:"),
 ]
 def run(src):
     # RELEASE WHAT WE ACQUIRE (Loom re-audit 10, L6). The temp tree was never removed and the source file
