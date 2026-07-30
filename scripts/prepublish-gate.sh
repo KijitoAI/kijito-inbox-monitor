@@ -4,10 +4,12 @@
 #   ./scripts/prepublish-gate.sh            # canary, then the gates over the public surface
 #   ./scripts/prepublish-gate.sh --canary   # prove the gate can still fail, then exit
 #
-# Three checks over the PUBLIC surface:
+# Four checks over the PUBLIC surface (this count is the exact thing that drifts - if you add a check,
+# the loops below and RELEASING.md step 3 say it too):
 #   1. typography   - em/en dashes, curly quotes, ellipsis
 #   2. memory-ids   - internal Kijito memory ids ([[12345]] / [12345])
 #   3. path-escapes - references to paths ABOVE the repository root (../)
+#   4. private-detail - an operator absolute home path, or a private handoff sentinel
 #
 # Why check 3 exists (added 2026-07-29, after finding two live instances): RELEASING.md instructed the
 # reader to run `../bin/producer-health.sh`, a helper that lives in the private workspace ALONGSIDE this
@@ -82,6 +84,12 @@ fi
 TYPOGRAPHY='—|–|[“”‘’]|…'
 MEMORY_IDS='\[\[[0-9]+\]\]|\[[0-9]{4,5}\]'
 PATH_ESCAPES='\.\./'
+# PRIVATE DETAIL (M185): an operator's absolute home directory, or a private Kijito handoff sentinel,
+# published to a public remote. Both were live here: the tracked LaunchAgent baked ONE operator's home
+# into seven paths, and RELEASING.md named a private current-state sentinel.
+# ★ MATCHED BY CONTENT, NEVER BY FILENAME - the M160 lesson. A filename-based rule ("check the plist")
+# is a rule about the files you already thought of; the leak arrives in the file you did not.
+PRIVATE_DETAIL='/(Users|home)/[A-Za-z0-9._-]+|_CURRENT_STATE_POINTER'
 
 # THE SCOPE. Everything tracked is inspected MINUS these, each justified here and DECLARED at run time:
 #   test_* , tests/   - the suite is not published surface
@@ -120,6 +128,9 @@ bad_shape path-escapes "$PATH_ESCAPES" '    ../bin/some-helper.sh'
 bad_shape path-escapes "$PATH_ESCAPES" 'require("../lib/thing")'
 bad_shape path-escapes "$PATH_ESCAPES" '../../etc/somewhere'
 bad_shape path-escapes "$PATH_ESCAPES" 'see ../docs/DESIGN.md'
+bad_shape private-detail "$PRIVATE_DETAIL" '    <string>/Users/someone/Code/thing/x.py</string>'
+bad_shape private-detail "$PRIVATE_DETAIL" 'a linux home /home/someone/.config/x'
+bad_shape private-detail "$PRIVATE_DETAIL" 'see the pointer, sentinel SOMEONE_CURRENT_STATE_POINTER_V1'
 
 # ---- canary, direction 2: the GOOD fixture CONTAINS what each pattern must ignore -----------------
 # It is not enough for the good fixture to merely OMIT the bad shapes - a detector sabotaged to flag
@@ -128,8 +139,11 @@ cat > "$fixture" <<'GOOD'
 an ascii - hyphen, "straight" double and 'straight' single quotes, and three dots...
 short ids [12] [123], a longer one [123456], plus [[notdigits]] and [abc]
 ./relative/path, file..txt, three...dots, /absolute/path, parent/child
+~/.config/kijito-inbox-monitor/token and $HOME/.cache/x and __HOME__/.cache/y
+/usr/local/bin, /opt/homebrew/bin/python3, /etc/hosts, /var/log/x
+the operator current state pointer, written as lower-case prose
 GOOD
-for label_pattern in "typography:$TYPOGRAPHY" "memory-ids:$MEMORY_IDS" "path-escapes:$PATH_ESCAPES"; do
+for label_pattern in "typography:$TYPOGRAPHY" "memory-ids:$MEMORY_IDS" "path-escapes:$PATH_ESCAPES" "private-detail:$PRIVATE_DETAIL"; do
     label=${label_pattern%%:*}
     pattern=${label_pattern#*:}
     if grep -qE "$pattern" "$fixture"; then
@@ -192,7 +206,7 @@ else
 fi
 
 status=0
-for label_pattern in "typography:$TYPOGRAPHY" "memory-ids:$MEMORY_IDS" "path-escapes:$PATH_ESCAPES"; do
+for label_pattern in "typography:$TYPOGRAPHY" "memory-ids:$MEMORY_IDS" "path-escapes:$PATH_ESCAPES" "private-detail:$PRIVATE_DETAIL"; do
     label=${label_pattern%%:*}
     pattern=${label_pattern#*:}
     hits=$(printf '%s\n' "$files" | tr '\n' '\0' | xargs -0 grep -nE "$pattern" || true)

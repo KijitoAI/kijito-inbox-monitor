@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  TEMPLATE - substitute the three placeholders before loading. This file is NOT loadable as-is, and
+  that is deliberate: it previously shipped one operator's absolute home directory baked into seven
+  paths, which is useless to you and leaks the layout of a machine you do not have.
+
+    __PYTHON__       absolute path to the interpreter, e.g. /usr/bin/python3 or /opt/homebrew/bin/python3
+                     (launchd does not search PATH, so this must be absolute)
+    __PROGRAM__      absolute path to the kijito_inbox_monitor.py you want to run
+    __HOME__         your home directory (the value of $HOME)
+
+  Install:
+    sed -e 's|__PYTHON__|'"$(command -v python3)"'|' \
+        -e 's|__PROGRAM__|'"$HOME/.local/share/kijito-inbox-monitor/versions/<sha>/kijito_inbox_monitor.py"'|' \
+        -e 's|__HOME__|'"$HOME"'|' \
+        com.kijito.inbox-monitor.plist.template > ~/Library/LaunchAgents/com.kijito.inbox-monitor.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.kijito.inbox-monitor.plist
+
+  ⚠️ POINT __PROGRAM__ AT A PINNED, READ-ONLY ARTIFACT, NOT AT A WORKING TREE. If it points at a
+  checkout, "deploying" by publishing a package leaves the producer on whatever the tree happens to
+  contain, and a restart does not change that - you will believe you deployed and have not. Rebuild
+  the artifact, repoint this file, restart, then assert the running argv carries the expected short
+  sha (RELEASING.md has the check).
+
+  ⚠️ The token file must be mode 0600; the producer refuses a world-readable one.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.kijito.inbox-monitor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>-u</string>
+    <string>__PROGRAM__</string>
+    <string>--token-file</string>
+    <string>__HOME__/.config/kijito-inbox-monitor/token</string>
+    <string>--state-file</string>
+    <string>__HOME__/.cache/kijito-inbox-monitor/hive.json</string>
+    <string>--events-file-template</string>
+    <string>__HOME__/.cache/kijito-inbox-monitor/events.{persona}.ndjson</string>
+    <string>--heartbeat</string>
+    <string>120</string>
+  </array>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.cache/kijito-inbox-monitor/monitor.out</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.cache/kijito-inbox-monitor/monitor.err</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+</dict>
+</plist>
