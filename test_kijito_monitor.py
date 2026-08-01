@@ -2705,8 +2705,16 @@ class Loom7PoisonMessageTest(unittest.TestCase):
         sink = km.RotatingFileSink(os.path.join(d, "events.ndjson"), 0, 5)
         self.addCleanup(sink.close)
         e = km.Emitter("stdout-jsonl", None, 220, False, sink=sink)
-        e.new({"id": 4, "from": "river", "content": "naïve café 日本語 — ★ emoji 🎉"})
-        self.assertIn("naïve café 日本語 — ★ emoji 🎉", read_file(os.path.join(d, "events.ndjson")))
+        # \u2014 is an EM DASH, written as an ESCAPE rather than as the literal character. The runtime
+        # string is byte-identical either way, so this still round-trips a real em dash and the test
+        # loses nothing; the SOURCE file simply no longer contains the character, which the prepublish
+        # gate bans across the published surface.
+        # WHY, so nobody "tidies" the escape back into a literal: this file BECAME published surface on
+        # 2026-08-01, when the `test_* is not published surface` exemption was dropped for being false.
+        # The literal form fails the typography check; the escape keeps the specimen intact.
+        payload = "naïve café 日本語 \u2014 ★ emoji \U0001f389"
+        e.new({"id": 4, "from": "river", "content": payload})
+        self.assertIn(payload, read_file(os.path.join(d, "events.ndjson")))
         self.assertEqual(km._safe_text("naïve café 日本語 🎉"), "naïve café 日本語 🎉")
 
     def test_an_encoding_error_on_write_is_a_FAILED_DELIVERY_not_a_crash(self):
