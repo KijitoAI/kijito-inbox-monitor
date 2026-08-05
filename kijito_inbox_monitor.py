@@ -12,6 +12,7 @@ Authentication is required: set $KIJITOMON_TOKEN (or --token-file) to your Kijit
 import argparse
 import datetime
 import errno
+import hashlib
 import http.client
 import json
 import os
@@ -23,6 +24,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 
@@ -645,6 +647,81 @@ class RotatingFileSink:
 
 _BROKEN_SINK = object()   # a sink that exists in config but cannot be written to SAFELY
 
+_BASE62 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+
+def _wake_nonce(event_id):
+    """The wake nonce: 11 base62 characters DERIVED from the event_id, never minted beside it.
+
+    WHY DERIVED, AND WHY THIS IS THE LOAD-BEARING DECISION.
+    The consumer-side wake ledger needs a nonce with "recompute-asserted uniqueness". The obvious
+    reading -- mint a fresh random one per emission -- silently introduces a SECOND identity that
+    CONTRADICTS the one this emitter already has. `_event_id` deliberately gives a `new` event the
+    same id across a restart, a re-delivery after state loss, and two watchers of the same inbox,
+    because a duplicated MESSAGE is duplicated WORK. A per-emission random nonce would call those
+    two different wakes; the consumer would find no queue entry containing the second one, score it
+    LOST, and PAGE -- on precisely the recovery path this producer exists to survive.
+
+    ⇒ Deriving from the event_id makes the nonce stable exactly where the event_id is stable and
+    distinct exactly where it is distinct. Signal events already get a per-emission-unique id
+    (`<persona>:<event>:<run>-<seq>`, 64 bits of per-run entropy), so ONE rule serves both families
+    and neither family's meaning changes. "Recompute-asserted" also becomes literally true: any
+    auditor recomputes this from the event_id in the same row.
+
+    ★ THE RULING'S STRONGEST GROUND (river): random DESTROYS information at the producer -- "this is
+    the same work re-delivered" becomes unrecoverable downstream because the identity that would
+    have said so was never minted. Derived merely DEFERS a decision to the consumer, where a missing
+    outcome column can supply it. Between two schemes that each have a false-page mode, take the one
+    whose defect is repairable.
+
+    ⚠️ 11 IS FORCED, NOT CHOSEN: the spec wants >=64 bits in <=11 base62 chars. 10 chars = 59.54 bits
+    (fails the floor), 11 = 65.50 (fits), 12 breaks the ceiling. There is no slack in either direction.
+
+    ⛔ THIS IS AN ATTRIBUTION LABEL, NOT A CAPABILITY. It is deterministic and therefore GUESSABLE by
+    anyone who knows the event_id. Nothing may treat nonce-presence as evidence of authenticity; a
+    forger able to write transcript rows already has what it needs and gains nothing from this value.
+    If a consumer ever requires an UNGUESSABLE nonce, this derivation is wrong for it and the choice
+    must be revisited rather than patched.
+
+    ⚠️ IDENTIFIES A WAKE, NOT A DELIVERY. Two different panes delivered the same message carry the
+    SAME nonce -- correctly, it is the same work. Consumer ledgers must therefore key rows on
+    (nonce, session_id), never on the nonce alone, or two panes' deliveries collide into one row.
+    """
+    v = int.from_bytes(hashlib.sha256(event_id.encode("utf-8")).digest(), "big")
+    out = []
+    for _ in range(11):
+        out.append(_BASE62[v % 62])
+        v //= 62
+    return "".join(out)
+
+
+def _emission_stamps():
+    """The producer-emission stamp, as a coherent triple of clocks read at one instant.
+
+    Three clocks because no one of them answers the question alone:
+      wall      - comparable across hosts and to every other timestamp in the system, but it STEPS
+                  (NTP, hypervisor time sync), so a wall delta is not an elapsed time.
+      monotonic - never steps and never goes backwards, but STOPS while the machine is not executing.
+      boottime  - like monotonic, and on a normal guest it keeps counting through a guest suspend.
+
+    Differencing them across two events is what makes dwell measurable rather than assumed:
+    (wall delta - monotonic delta) over an interval is the time the machine did not execute, which is
+    the difference between "this wake sat in a queue for three hours" and "the host was frozen".
+    Measured on this seat, the two are routinely confused: 72.79 h of hypervisor freeze presented as
+    ordinary elapsed wall time, with BOOTTIME - MONOTONIC reading exactly 0.00 s throughout because a
+    hypervisor pause stops the guest's clocks together.
+
+    boottime is optional at runtime: CLOCK_BOOTTIME does not exist on Darwin, and a missing key is
+    honest where a fabricated one is not.
+    """
+    stamps = {
+        "wall": _now_iso(),
+        "monotonic": round(time.clock_gettime(time.CLOCK_MONOTONIC), 6),
+    }
+    if hasattr(time, "CLOCK_BOOTTIME"):
+        stamps["boottime"] = round(time.clock_gettime(time.CLOCK_BOOTTIME), 6)
+    return stamps
+
 
 class Emitter:
     def __init__(self, mode, exec_cmd, content_chars, no_content, sink=None, suppress_authors=None,
@@ -790,6 +867,13 @@ class Emitter:
         # Stamped HERE, the single chokepoint every event passes through, rather than in the
         # convenience constructors: a future event kind added elsewhere cannot forget to carry one.
         event["event_id"] = self._event_id(event)
+        # The nonce is DERIVED from the event_id, never minted beside it - so it must be computed
+        # after it, and it inherits its identity semantics exactly. See _wake_nonce().
+        event["nonce"] = _wake_nonce(event["event_id"])
+        # Stamp 1 of the three-stamp wake ledger, all three clocks read together so they are a
+        # COHERENT triple. `ts` is deliberately left alone: it is stamped in the convenience
+        # constructors, microseconds earlier, and consumers already depend on it.
+        event["emitted"] = _emission_stamps()
         if self.mode == "stdout-jsonl":
             # Sanitised at the SERIALISED line, so one call covers every field an event can carry -
             # content, `from`, an alarm `reason` built from server data - rather than each of them.

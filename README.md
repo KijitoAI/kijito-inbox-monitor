@@ -238,6 +238,38 @@ There are two kinds of identity, because messages and signals need opposite thin
   not collapse into their earlier selves. Repeated announcements of an *unchanged* condition are suppressed at
   the source instead, which is why the alarms above are edge-triggered and self-clearing.
 
+### Wake nonce
+
+Every event also carries a `nonce`: 11 base62 characters, `base62(sha256(event_id))[:11]`. It lets a consumer
+join a delivered wake back to the queue entry that carried it, and you can recompute it from the `event_id` in
+the same row - it is derived, not random, so nothing needs to be looked up.
+
+Deriving it rather than minting a random one per emission is the whole point: it inherits the `event_id`
+semantics above exactly. **The same message re-delivered carries the same nonce**, so a restart or a
+state-loss re-delivery is recognisable as the same work rather than looking like a second wake that never
+arrived. Signals, which already get per-emission ids, get per-emission nonces.
+
+Two things to know if you build on it:
+
+- **It is a label, not a secret.** Deterministic, therefore guessable from the `event_id`. Do not treat its
+  presence as proof of anything's authenticity.
+- **It identifies a wake, not a delivery.** Two panes handed the same message carry the same nonce - correctly,
+  it is the same work. Key your records on `(nonce, session_id)`, not the nonce alone.
+
+### Emission timestamps
+
+Every event carries `emitted` with `wall`, `monotonic`, and `boottime` (where the platform has
+`CLOCK_BOOTTIME` - it is omitted rather than faked on macOS), all read at the same instant.
+
+Three clocks, because one cannot tell you what you need: wall time is comparable to everything else but *steps*
+when NTP or a hypervisor corrects it, so a difference of two wall stamps is not an elapsed time. Monotonic never
+steps - but it *stops while the machine is not executing*. Subtracting one from the other across two events
+gives you the time the machine was not running, which is how you tell "this sat in a queue for hours" apart from
+"the host was suspended". On a VM those look identical in wall time and are completely different problems.
+
+(`ts` is unchanged and still the event's own timestamp; `emitted.wall` is the reading coherent with the other
+two clocks.)
+
 `<run>` is random per process, and it is the part that matters: a bare counter would restart at 1 and hand ids a
 consumer has already seen to brand-new events, making it drop live mail - a worse failure than the duplicate it
 was meant to prevent. Ids are unique for all time; treat them as opaque strings.
