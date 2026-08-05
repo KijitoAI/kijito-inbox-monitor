@@ -283,7 +283,8 @@ event ingestion). So `exec-per-event` is the more portable primitive; `stdout-js
 
 ### 6.1 Event schema (stdout-jsonl)
 
-One object per line; every event carries `event`, `source`, `ts` (emit-time UTC ISO) and `event_id` (§6.3).
+One object per line; every event carries `event`, `source`, `ts` (emit-time UTC ISO), `event_id` (§6.3),
+`nonce` (§6.4) and `emitted` (§6.5).
 ```
 {"event":"new",         "source":"kijito-inbox","ts":"<iso>","id":246,"from":"river","content":"<≤N or omitted>","created":"<iso>"}
 {"event":"armed",       "source":"kijito-inbox","ts":"<iso>","cursor":250}
@@ -343,6 +344,65 @@ failure than the duplicate the id was introduced to prevent.
 Deliberately NOT a hash of the emitted line. Byte-hashing couples the consumer to our serialisation, so a change
 to key order, spacing, or `--content-chars` silently changes the dedupe key and re-delivers old events. Verified
 by emitting the same mail from two processes with different `--content-chars`: the `new` ids are identical.
+
+### 6.4 `nonce`: a wake label DERIVED from the event_id, never minted beside it
+
+`nonce = base62(sha256(event_id))[:11]` — 11 base62 characters, top-level, on every event.
+
+It exists so a consumer-side wake ledger can join a delivered wake to the queue entry that carried it. The
+obvious implementation — a fresh random value per emission — is **wrong here, and wrong in a way that pages.**
+This producer already has an identity with deliberate semantics (§6.3): a `new` event keeps the SAME id across a
+restart, a re-delivery after state loss, and two watchers of one inbox. A per-emission random nonce would call
+one re-delivered message **two different wakes**; the consumer would find no queue entry containing the second,
+score it LOST, and alarm — on precisely the recovery path this producer exists to survive.
+
+Deriving from the `event_id` makes the nonce stable exactly where that id is stable and distinct exactly where it
+is distinct, so **one rule serves both identity families and neither family's meaning changes.** It also makes
+"recompute-asserted uniqueness" literally true: an auditor recomputes the nonce from the `event_id` in the same
+row, needing nothing else.
+
+The deeper reason, and the one that survives any change in failure rates: **a random nonce DESTROYS information at
+the producer** — "this is the same work re-delivered" becomes unrecoverable downstream, because the identity that
+would have said so was never minted. A derived nonce merely **defers a decision to the consumer**, where a
+`LATE-AFTER-DELIVERED` outcome can absorb it. Between two schemes that each have a false-alarm mode, prefer the
+one whose defect is repairable.
+
+**11 is forced, not chosen.** The consumer contract wants ≥64 bits in ≤11 base62 characters: 10 chars is 59.54
+bits and fails the floor; 12 breaks the ceiling. There is no slack in either direction.
+
+Two constraints on consumers:
+
+- ⛔ **It is an attribution label, not a capability.** It is deterministic and therefore guessable by anyone who
+  knows the `event_id`. Nothing may treat nonce-presence as evidence of authenticity — a forger able to write
+  transcript rows already has what it needs and gains nothing from this value. A consumer requiring an
+  *unguessable* nonce needs a different mechanism, not this one.
+- ⚠️ **It identifies a WAKE, not a DELIVERY.** Two different panes delivered the same message carry the SAME
+  nonce — correctly, it is the same work. Ledgers must key rows on `(nonce, session_id)`, never the nonce alone,
+  or two panes' deliveries collide into one row and per-nonce outcomes silently overwrite each other.
+
+### 6.5 `emitted`: three clocks read together, so dwell is measurable rather than assumed
+
+`emitted` carries `wall`, `monotonic`, and (where the platform has `CLOCK_BOOTTIME`) `boottime`, all read at the
+same instant at the `emit()` chokepoint. It is stamp 1 of a three-stamp wake ledger; the consumer supplies the
+other two.
+
+Three clocks because none answers alone: **wall** is comparable across hosts and to every other timestamp in the
+system, but it *steps* (NTP, hypervisor time sync), so a wall delta is not an elapsed time; **monotonic** never
+steps or goes backwards, but *stops while the machine is not executing*; **boottime** matches monotonic on a
+normal guest but keeps counting through a guest suspend.
+
+Differencing them across two events is what separates two states a single clock conflates: `wall delta −
+monotonic delta` over an interval is time the machine **did not execute**, which is the difference between "this
+wake sat in a queue for three hours" and "the host was frozen". That is not hypothetical — measured on a
+Parallels guest, **72.79 h of hypervisor freeze presented as ordinary elapsed wall time**, while
+`BOOTTIME − MONOTONIC` read exactly `0.00 s` throughout, because a hypervisor pause stops the guest's clocks
+*together* and the guest is not executing to notice.
+
+`boottime` is **omitted, not faked**, where the platform lacks it (Darwin). A fabricated value would be
+indistinguishable from a genuine zero-freeze reading, which is the failure this field exists to prevent.
+
+`ts` is deliberately left alone: it is stamped microseconds earlier in the convenience constructors and existing
+consumers depend on it. Use `emitted.wall` when you need the wall reading coherent with the other two clocks.
 
 ## 7. Robustness contract
 

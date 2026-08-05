@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 import urllib.error
 
@@ -4546,6 +4547,145 @@ class AlarmFlagsAreIndependentTest(unittest.TestCase):
         b = km.build_parser().parse_args(["--persona", "x", "--no-urgent-alerts"])
         self.assertFalse(b.no_stranded_alerts)
         self.assertTrue(b.no_urgent_alerts)
+
+
+class WakeNonceTest(unittest.TestCase):
+    """The wake nonce is DERIVED from the event_id, so it inherits that id's identity semantics.
+
+    The property under test is not "a nonce exists" but "the nonce and the event_id agree about what
+    the same thing IS". A per-emission random nonce would satisfy every shape check below and still
+    be wrong, because it would call one re-delivered message two different wakes -- which the
+    consumer scores LOST and pages on, from the recovery path this producer exists to survive.
+    """
+
+    class Capture:
+        def __init__(self):
+            self.lines = []
+
+        def write(self, line):
+            self.lines.append(json.loads(line))
+
+        def close(self):
+            pass
+
+    def _emitter(self, content_chars=200, no_content=False):
+        cap = self.Capture()
+        return km.Emitter("stdout-jsonl", None, content_chars, no_content, sink=cap), cap
+
+    def _msg(self, mid=41):
+        return {"id": mid, "from": "river", "content": "x", "created": "t", "_persona": "argus"}
+
+    def test_every_event_carries_a_nonce_of_exactly_11_base62_chars(self):
+        em, cap = self._emitter()
+        em.new(self._msg())
+        for kind in ("armed", "alert", "recovered", "heartbeat", "persona_added"):
+            em.lifecycle(kind, persona="argus", cursor=7)
+        self.assertEqual(len(cap.lines), 6)
+        for ev in cap.lines:
+            n = ev.get("nonce")
+            self.assertIsInstance(n, str, "missing nonce on %r" % ev["event"])
+            # 11 is FORCED: 10 base62 chars = 59.54 bits and fails the >=64-bit floor; 12 breaks the
+            # <=11 ceiling. Neither bound has slack, so this length is a spec conformance check.
+            self.assertEqual(len(n), 11, "nonce %r on %r is not 11 chars" % (n, ev["event"]))
+            self.assertTrue(all(c.isalnum() and c.isascii() for c in n), "non-base62 nonce %r" % n)
+
+    def test_THE_POINT_same_message_re_delivered_carries_the_SAME_nonce(self):
+        # A restart, a re-delivery after state loss, or a second watcher on the same inbox. This is
+        # the assertion a per-emission random nonce fails, and the reason the derivation exists.
+        a, capa = self._emitter()
+        b, capb = self._emitter()          # a genuinely different Emitter = a different run
+        a.new(self._msg(41))
+        b.new(self._msg(41))
+        self.assertEqual(capa.lines[0]["event_id"], capb.lines[0]["event_id"])
+        self.assertEqual(capa.lines[0]["nonce"], capb.lines[0]["nonce"])
+
+    def test_different_messages_get_different_nonces(self):
+        em, cap = self._emitter()
+        em.new(self._msg(41))
+        em.new(self._msg(42))
+        self.assertNotEqual(cap.lines[0]["nonce"], cap.lines[1]["nonce"])
+
+    def test_signals_recur_as_DISTINCT_nonces_because_a_second_outage_is_a_second_event(self):
+        # The other half of the contract: `new` is per-MESSAGE, signals are per-EMISSION. The two
+        # families mean different things ON PURPOSE and the nonce must not flatten them together.
+        em, cap = self._emitter()
+        em.lifecycle("alert", persona="argus", reason="stranded")
+        em.lifecycle("alert", persona="argus", reason="stranded")
+        self.assertNotEqual(cap.lines[0]["nonce"], cap.lines[1]["nonce"])
+
+    def test_the_nonce_is_recomputable_from_the_event_id_in_the_same_row(self):
+        # "Recompute-asserted uniqueness": an auditor needs nothing but the row itself.
+        em, cap = self._emitter()
+        em.new(self._msg())
+        ev = cap.lines[0]
+        self.assertEqual(ev["nonce"], km._wake_nonce(ev["event_id"]))
+
+    def test_the_nonce_survives_no_content_mode(self):
+        # It is a top-level field, not content, so the opaque mode cannot strip it.
+        em, cap = self._emitter(no_content=True)
+        em.new(self._msg())
+        self.assertNotIn("content", cap.lines[0])
+        self.assertEqual(len(cap.lines[0]["nonce"]), 11)
+
+    def test_the_nonce_is_not_eaten_by_content_clipping(self):
+        # The reason it is a top-level field rather than appended to the message text: _clip is a
+        # head truncation at --content-chars (default 220), so a tail-appended nonce would vanish on
+        # any message longer than the clip -- silently, and only for long messages.
+        em, cap = self._emitter(content_chars=10)
+        m = self._msg()
+        m["content"] = "y" * 500
+        em.new(m)
+        self.assertEqual(len(cap.lines[0]["content"]), 10)
+        self.assertEqual(len(cap.lines[0]["nonce"]), 11)
+
+
+class EmissionStampTest(unittest.TestCase):
+    """Stamp 1 of the three-stamp wake ledger: three clocks read together at the emit chokepoint."""
+
+    class Capture:
+        def __init__(self):
+            self.lines = []
+
+        def write(self, line):
+            self.lines.append(json.loads(line))
+
+        def close(self):
+            pass
+
+    def _emitter(self):
+        cap = self.Capture()
+        return km.Emitter("stdout-jsonl", None, 200, False, sink=cap), cap
+
+    def test_every_event_carries_wall_and_monotonic(self):
+        em, cap = self._emitter()
+        em.new({"id": 1, "from": "r", "content": "c", "created": "t", "_persona": "argus"})
+        em.lifecycle("heartbeat", persona="argus")
+        for ev in cap.lines:
+            st = ev.get("emitted")
+            self.assertIsInstance(st, dict, "no emission stamps on %r" % ev["event"])
+            self.assertIn("wall", st)
+            self.assertIsInstance(st["monotonic"], float)
+
+    def test_monotonic_never_goes_backwards_across_two_emissions(self):
+        em, cap = self._emitter()
+        em.lifecycle("heartbeat", persona="argus")
+        em.lifecycle("heartbeat", persona="argus")
+        self.assertGreaterEqual(cap.lines[1]["emitted"]["monotonic"],
+                                cap.lines[0]["emitted"]["monotonic"])
+
+    def test_boottime_is_present_where_the_platform_has_it_and_absent_where_it_does_not(self):
+        # Darwin has no CLOCK_BOOTTIME. A missing key is honest; a fabricated one is not, and a
+        # fabricated one would be indistinguishable from a real zero-freeze reading.
+        em, cap = self._emitter()
+        em.lifecycle("heartbeat", persona="argus")
+        st = cap.lines[0]["emitted"]
+        self.assertEqual(hasattr(time, "CLOCK_BOOTTIME"), "boottime" in st)
+
+    def test_ts_is_left_alone_so_existing_consumers_do_not_move(self):
+        em, cap = self._emitter()
+        em.lifecycle("heartbeat", persona="argus")
+        self.assertIn("ts", cap.lines[0])
+        self.assertNotEqual(cap.lines[0]["ts"], cap.lines[0]["emitted"])
 
 
 if __name__ == "__main__":

@@ -12,6 +12,25 @@ producer against a live account, so "verified live" claims here rest on the auth
 commit was out of that review's scope.
 
 ### Added
+- **A wake `nonce` on every event** - 11 base62 chars, `base62(sha256(event_id))[:11]`. It lets a consumer join
+  a delivered wake back to the queue entry that carried it, and it is recomputable from the `event_id` in the
+  same row. **Derived rather than random on purpose:** this producer already defines identity (a `new` event
+  keeps the same id across a restart, a state-loss re-delivery, and two watchers of one inbox), and a
+  per-emission random nonce would have contradicted that - calling one re-delivered message two different wakes,
+  so a consumer finds no queue entry for the second, scores it lost, and alarms **on the recovery path the
+  producer exists to survive**. Deriving inherits the existing semantics for both identity families and changes
+  neither. Note it is a label and not a secret (deterministic, hence guessable from the `event_id`), and that it
+  identifies a *wake* rather than a *delivery* - two panes handed the same message share a nonce, so consumer
+  records must key on `(nonce, session_id)`.
+- **Emission timestamps (`emitted`)** - `wall`, `monotonic`, and `boottime` where the platform has
+  `CLOCK_BOOTTIME`, all read at one instant. Differencing wall against monotonic across two events measures the
+  time the machine **was not executing**, which is what separates "this sat in a queue for hours" from "the host
+  was suspended" - indistinguishable in wall time and completely different problems. Measured on a Parallels
+  guest: 72.79 h of hypervisor freeze looked like ordinary elapsed wall time, while `BOOTTIME - MONOTONIC` read
+  `0.00 s` throughout, because a hypervisor pause stops the guest's clocks together and the guest is not running
+  to notice. `boottime` is **omitted rather than faked** on platforms without it (macOS): a fabricated value
+  would be indistinguishable from a real zero-freeze reading, which is the failure the field exists to prevent.
+  `ts` is unchanged; `emitted.wall` is the reading coherent with the other two clocks.
 - **An alarm for escalated mail nobody is answering.** Fires only when a member holds mail a sender marked
   URGENT *and* no activity from that member has been observed - both halves positive. Silence alone is never
   the trigger, because idle-by-design and wedged are indistinguishable from outside; the urgent flag is a
