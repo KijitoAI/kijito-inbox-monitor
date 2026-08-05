@@ -349,6 +349,20 @@ by emitting the same mail from two processes with different `--content-chars`: t
 
 `nonce = base62(sha256(event_id))[:11]` - 11 base62 characters, top-level, on every event.
 
+⚠️ **THE ALPHABET IS PART OF THE DERIVATION, AND "base62" DOES NOT PIN IT.** The alphabet is
+**lowercase-first**: `abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789`, consumed
+**least-significant-digit first** (`s += A[v % 62]; v //= 62`, eleven times, over the big-endian integer of
+the SHA-256 digest). An auditor who assumes the conventional **digit-first** ordering recomputes a different
+string and concludes the nonce does not verify - **a false integrity alarm against correct data**, which is
+worse than no check at all. Found by a reviewer reproducing the recompute independently; recorded here so the
+next one does not have to.
+
+```python
+A = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+v = int.from_bytes(hashlib.sha256(event_id.encode("utf-8")).digest(), "big")
+nonce = "".join(A[(v // 62**i) % 62] for i in range(11))
+```
+
 It exists so a consumer-side wake ledger can join a delivered wake to the queue entry that carried it. The
 obvious implementation - a fresh random value per emission - is **wrong here, and wrong in a way that pages.**
 This producer already has an identity with deliberate semantics (§6.3): a `new` event keeps the SAME id across a
