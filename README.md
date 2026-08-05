@@ -258,14 +258,34 @@ Two things to know if you build on it:
 
 ### Emission timestamps
 
-Every event carries `emitted` with `wall`, `monotonic`, and `boottime` (where the platform has
-`CLOCK_BOOTTIME` - it is omitted rather than faked on macOS), all read at the same instant.
+Every event carries `emitted` with `wall`, `monotonic`, `boottime` and `src`, all read at the same instant.
 
 Three clocks, because one cannot tell you what you need: wall time is comparable to everything else but *steps*
 when NTP or a hypervisor corrects it, so a difference of two wall stamps is not an elapsed time. Monotonic never
 steps - but it *stops while the machine is not executing*. Subtracting one from the other across two events
 gives you the time the machine was not running, which is how you tell "this sat in a queue for hours" apart from
 "the host was suspended". On a VM those look identical in wall time and are completely different problems.
+
+**The keys name what the clock MEANS, not what your OS calls it** - and on macOS those disagree:
+
+| key | meaning | Linux | macOS |
+|---|---|---|---|
+| `monotonic` | does **not** tick while the machine is asleep/paused | `CLOCK_MONOTONIC` | `CLOCK_UPTIME_RAW` |
+| `boottime` | **does** tick while the machine is asleep/paused | `CLOCK_BOOTTIME` | `CLOCK_MONOTONIC` |
+
+macOS `CLOCK_MONOTONIC` *includes* sleep - it means what Linux calls `CLOCK_BOOTTIME` - and macOS has no
+`CLOCK_BOOTTIME` at all. Reading the constant by name there gives you the wrong quantity under the right label,
+and nothing complains. `src` tells you which constant actually supplied each value, so you can check rather than
+assume:
+
+```json
+"emitted": {"wall":"...","monotonic":1404080.74,"boottime":1469598.35,
+            "src":{"monotonic":"CLOCK_UPTIME_RAW","boottime":"CLOCK_MONOTONIC"}}
+```
+
+`boottime - monotonic` is time the machine was not executing (18.20 h on the Mac above). A key is omitted rather
+than faked if its meaning is genuinely unavailable - a made-up value would be indistinguishable from a real
+zero.
 
 (`ts` is unchanged and still the event's own timestamp; `emitted.wall` is the reading coherent with the other
 two clocks.)

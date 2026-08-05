@@ -347,14 +347,14 @@ by emitting the same mail from two processes with different `--content-chars`: t
 
 ### 6.4 `nonce`: a wake label DERIVED from the event_id, never minted beside it
 
-`nonce = base62(sha256(event_id))[:11]` — 11 base62 characters, top-level, on every event.
+`nonce = base62(sha256(event_id))[:11]` - 11 base62 characters, top-level, on every event.
 
 It exists so a consumer-side wake ledger can join a delivered wake to the queue entry that carried it. The
-obvious implementation — a fresh random value per emission — is **wrong here, and wrong in a way that pages.**
+obvious implementation - a fresh random value per emission - is **wrong here, and wrong in a way that pages.**
 This producer already has an identity with deliberate semantics (§6.3): a `new` event keeps the SAME id across a
 restart, a re-delivery after state loss, and two watchers of one inbox. A per-emission random nonce would call
 one re-delivered message **two different wakes**; the consumer would find no queue entry containing the second,
-score it LOST, and alarm — on precisely the recovery path this producer exists to survive.
+score it LOST, and alarm - on precisely the recovery path this producer exists to survive.
 
 Deriving from the `event_id` makes the nonce stable exactly where that id is stable and distinct exactly where it
 is distinct, so **one rule serves both identity families and neither family's meaning changes.** It also makes
@@ -362,7 +362,7 @@ is distinct, so **one rule serves both identity families and neither family's me
 row, needing nothing else.
 
 The deeper reason, and the one that survives any change in failure rates: **a random nonce DESTROYS information at
-the producer** — "this is the same work re-delivered" becomes unrecoverable downstream, because the identity that
+the producer** - "this is the same work re-delivered" becomes unrecoverable downstream, because the identity that
 would have said so was never minted. A derived nonce merely **defers a decision to the consumer**, where a
 `LATE-AFTER-DELIVERED` outcome can absorb it. Between two schemes that each have a false-alarm mode, prefer the
 one whose defect is repairable.
@@ -373,33 +373,60 @@ bits and fails the floor; 12 breaks the ceiling. There is no slack in either dir
 Two constraints on consumers:
 
 - ⛔ **It is an attribution label, not a capability.** It is deterministic and therefore guessable by anyone who
-  knows the `event_id`. Nothing may treat nonce-presence as evidence of authenticity — a forger able to write
+  knows the `event_id`. Nothing may treat nonce-presence as evidence of authenticity - a forger able to write
   transcript rows already has what it needs and gains nothing from this value. A consumer requiring an
   *unguessable* nonce needs a different mechanism, not this one.
 - ⚠️ **It identifies a WAKE, not a DELIVERY.** Two different panes delivered the same message carry the SAME
-  nonce — correctly, it is the same work. Ledgers must key rows on `(nonce, session_id)`, never the nonce alone,
+  nonce - correctly, it is the same work. Ledgers must key rows on `(nonce, session_id)`, never the nonce alone,
   or two panes' deliveries collide into one row and per-nonce outcomes silently overwrite each other.
 
 ### 6.5 `emitted`: three clocks read together, so dwell is measurable rather than assumed
 
-`emitted` carries `wall`, `monotonic`, and (where the platform has `CLOCK_BOOTTIME`) `boottime`, all read at the
-same instant at the `emit()` chokepoint. It is stamp 1 of a three-stamp wake ledger; the consumer supplies the
-other two.
+`emitted` carries `wall`, `monotonic`, `boottime` and `src`, all read at the same instant at the `emit()`
+chokepoint. It is stamp 1 of a three-stamp wake ledger; the consumer supplies the other two.
+
+⛔ **THE KEYS NAME SEMANTICS, NOT OS CONSTANTS - AND ON DARWIN THE TWO ARE INVERTED.**
+
+| key | semantic |
+|---|---|
+| `monotonic` | does **not** advance while the machine is not executing |
+| `boottime` | **does** advance while the machine is not executing |
+
+| platform | `monotonic` ← | `boottime` ← |
+|---|---|---|
+| Linux | `CLOCK_MONOTONIC` | `CLOCK_BOOTTIME` |
+| Darwin | `CLOCK_UPTIME_RAW` | `CLOCK_MONOTONIC` |
+
+On Linux the names coincide with the meanings. **On macOS they do not: `CLOCK_MONOTONIC` INCLUDES sleep** (it
+carries Linux `CLOCK_BOOTTIME`'s semantic), `CLOCK_UPTIME_RAW` is the sleep-excluding clock, and `CLOCK_BOOTTIME`
+does not exist. Measured on a real Mac: `CLOCK_MONOTONIC` 408.19 h against `CLOCK_UPTIME_RAW` 389.99 h - an
+**18.20 h** difference that *is* the accumulated sleep, matching an independent `kern.boottime` derivation to two
+decimals.
+
+An earlier revision read `CLOCK_MONOTONIC` on every platform. On a Mac that publishes the *sleep-including*
+clock under the key `monotonic` and drops the sleep-excluding quantity altogether, so a consumer differencing
+wall against `monotonic` measures **~0 freeze forever, on every Mac row, with nothing raising** - and a
+Linux-only test suite cannot see it, because there the names are honest.
+
+`src` records which constant supplied each semantic (`{"monotonic":"CLOCK_UPTIME_RAW", ...}`), so the mapping is
+**auditable from the row** rather than resting on the reader's assumptions about the platform.
 
 Three clocks because none answers alone: **wall** is comparable across hosts and to every other timestamp in the
 system, but it *steps* (NTP, hypervisor time sync), so a wall delta is not an elapsed time; **monotonic** never
-steps or goes backwards, but *stops while the machine is not executing*; **boottime** matches monotonic on a
-normal guest but keeps counting through a guest suspend.
+steps or goes backwards, but *stops while the machine is not executing*; **boottime** keeps counting through a
+suspend.
 
 Differencing them across two events is what separates two states a single clock conflates: `wall delta −
 monotonic delta` over an interval is time the machine **did not execute**, which is the difference between "this
-wake sat in a queue for three hours" and "the host was frozen". That is not hypothetical — measured on a
+wake sat in a queue for three hours" and "the host was frozen". That is not hypothetical - measured on a
 Parallels guest, **72.79 h of hypervisor freeze presented as ordinary elapsed wall time**, while
 `BOOTTIME − MONOTONIC` read exactly `0.00 s` throughout, because a hypervisor pause stops the guest's clocks
 *together* and the guest is not executing to notice.
 
-`boottime` is **omitted, not faked**, where the platform lacks it (Darwin). A fabricated value would be
-indistinguishable from a genuine zero-freeze reading, which is the failure this field exists to prevent.
+A key is **omitted, never faked**, where its *semantic* is genuinely unavailable on the platform. A fabricated
+value would be indistinguishable from a genuine zero-freeze reading, which is the failure this field exists to
+prevent. Note the omission rule applies to the semantic, not the constant: Darwin lacks `CLOCK_BOOTTIME` but
+still supplies the sleep-including semantic via `CLOCK_MONOTONIC`, so `boottime` is present there.
 
 `ts` is deliberately left alone: it is stamped microseconds earlier in the convenience constructors and existing
 consumers depend on it. Use `emitted.wall` when you need the wall reading coherent with the other two clocks.

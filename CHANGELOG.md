@@ -22,15 +22,21 @@ commit was out of that review's scope.
   neither. Note it is a label and not a secret (deterministic, hence guessable from the `event_id`), and that it
   identifies a *wake* rather than a *delivery* - two panes handed the same message share a nonce, so consumer
   records must key on `(nonce, session_id)`.
-- **Emission timestamps (`emitted`)** - `wall`, `monotonic`, and `boottime` where the platform has
-  `CLOCK_BOOTTIME`, all read at one instant. Differencing wall against monotonic across two events measures the
-  time the machine **was not executing**, which is what separates "this sat in a queue for hours" from "the host
-  was suspended" - indistinguishable in wall time and completely different problems. Measured on a Parallels
-  guest: 72.79 h of hypervisor freeze looked like ordinary elapsed wall time, while `BOOTTIME - MONOTONIC` read
-  `0.00 s` throughout, because a hypervisor pause stops the guest's clocks together and the guest is not running
-  to notice. `boottime` is **omitted rather than faked** on platforms without it (macOS): a fabricated value
-  would be indistinguishable from a real zero-freeze reading, which is the failure the field exists to prevent.
-  `ts` is unchanged; `emitted.wall` is the reading coherent with the other two clocks.
+- **Emission timestamps (`emitted`)** - `wall`, `monotonic`, `boottime` and `src`, all read at one instant.
+  Differencing wall against monotonic across two events measures the time the machine **was not executing**,
+  which is what separates "this sat in a queue for hours" from "the host was suspended" - indistinguishable in
+  wall time and completely different problems. Measured on a Parallels guest: 72.79 h of hypervisor freeze
+  looked like ordinary elapsed wall time, while `BOOTTIME - MONOTONIC` read `0.00 s` throughout, because a
+  hypervisor pause stops the guest's clocks together and the guest is not running to notice.
+  **The keys name SEMANTICS, not OS constants, because on macOS the two are inverted:** `monotonic` means "does
+  not tick while the machine is not executing" (Linux `CLOCK_MONOTONIC`, Darwin `CLOCK_UPTIME_RAW`) and
+  `boottime` means "does tick" (Linux `CLOCK_BOOTTIME`, Darwin `CLOCK_MONOTONIC`). macOS `CLOCK_MONOTONIC`
+  *includes* sleep and macOS has no `CLOCK_BOOTTIME`, so reading constants by name there yields the wrong
+  quantity under the right label with nothing complaining - measured on a real Mac at 408.19 h vs 389.99 h,
+  an 18.20 h gap that is the accumulated sleep. `src` names the constant behind each value so consumers can
+  audit the mapping from the row instead of assuming it. A key is **omitted rather than faked** where its
+  *semantic* is unavailable: a fabricated value is indistinguishable from a real zero-freeze reading, which is
+  the failure the field exists to prevent. `ts` is unchanged; `emitted.wall` is the coherent wall reading.
 - **An alarm for escalated mail nobody is answering.** Fires only when a member holds mail a sender marked
   URGENT *and* no activity from that member has been observed - both halves positive. Silence alone is never
   the trigger, because idle-by-design and wedged are indistinguishable from outside; the urgent flag is a
