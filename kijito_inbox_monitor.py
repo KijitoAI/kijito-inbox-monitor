@@ -695,31 +695,77 @@ def _wake_nonce(event_id):
     return "".join(out)
 
 
-def _emission_stamps():
-    """The producer-emission stamp, as a coherent triple of clocks read at one instant.
+def _clock_map():
+    """Map our two SEMANTICS onto this platform's constants. Returns {key: (semantic_name, const)}.
 
-    Three clocks because no one of them answers the question alone:
+    ⛔⛔ THE KEYS NAME SEMANTICS, NOT OS CONSTANTS, AND THE TWO DISAGREE ACROSS PLATFORMS.
+        monotonic := DOES NOT advance while the machine is not executing
+        boottime  := DOES advance while the machine is not executing
+
+    On Linux those are CLOCK_MONOTONIC and CLOCK_BOOTTIME, and the names coincide with the meanings.
+    ON DARWIN THEY DO NOT, AND THE MISMATCH IS SILENT AND INVERTED:
+
+        CLOCK_MONOTONIC    INCLUDES sleep   -> carries Linux CLOCK_BOOTTIME's semantic
+        CLOCK_UPTIME_RAW   EXCLUDES sleep   -> carries Linux CLOCK_MONOTONIC's semantic
+        CLOCK_BOOTTIME     does not exist
+
+    Measured on the real Mac (2026-08-05): CLOCK_MONOTONIC 408.19 h vs CLOCK_UPTIME_RAW 389.99 h --
+    an 18.20 h difference that IS the accumulated sleep, matching an independent kern.boottime
+    derivation to two decimals.
+
+    An earlier version of this function read CLOCK_MONOTONIC on every platform and omitted boottime
+    where the constant was missing. On a Mac that emits the SLEEP-INCLUDING clock under the key
+    `monotonic`, and drops the sleep-excluding quantity entirely -- so a consumer differencing
+    wall against `monotonic` measures ~0 freeze forever, on every Mac-emitted row, with nothing
+    raising. The bug is invisible to a Linux test suite by construction: there, the names are honest.
+
+    ⇒ Dispatch on the SEMANTIC and record which constant supplied it (see _emission_stamps), so the
+    mapping is auditable from the row instead of being a property of the reader's assumptions.
+    """
+    m = {}
+    if hasattr(time, "CLOCK_UPTIME_RAW"):          # Darwin: the sleep-EXCLUDING clock
+        m["monotonic"] = ("CLOCK_UPTIME_RAW", time.CLOCK_UPTIME_RAW)
+    elif hasattr(time, "CLOCK_MONOTONIC"):          # Linux: names and meanings coincide
+        m["monotonic"] = ("CLOCK_MONOTONIC", time.CLOCK_MONOTONIC)
+    if hasattr(time, "CLOCK_BOOTTIME"):             # Linux: the sleep-INCLUDING clock
+        m["boottime"] = ("CLOCK_BOOTTIME", time.CLOCK_BOOTTIME)
+    elif hasattr(time, "CLOCK_UPTIME_RAW") and hasattr(time, "CLOCK_MONOTONIC"):
+        # Darwin: CLOCK_MONOTONIC is the sleep-INCLUDING one. Only claim this when UPTIME_RAW is
+        # also present -- that presence is what identifies the platform as one with the inverted
+        # meaning, rather than a Linux box whose CLOCK_MONOTONIC means the opposite.
+        m["boottime"] = ("CLOCK_MONOTONIC", time.CLOCK_MONOTONIC)
+    return m
+
+
+def _emission_stamps():
+    """The producer-emission stamp: a coherent set of clocks read at one instant.
+
+    Three readings because none answers alone:
       wall      - comparable across hosts and to every other timestamp in the system, but it STEPS
                   (NTP, hypervisor time sync), so a wall delta is not an elapsed time.
-      monotonic - never steps and never goes backwards, but STOPS while the machine is not executing.
-      boottime  - like monotonic, and on a normal guest it keeps counting through a guest suspend.
+      monotonic - never steps, but STOPS while the machine is not executing.
+      boottime  - like monotonic, except it keeps counting while the machine is not executing.
 
     Differencing them across two events is what makes dwell measurable rather than assumed:
-    (wall delta - monotonic delta) over an interval is the time the machine did not execute, which is
+    (wall delta - monotonic delta) over an interval is the time the machine DID NOT EXECUTE, which is
     the difference between "this wake sat in a queue for three hours" and "the host was frozen".
     Measured on this seat, the two are routinely confused: 72.79 h of hypervisor freeze presented as
-    ordinary elapsed wall time, with BOOTTIME - MONOTONIC reading exactly 0.00 s throughout because a
-    hypervisor pause stops the guest's clocks together.
+    ordinary elapsed wall time, with BOOTTIME - MONOTONIC reading exactly 0.00 s throughout, because a
+    hypervisor pause stops the guest's clocks TOGETHER and the guest is not running to notice.
 
-    boottime is optional at runtime: CLOCK_BOOTTIME does not exist on Darwin, and a missing key is
-    honest where a fabricated one is not.
+    `src` records which OS constant supplied each semantic, so a consumer can AUDIT the mapping from
+    the row rather than assuming the platform's names mean what they say -- see _clock_map(), where
+    Darwin's do not. A key is OMITTED, never faked, where its semantic is genuinely unavailable: a
+    fabricated value is indistinguishable from a real zero-freeze reading, which is the exact failure
+    these fields exist to detect.
     """
-    stamps = {
-        "wall": _now_iso(),
-        "monotonic": round(time.clock_gettime(time.CLOCK_MONOTONIC), 6),
-    }
-    if hasattr(time, "CLOCK_BOOTTIME"):
-        stamps["boottime"] = round(time.clock_gettime(time.CLOCK_BOOTTIME), 6)
+    stamps = {"wall": _now_iso()}
+    src = {}
+    for key, (const_name, const) in _clock_map().items():
+        stamps[key] = round(time.clock_gettime(const), 6)
+        src[key] = const_name
+    if src:
+        stamps["src"] = src
     return stamps
 
 

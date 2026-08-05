@@ -4673,13 +4673,50 @@ class EmissionStampTest(unittest.TestCase):
         self.assertGreaterEqual(cap.lines[1]["emitted"]["monotonic"],
                                 cap.lines[0]["emitted"]["monotonic"])
 
-    def test_boottime_is_present_where_the_platform_has_it_and_absent_where_it_does_not(self):
-        # Darwin has no CLOCK_BOOTTIME. A missing key is honest; a fabricated one is not, and a
-        # fabricated one would be indistinguishable from a real zero-freeze reading.
+    def test_THE_SEMANTIC_INVARIANT_boottime_never_reads_below_monotonic(self):
+        # ★ THE TEST THAT CATCHES AN INVERTED MAPPING, AND IT WORKS ON EVERY PLATFORM.
+        # boottime INCLUDES the time the machine was not executing; monotonic EXCLUDES it. So
+        # boottime >= monotonic always, by definition, whatever the OS calls its constants.
+        # On Linux with no suspend they are equal. On Darwin they differ by the accumulated sleep
+        # (measured on the real Mac: 408.19 h vs 389.99 h = 18.20 h). If the Darwin mapping were
+        # inverted -- which is exactly the defect this replaced -- boottime would read BELOW
+        # monotonic and this fails. A test keyed on which CONSTANT exists could not see that.
         em, cap = self._emitter()
         em.lifecycle("heartbeat", persona="argus")
         st = cap.lines[0]["emitted"]
-        self.assertEqual(hasattr(time, "CLOCK_BOOTTIME"), "boottime" in st)
+        if "monotonic" in st and "boottime" in st:
+            self.assertGreaterEqual(st["boottime"], st["monotonic"])
+
+    def test_the_row_records_WHICH_constant_supplied_each_semantic(self):
+        # The mapping must be auditable FROM THE ROW, not from the reader's assumptions about what
+        # the platform's names mean -- because on Darwin they mean the opposite.
+        em, cap = self._emitter()
+        em.lifecycle("heartbeat", persona="argus")
+        src = cap.lines[0]["emitted"]["src"]
+        for key in ("monotonic", "boottime"):
+            if key in cap.lines[0]["emitted"]:
+                self.assertIn(key, src)
+                self.assertTrue(hasattr(time, src[key]), "named a constant that does not exist here")
+
+    def test_this_platforms_mapping_is_the_one_its_semantics_require(self):
+        em, cap = self._emitter()
+        em.lifecycle("heartbeat", persona="argus")
+        src = cap.lines[0]["emitted"]["src"]
+        if hasattr(time, "CLOCK_UPTIME_RAW"):          # Darwin
+            self.assertEqual(src["monotonic"], "CLOCK_UPTIME_RAW")
+            self.assertEqual(src["boottime"], "CLOCK_MONOTONIC")
+        else:                                           # Linux
+            self.assertEqual(src["monotonic"], "CLOCK_MONOTONIC")
+            self.assertEqual(src.get("boottime"), "CLOCK_BOOTTIME")
+
+    def test_a_semantic_is_OMITTED_never_faked_when_unavailable(self):
+        # Fabricating a value would be indistinguishable from a genuine zero-freeze reading, which
+        # is the precise failure these fields exist to detect. Absence must stay legible as absence.
+        st = km._emission_stamps()
+        for key in ("monotonic", "boottime"):
+            if key in st:
+                self.assertIsInstance(st[key], float)
+                self.assertIn(key, st["src"])
 
     def test_ts_is_left_alone_so_existing_consumers_do_not_move(self):
         em, cap = self._emitter()
