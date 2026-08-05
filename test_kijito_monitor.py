@@ -1057,6 +1057,59 @@ class EventIdTest(unittest.TestCase):
             km.subprocess.run = orig
         self.assertEqual(seen.get("KIJITOMON_EVENT_ID"), "argus:new:12")
 
+    def test_exec_mode_exports_the_nonce_so_a_consumer_never_re_derives_it(self):
+        """The exec env must carry the nonce ITSELF, not merely the event_id it could be derived from.
+
+        THE GAP THIS CLOSES (measured by the unacknowledged-delivery drill, 2026-08-05): the nonce was
+        stamped in emit() and reached the ndjson wire, but the exec keymap was never extended - so the one
+        channel the docs point consumers at first could not see the identity that says "this is the same
+        work re-delivered". Deriving it consumer-side is a SECOND implementation of sha256 + base62 + a
+        pinned alphabet + an 11-char truncation, and the alphabet has already caused one false integrity
+        alarm. Worse, such a divergence surfaces in the RECEIVING system as a delivery fault that never
+        happened. river's ruling: transmit the value.
+        """
+        seen = {}
+        em = km.Emitter("exec-per-event", "true", 200, False)
+        orig = km.subprocess.run
+
+        def _run(*a, **kw):
+            seen.update(kw.get("env") or {})
+            return subprocess.CompletedProcess(args=a[0] if a else "", returncode=0)
+        km.subprocess.run = _run
+        try:
+            em.new({"id": 12, "from": "r", "content": "x", "created": "t", "_persona": "argus"})
+        finally:
+            km.subprocess.run = orig
+        # PINNED TO A LITERAL, deliberately. Asserting against km._wake_nonce() would re-derive the
+        # expected value from the implementation under test, so the test would pass even if the
+        # derivation itself changed - which is exactly the drift this guards. This literal comes from an
+        # INDEPENDENT reimplementation of base62(sha256("argus:new:12"))[:11].
+        self.assertEqual(seen.get("KIJITOMON_NONCE"), "vwwTOywuFUr")
+
+    def test_the_nonce_is_identical_on_the_wire_and_in_the_exec_env(self):
+        """One event, two channels, one identity. A drill found them disagreeing by OMISSION.
+
+        The two emit paths describe the same event; if they can differ about its identity, a consumer
+        that switches channels silently changes what it is deduping on.
+        """
+        msg = {"id": 12, "from": "r", "content": "x", "created": "t", "_persona": "argus"}
+        wire, cap = self._emitter()
+        wire.new(dict(msg))
+        seen = {}
+        ex = km.Emitter("exec-per-event", "true", 200, False)
+        orig = km.subprocess.run
+
+        def _run(*a, **kw):
+            seen.update(kw.get("env") or {})
+            return subprocess.CompletedProcess(args=a[0] if a else "", returncode=0)
+        km.subprocess.run = _run
+        try:
+            ex.new(dict(msg))
+        finally:
+            km.subprocess.run = orig
+        self.assertEqual(cap.lines[0]["nonce"], seen.get("KIJITOMON_NONCE"))
+        self.assertTrue(seen.get("KIJITOMON_NONCE"), "the env value must be populated, not empty")
+
 
 class UnreadNotShownParseTest(unittest.TestCase):
     """`unread_not_shown` must arrive as a tri-state: a count, or NO STATEMENT. Never coerced to 0."""

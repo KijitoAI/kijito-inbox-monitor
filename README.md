@@ -205,8 +205,21 @@ Each line of the events file (and each `exec-per-event` invocation) is one event
 | `recovered` | the source came back after an `alert` | `KIJITOMON_CURSOR` |
 | `heartbeat` | optional liveness tick (`--heartbeat N`) | `KIJITOMON_CURSOR` |
 
-Every event also carries `KIJITOMON_EVENT`, `KIJITOMON_SOURCE`, `KIJITOMON_TS`, `KIJITOMON_EVENT_ID`, and (for
-persona targets) `KIJITOMON_PERSONA`. In file mode the same data is NDJSON, one event per line, with a space after each `:` and `,`
+Every event also carries `KIJITOMON_EVENT`, `KIJITOMON_SOURCE`, `KIJITOMON_TS`, `KIJITOMON_EVENT_ID`,
+`KIJITOMON_NONCE`, and (for persona targets) `KIJITOMON_PERSONA`.
+
+> ⚠️ **`KIJITOMON_NONCE` IS AUTHORITATIVE - USE THE VALUE YOU ARE GIVEN, DO NOT RE-DERIVE IT.**
+> The nonce *is* `base62(sha256(event_id))[:11]`, so you could recompute it from `KIJITOMON_EVENT_ID`.
+> **Don't.** Re-deriving it makes your consumer a second implementation of sha256 + base62 + a pinned
+> alphabet + an 11-char truncation, and two implementations diverge. The alphabet in particular is
+> lowercase-first (`a-zA-Z0-9`, see below) and a guessed digit-first variant produces plausible-looking
+> tokens that match nothing - that mistake has already raised one false integrity alarm against correct
+> data. And the divergence does not surface in *your* logs: a wake carrying a mis-derived nonce matches no
+> record on the receiving side, so it is reported downstream as a delivery fault that never happened.
+> The rule generalises: **duplicate instruments, transmit data.** For a measurement, two independent
+> implementations are a safety property; for a shared identifier, divergence *is* the defect.
+
+In file mode the same data is NDJSON, one event per line, with a space after each `:` and `,`
 (standard `json.dumps`): `{"event": "new", "id": 41, "from": "river", "persona": "testbot", ...}` - so a filter
 like `grep '"event": "new"'` matches.
 The watcher peeks (never marks your mail read) and dedupes by the monotonic message id.

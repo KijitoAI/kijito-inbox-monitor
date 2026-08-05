@@ -952,6 +952,21 @@ class Emitter:
             env["KIJITOMON_SOURCE"] = str(event.get("source", ""))
             env["KIJITOMON_TS"] = str(event.get("ts", ""))
             env["KIJITOMON_EVENT_ID"] = str(event.get("event_id", ""))
+            # TRANSMITTED, NEVER RE-DERIVED (river's ruling, 2026-08-05, on a gap a drill measured).
+            # The nonce was stamped in emit() and reached the ndjson wire, but never the exec env - so the
+            # ONE channel our docs point consumers at first could not see the identity that says "this is
+            # the same work re-delivered". It is derivable from KIJITOMON_EVENT_ID, and that is exactly the
+            # hazard: re-derivation is a SECOND IMPLEMENTATION of sha256 + base62 + a pinned alphabet + an
+            # 11-char truncation, and two implementations diverge. The unpinned alphabet has ALREADY
+            # manufactured one false integrity alarm against correct data. Worse, the divergence surfaces
+            # in SOMEBODY ELSE'S detector: a consumer whose derivation is slightly off splices a token that
+            # matches no enqueue row, and D1 pages a delivery pathology that does not exist.
+            # ⇒ DUPLICATE INSTRUMENTS, TRANSMIT DATA. For an instrument, divergence is a safety property;
+            #   for a shared identifier, divergence IS the defect. The discriminator is whether the thing
+            #   is a MEASUREMENT or a VALUE. This is a value: it must be IDENTICAL in two processes.
+            # No capability is disclosed by passing it - the nonce is an attribution label, deterministic
+            # and therefore already guessable from the event_id sitting beside it.
+            env["KIJITOMON_NONCE"] = str(event.get("nonce", ""))
             keymap = {
                 "id": "KIJITOMON_ID", "from": "KIJITOMON_FROM", "content": "KIJITOMON_CONTENT",
                 "created": "KIJITOMON_CREATED", "cursor": "KIJITOMON_CURSOR",

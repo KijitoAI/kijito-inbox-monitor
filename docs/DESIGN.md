@@ -307,15 +307,36 @@ Every event invokes `CMD`; inapplicable env vars are unset:
 
 | env var | new | armed | alert | recovered | heartbeat | seed_ahead | replay_capped |
 |---|---|---|---|---|---|---|---|
-| `KIJITOMON_EVENT`,`_SOURCE`,`_TS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `KIJITOMON_EVENT`,`_SOURCE`,`_TS`,`_EVENT_ID`,`_NONCE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `KIJITOMON_ID`,`_FROM`,`_CONTENT`,`_CREATED` | ✓ | - | - | - | - | - | - |
 | `KIJITOMON_CURSOR` | - | ✓ | - | ✓ | ✓ | - | - |
 | `KIJITOMON_REASON`,`_FAILURES` | - | - | ✓ | - | - | - | - |
 | `KIJITOMON_SEEDED`,`_CURRENT_MAX` | - | - | - | - | - | ✓ | - |
 | `KIJITOMON_CAPPED_TO`,`_DROPPED` | - | - | - | - | - | - | ✓ |
 
-The spawned command has a 10s timeout; a non-zero exit or timeout is logged to stderr and is non-fatal (and never
-holds the cursor back, per §7.0).
+The spawned command has a 10s timeout; a non-zero exit or timeout is logged to stderr and is non-fatal.
+
+🛑 **CORRECTED 2026-08-05 - THIS PARAGRAPH USED TO END "(and never holds the cursor back, per §7.0)", WHICH
+WAS THE EXACT OPPOSITE OF WHAT THE CODE DOES, AND HAD BEEN FOR AS LONG AS THE ACKNOWLEDGEMENT CONTRACT HAS
+EXISTED.** In `exec-per-event` mode **your command's exit status IS the acknowledgement**: exit 0 and the
+cursor advances; **exit non-zero or time out and the cursor is HELD below that message and it is re-delivered
+on the next poll** (`emit()` returns False - the Loom re-audit 7 HIGH 1 fix). Delivery also stops at the first
+failure, so a consumer never sees message N+1 before a retried N.
+**Measured, not reasoned:** the unacknowledged-delivery drill (2026-08-05, `evidence/unack-delivery-drill-20260805/`)
+ran an `--exec` that exits 7 and observed one message delivered **six times** with the persisted cursor held at
+the id below it throughout. The README described this correctly the whole time; only this section was wrong.
+★ **The lesson worth keeping: two documents disagreed about a safety-critical contract and nothing detected it,
+because each was internally consistent. A drill that exercises the behaviour is what adjudicated them - a doc
+review comparing prose to prose could not have.**
+
+**`KIJITOMON_NONCE` is AUTHORITATIVE and must NOT be re-derived by consumers** (river's ruling, 2026-08-05,
+after a drill measured that the nonce reached the ndjson wire but never the exec env - so the one channel the
+docs recommend first could not see it). It is derivable from `KIJITOMON_EVENT_ID`, and that is precisely the
+hazard: re-derivation is a second implementation of sha256 + base62 + a pinned alphabet + an 11-char
+truncation, and two implementations diverge - the unpinned alphabet has already produced one false integrity
+alarm against correct data. The divergence surfaces in the *receiving* system as a delivery fault that never
+occurred, not in the consumer that caused it. ⇒ **Duplicate instruments, transmit data:** for a measurement,
+two independent implementations are a safety property; for a shared identifier, divergence *is* the defect.
 
 ### 6.3 `event_id`: the producer owns event identity
 
