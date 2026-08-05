@@ -2144,7 +2144,12 @@ class WatchTarget:
                         # no per-message unread flag, so this cannot say WHICH of the skipped messages are
                         # unread - only how many the persona holds. Stated, not glossed.
                         if items:
-                            u = (unread_counts or {}).get(self.persona) if counts_available else None
+                            # Keyed on unread_persona, NOT persona: it honours an explicit ?persona=
+                            # in the watch URL and falls back to persona otherwise (:1749), and it is
+                            # what both existing count consumers use (:2069, :2491). Keying this one
+                            # differently would diverge exactly when a watch URL carries the override
+                            # - rare, and therefore the kind of divergence that survives a long time.
+                            u = unread_counts.get(self.unread_persona) if counts_available else None
                             # An UNKNOWN unread count must not be read as zero - that assumption is the
                             # whole defect, one level up. Silent only when the count is KNOWN to be 0.
                             if u != 0:
