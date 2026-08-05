@@ -4549,6 +4549,98 @@ class AlarmFlagsAreIndependentTest(unittest.TestCase):
         self.assertTrue(b.no_urgent_alerts)
 
 
+class AbsentStateBaselineDiagnosticTest(unittest.TestCase):
+    """An absent state file baselines over the backlog. That is correct for a FIRST LAUNCH and wrong
+    for a LOST state file, and nothing in the producer can tell those apart - absence leaves no
+    evidence. The baseline therefore stays (anti-flood is deliberate), but it must ANNOUNCE itself.
+
+    Found by assay's state-wipe drill: a wiped state file skipped an unread message with no bounce
+    and no record. The mail survives - the fetch is non-consuming - so what goes dark is the WAKE.
+
+    BORROWS the end-to-end harness rather than SUBCLASSING it. Subclassing re-runs every inherited
+    test under this class's name, which inflated the suite from 358 to 377 while adding six tests -
+    a count that reads as coverage and is duplication. A misleading total is the same defect class
+    as a test that cannot fail: both make the suite look like it says more than it does.
+    """
+
+    RecordingEmitter = BoundedWindowEndToEndTest.RecordingEmitter
+    FullArgs = BoundedWindowEndToEndTest.FullArgs
+    _target = BoundedWindowEndToEndTest._target
+    _fetch = BoundedWindowEndToEndTest._fetch
+
+    def _armless(self, emitter):
+        t = self._target(cursor=100, emitter=emitter)
+        t.cursor = None          # the absent-state condition
+        t.armed = False
+        t.state_corrupt = False  # NOT the corrupt branch: that one already announces
+        return t
+
+    def _run_counts(self, t, fetch_fn, counts_available, unread_counts):
+        orig, km.fetch = km.fetch, fetch_fn
+        try:
+            t.poll_once(counts_available=counts_available, unread_counts=unread_counts)
+        finally:
+            km.fetch = orig
+
+    def _diag(self, em):
+        return [f for e, f in em.events if e == "baseline_skipped"]
+
+    def test_it_ANNOUNCES_the_skip_when_the_persona_holds_unread_mail(self):
+        em = self.RecordingEmitter()
+        t = self._armless(em)
+        self._run_counts(t, self._fetch([{"id": 200}, {"id": 201}, {"id": 202}], 0), True, {"argus": 3})
+        d = self._diag(em)
+        self.assertEqual(len(d), 1, "an absent-state baseline over unread mail must not be silent")
+        self.assertEqual(d[0]["skipped"], 3)
+        self.assertEqual(d[0]["id_range"], [200, 202])
+        self.assertEqual(d[0]["unread_held"], 3)
+        self.assertEqual(d[0]["armed_at"], 202)
+
+    def test_it_STILL_BASELINES_and_re_emits_NOTHING(self):
+        # The diagnostic converts silent into announced. It must not turn into a flood, which is the
+        # behaviour the baseline exists to prevent and the reason this is not simply "fail closed".
+        em = self.RecordingEmitter()
+        t = self._armless(em)
+        self._run_counts(t, self._fetch([{"id": 200}, {"id": 201}, {"id": 202}], 0), True, {"argus": 3})
+        self.assertEqual(em.new_ids, [], "baselining must not re-emit the window")
+        self.assertEqual(t.cursor, 202, "the cursor must still baseline to the newest visible id")
+
+    def test_a_KNOWN_ZERO_unread_stays_silent(self):
+        # A genuine first launch on an inbox with nothing owed. Announcing here would be noise, and
+        # noise is what gets alarms ignored.
+        em = self.RecordingEmitter()
+        t = self._armless(em)
+        self._run_counts(t, self._fetch([{"id": 200}, {"id": 201}], 0), True, {"argus": 0})
+        self.assertEqual(self._diag(em), [], "a known-zero unread count must not announce")
+
+    def test_THE_LOAD_BEARING_CASE_an_UNKNOWN_unread_count_announces_rather_than_assuming_zero(self):
+        # ★ Reading "I could not determine the unread count" as "there is no unread mail" is the exact
+        # defect this diagnostic exists to fix, one level up. Absent is not zero - here either.
+        em = self.RecordingEmitter()
+        t = self._armless(em)
+        self._run_counts(t, self._fetch([{"id": 200}, {"id": 201}], 0), False, None)
+        d = self._diag(em)
+        self.assertEqual(len(d), 1, "an UNKNOWN unread count must announce, not assume zero")
+        self.assertEqual(d[0]["unread_held"], "unknown")
+
+    def test_an_EMPTY_window_announces_nothing_because_nothing_was_skipped(self):
+        em = self.RecordingEmitter()
+        t = self._armless(em)
+        self._run_counts(t, self._fetch([], 0), True, {"argus": 5})
+        self.assertEqual(self._diag(em), [], "no visible items means nothing was skipped over")
+
+    def test_the_CORRUPT_branch_is_untouched_and_still_fails_closed(self):
+        # Regression guard on the neighbouring branch: exists-but-corrupt has EVIDENCE a cursor
+        # existed, so it re-emits rather than baselining. The new branch must not have absorbed it.
+        em = self.RecordingEmitter()
+        t = self._armless(em)
+        t.state_corrupt = True
+        self._run_counts(t, self._fetch([{"id": 200}, {"id": 201}], 0), True, {"argus": 2})
+        self.assertEqual(em.new_ids, [200, 201], "corrupt state must still re-emit the window")
+        self.assertIn("state_corrupt", [e for e, f in em.events])
+        self.assertEqual(self._diag(em), [], "corrupt state announces state_corrupt, not baseline_skipped")
+
+
 class WakeNonceTest(unittest.TestCase):
     """The wake nonce is DERIVED from the event_id, so it inherits that id's identity semantics.
 

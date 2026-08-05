@@ -380,6 +380,27 @@ Two constraints on consumers:
   nonce - correctly, it is the same work. Ledgers must key rows on `(nonce, session_id)`, never the nonce alone,
   or two panes' deliveries collide into one row and per-nonce outcomes silently overwrite each other.
 
+⚠️ **ERRATUM (2026-08-05) - "a re-delivery after state loss" conflates two components.** That phrase, used
+above and in §6.3, names an **emitter capability** and a **watcher trigger** as though they were one thing.
+The emitter does handle a re-delivery correctly when one occurs. **The watcher does not produce one by losing
+its state file:** an absent state file baselines to the newest visible id (§7.0), so the backlog is skipped
+rather than re-emitted - measured, not inferred. The path that *does* reach re-delivery is an **unacknowledged
+delivery** (a refused sink, a non-zero `--exec`), where the cursor is held below the message and the next poll
+re-delivers it. **Do not cite the state-loss case as evidence that re-delivery works: it is the one case that
+cannot reach it.** Written down because the original sentence misled a reviewer into designing a drill around
+the one trigger that cannot fire.
+
+⚠️ **AND THE BEHAVIOUR THAT ERRATUM EXPOSED IS NOW ANNOUNCED.** An absent state file means two things that
+demand opposite responses - a **first launch** (baseline; never flood a new agent with inbox history) and a
+**lost state file** (everything since the vanished cursor is owed to someone). The producer cannot tell them
+apart, because **absence leaves no evidence** - which is why the neighbouring *exists-but-corrupt* case can
+fail closed and this one cannot. The baseline therefore stands, but it now emits a **`baseline_skipped`**
+lifecycle event naming the skipped count, the id range, and the persona's unread count. Nothing is re-emitted;
+the anti-flood behaviour is unchanged. A known-zero unread count stays silent; an **unknown** one announces,
+because reading "I could not determine the count" as "there is none" is the same defect one level up.
+⚠️ Scope of the loss, stated at its true size: the fetch is non-consuming (`mark_read=false`), so **the mail
+survives and stays readable in the inbox. What goes dark is the WAKE** - nothing will announce it.
+
 ### 6.5 `emitted`: three clocks read together, so dwell is measurable rather than assumed
 
 `emitted` carries `wall`, `monotonic`, `boottime` and `src`, all read at the same instant at the `emit()`
