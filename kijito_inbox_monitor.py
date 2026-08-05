@@ -662,6 +662,16 @@ def _wake_nonce(event_id):
     two different wakes; the consumer would find no queue entry containing the second one, score it
     LOST, and PAGE -- on precisely the recovery path this producer exists to survive.
 
+    ⚠️ ERRATUM ON "a re-delivery after state loss" ABOVE (disclosed 2026-08-05, found by a drill).
+    That phrase names an EMITTER capability and a WATCHER trigger as if they were one thing; they
+    live in different components. The emitter does handle a re-delivery correctly when one occurs.
+    But the WATCHER does not produce one by losing its state file: an absent state file BASELINES to
+    the newest visible id (see poll_once's absent-state branch), so the backlog is skipped, not
+    re-emitted. Wiping the state file was MEASURED not to re-deliver. The path that does reach it is
+    an UNACKNOWLEDGED delivery -- a refused sink, a non-zero --exec -- where the cursor is held below
+    the message and the next poll re-delivers it. Do not cite the state-loss case as evidence that
+    re-delivery works: it is the one case that cannot reach it.
+
     ⇒ Deriving from the event_id makes the nonce stable exactly where the event_id is stable and
     distinct exactly where it is distinct. Signal events already get a per-emission-unique id
     (`<persona>:<event>:<run>-<seq>`, 64 bits of per-run entropy), so ONE rule serves both families
@@ -2117,6 +2127,37 @@ class WatchTarget:
                                                             "visible window instead of baselining over it"})
                     elif self.cursor is None:
                         self.cursor = max((m["id"] for m in items), default=0)
+                        # ⛔ AN ABSENT STATE FILE MEANS TWO THINGS THAT DEMAND OPPOSITE BEHAVIOUR, AND
+                        # NOTHING HERE CAN TELL THEM APART. A genuine first launch must baseline - never
+                        # flood a new agent with inbox history. A LOST state file must not: everything
+                        # since the vanished cursor is owed to someone. The branch above distinguishes
+                        # exists-but-corrupt, because a file that is present is EVIDENCE a cursor existed.
+                        # Absence leaves no such evidence, so the baseline stands - but it no longer
+                        # happens QUIETLY. (Found by assay's state-wipe drill, 2026-08-05: a wiped state
+                        # file skipped an unread message with no bounce and no record. Clause 5's rule is
+                        # "fail open HONESTLY, never silently" - the honesty is the part that was missing.)
+                        #
+                        # ⚠️ NOT re-emitting: the anti-flood behaviour is deliberate and unchanged. This
+                        # only converts a silent skip into an announced one.
+                        #
+                        # The unread COUNT is per-persona and comes from a different endpoint; items carry
+                        # no per-message unread flag, so this cannot say WHICH of the skipped messages are
+                        # unread - only how many the persona holds. Stated, not glossed.
+                        if items:
+                            u = (unread_counts or {}).get(self.persona) if counts_available else None
+                            # An UNKNOWN unread count must not be read as zero - that assumption is the
+                            # whole defect, one level up. Silent only when the count is KNOWN to be 0.
+                            if u != 0:
+                                diag = ("baseline_skipped", {
+                                    "armed_at": self.cursor,
+                                    "skipped": len(items),
+                                    "id_range": [min(m["id"] for m in items), max(m["id"] for m in items)],
+                                    "unread_held": u if u is not None else "unknown",
+                                    "reason": "no state file: baselined to the newest visible id rather than "
+                                              "re-emitting. If this was a LOST state file rather than a first "
+                                              "launch, these messages will never raise a wake - they remain "
+                                              "unread and readable in the inbox, but nothing will announce them",
+                                })
                     else:
                         current_max = max((m["id"] for m in items), default=0)
                         # A RESTORED PIN SURVIVES ARMING. `emitted_above` is only ever non-empty when a
