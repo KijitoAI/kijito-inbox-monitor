@@ -244,6 +244,16 @@ Every event also carries a `nonce`: 11 base62 characters, `base62(sha256(event_i
 join a delivered wake back to the queue entry that carried it, and you can recompute it from the `event_id` in
 the same row - it is derived, not random, so nothing needs to be looked up.
 
+**If you recompute it, use this exact alphabet** - "base62" does not pin one, and the conventional
+*digit-first* ordering produces a completely different string, so a mismatch would look like corrupt data
+rather than a wrong guess:
+
+```python
+A = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"   # lowercase first
+v = int.from_bytes(hashlib.sha256(event_id.encode("utf-8")).digest(), "big")
+nonce = "".join(A[(v // 62**i) % 62] for i in range(11))               # least-significant digit first
+```
+
 Deriving it rather than minting a random one per emission is the whole point: it inherits the `event_id`
 semantics above exactly. **The same message re-delivered carries the same nonce**, so a restart or a
 state-loss re-delivery is recognisable as the same work rather than looking like a second wake that never
