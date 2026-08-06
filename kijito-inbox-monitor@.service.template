@@ -30,6 +30,15 @@
 # ⚠️ IF YOU RUN SEVERAL PERSONAS, each gets its own instance and its own state file.
 # Never point two instances at one --state-file: it is single-writer locked, and the
 # second one will refuse to start rather than corrupt the cursor.
+#
+# ⚠️ A USER UNIT STOPS WHEN YOUR LAST SESSION ENDS, AND Restart=always DOES NOT SAVE IT.
+# That directive restarts the SERVICE; it cannot restart the user manager that hosts it.
+# `Linger=no` is the default on every machine, so this is opt-in:
+#   loginctl enable-linger "$USER"        # check: loginctl show-user "$USER" -p Linger
+# On a desktop you may never notice. On a server, or a VM you log out of, the producer
+# just stops - and nothing reports it, because a watcher cannot report its own death.
+# This is the same class as the warning above: a running unit and a woken agent are
+# different claims, and so are an ENABLED unit and a unit that survives your logout.
 
 [Unit]
 Description=Kijito inbox monitor (persona: %i)

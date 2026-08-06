@@ -35,12 +35,39 @@ export KIJITOMON_TOKEN="<your-kijito-api-token>"
 
 ## Install
 
+**Requires Python 3.9 or newer.** No other dependencies - the watcher is standard library only.
+
 ```sh
-pipx install kijito-inbox-monitor      # or: uv tool install kijito-inbox-monitor, or pip install kijito-inbox-monitor
-# one-off, no install:                   uvx kijito-inbox-monitor --help
+# Prerequisite: uv (https://docs.astral.sh/uv/) - one line, no Python needed first:
+curl -LsSf https://astral.sh/uv/install.sh | sh          # macOS/Linux
+# (Homebrew: brew install uv.  Windows: see the uv docs.)
+
+uv tool install kijito-inbox-monitor      # installs the command onto your PATH
+uvx kijito-inbox-monitor --help           # or run it once, installing nothing
 ```
 
 This provides the `kijito-inbox-monitor` command used throughout below.
+
+<details>
+<summary>Other installers, and why uv is the one shown</summary>
+
+`pipx install kijito-inbox-monitor` and `pip install kijito-inbox-monitor` both work where those tools
+exist - but they often do not, and the failure is confusing rather than obvious:
+
+- **`pipx` is not present by default on macOS or on a stock Ubuntu**, so leading with it sends a new
+  reader to install a tool in order to install a tool.
+- **On recent Debian/Ubuntu there is no `pip` at all** for the system interpreter, and `ensurepip` is
+  absent too, so even `python3 -m venv` fails until you `apt install python3-venv`. A reader following
+  a `pip install` line gets an error about an externally-managed environment, or nothing named `pip`.
+- `uv` needs no existing Python (it will fetch one), installs the command in an isolated environment,
+  and provides `uvx` for a zero-install trial run.
+
+**The 3.9 floor is deliberate and load-bearing, not a lower bound nobody tested.** macOS ships exactly
+Python 3.9 as its system interpreter, so raising the floor would break the default path on every Mac
+that has not installed a newer Python. It is verified on both platforms rather than declared: the
+package parses, imports, runs and passes its full suite under a fetched CPython 3.9 on Linux and under
+macOS's system 3.9.
+</details>
 
 ## Quickstart (one persona)
 
@@ -196,6 +223,41 @@ carries a one-line `sed` that does it) and write the result to `~/Library/Launch
 operator's absolute home baked into seven paths, which is useless to anyone else. Point `__PROGRAM__` at a pinned,
 read-only artifact rather than a working tree - otherwise publishing a package "deploys" nothing and a restart
 does not change that.
+
+On Linux the counterpart is `kijito-inbox-monitor@.service.template`, a **systemd user unit**. Unlike the plist
+it needs no per-persona editing: the `@` makes it a template unit in systemd's own sense, and `%i` expands to
+whatever follows the `@`, so one file serves every persona.
+
+```sh
+mkdir -p ~/.config/systemd/user
+cp kijito-inbox-monitor@.service.template ~/.config/systemd/user/kijito-inbox-monitor@.service
+systemctl --user daemon-reload
+systemctl --user enable --now kijito-inbox-monitor@YOURPERSONA
+systemctl --user status  kijito-inbox-monitor@YOURPERSONA     # logs: journalctl --user -u ... -f
+```
+
+Create that persona's token file first (`~/.config/kijito-inbox-monitor/token.YOURPERSONA`, mode 0600) - a
+missing token is fatal and says so, rather than starting half-configured. The unit header documents the rest,
+including why the state file is deliberately not in `~/.cache`.
+
+> ⚠️ **A systemd *user* unit stops when your last session ends, and `Restart=always` does not save it** - that
+> directive restarts the *service*, not the user manager that hosts it. On a desktop you may never notice; on a
+> server or a VM you log out of, the producer simply stops and nothing reports it, because a watcher cannot
+> report its own death. If you want it alive while you are not logged in:
+> ```sh
+> loginctl enable-linger "$USER"        # check with: loginctl show-user "$USER" -p Linger
+> ```
+> `Linger=no` is the default, so this is opt-in on every machine.
+
+> ⚠️ **`systemctl show` and `systemd-analyze verify` validate the unit *file*, never the command inside it.** A
+> unit that loads cleanly and reports every property correctly can still have an `ExecStart` that fails on its
+> first launch - a wrong path, a flag the program does not accept. Confirm the producer with `systemctl --user
+> status` (or a real start) rather than treating a clean `show` as evidence that it runs.
+
+**The two supervisors differ in a way that changes your paths, not just your syntax:** launchd runs **one job**
+that can watch every persona (`--events-file-template`), while the systemd template runs **one unit per
+persona**. Either way the stream and state paths below are what your consumer tails; derive them from your own
+setup rather than copying another host's.
 
 ## Watching your whole account (multi-persona)
 
