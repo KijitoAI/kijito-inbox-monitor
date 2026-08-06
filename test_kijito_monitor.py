@@ -4951,3 +4951,191 @@ class EmissionStampTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WakeClassPhase1Test(unittest.TestCase):
+    """v16 phase 1: the producer stamps a wake_class so consumers stop needing to learn names.
+
+    The criteria are argus's phase-1 DONE-WHEN (docs/v16-phase1-done-when.md), certified by assay.
+    C1-C4 and C9 are the ones a unit suite can settle; C5-C7 (the byte-identical `event` field and the
+    old filters behaving identically against pre/post specimens) need rows captured on either side of
+    a real landing and are deliberately NOT faked here.
+
+    What makes these tests rather than restatements: none of them reads the classification table to
+    build its expectation. C1 derives the vocabulary from the SOURCE's emit sites, C3 constructs a
+    kind that does not exist, and C9 removes the field to prove it is what carries the wake.
+    """
+
+    LIVENESS = {"heartbeat", "armed"}
+
+    class Capture:
+        def __init__(self):
+            self.lines = []
+
+        def write(self, line):
+            self.lines.append(json.loads(line))
+            return True
+
+        def sync(self):
+            return True
+
+    def _emit(self, kind, **fields):
+        cap = self.Capture()
+        em = km.Emitter("stdout-jsonl", None, 220, False, sink=cap)
+        em.lifecycle(kind, **fields)
+        self.assertEqual(len(cap.lines), 1)
+        row = cap.lines[0]
+        # Assert PRESENCE here so a missing stamp fails as a named assertion with a readable message
+        # rather than as a KeyError three frames away. A mutation that kills a test by crashing it is
+        # a FALSE kill: it reports "detected" while saying nothing about the property under test.
+        self.assertIn("wake_class", row,
+                      "no wake_class on an emitted %r row - the emit chokepoint is not stamping" % kind)
+        return row
+
+    # ---- C1 -----------------------------------------------------------------------------------
+    @staticmethod
+    def _kinds_emitted_by_source():
+        """Every event kind the module can emit, derived from the SOURCE rather than from a list.
+
+        ⚠️ A literal `grep 'lifecycle("...")'` finds only FOUR of the ten kinds. The rest arrive as
+        `lifecycle(diag[0], ...)` and `_alarm(event, ...)`, where the kind is passed in a VARIABLE -
+        so a name-literal scan would reproduce, inside the test meant to prove the blindness fixed,
+        exactly the blindness this whole v16 item exists to end. Hence: literal call arguments, the
+        `{"event": "..."}` dict literal, AND the `diag = ("kind", {...})` assignments.
+        """
+        import ast
+        with open(km.__file__, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        kinds = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                fn = node.func
+                name = getattr(fn, "attr", None) or getattr(fn, "id", None)
+                if name in ("lifecycle", "_alarm") and node.args:
+                    a = node.args[0]
+                    if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                        kinds.add(a.value)
+            elif isinstance(node, ast.Dict):
+                for k, v in zip(node.keys, node.values):
+                    if (isinstance(k, ast.Constant) and k.value == "event"
+                            and isinstance(v, ast.Constant) and isinstance(v.value, str)):
+                        kinds.add(v.value)
+            elif isinstance(node, ast.Assign):
+                # diag = ("state_corrupt", {...})
+                for t in node.targets:
+                    if getattr(t, "id", None) == "diag" and isinstance(node.value, ast.Tuple) \
+                            and node.value.elts and isinstance(node.value.elts[0], ast.Constant) \
+                            and isinstance(node.value.elts[0].value, str):
+                        kinds.add(node.value.elts[0].value)
+        return kinds
+
+    def test_c1_every_emittable_kind_is_classified(self):
+        found = self._kinds_emitted_by_source()
+        # Guard the SCANNER before trusting its verdict: an ast walk that silently stopped matching
+        # would report an empty vocabulary, and "every kind is classified" would pass vacuously.
+        for expected in ("new", "alert", "recovered", "heartbeat", "armed",
+                         "persona_added", "state_corrupt", "baseline_skipped",
+                         "seed_ahead", "replay_capped"):
+            self.assertIn(expected, found,
+                          "source scan missed %r - the scanner is broken, not the table" % expected)
+        unclassified = sorted(k for k in found if k not in km._WAKE_CLASS_BY_KIND)
+        self.assertEqual(unclassified, [],
+                         "emitted but unclassified: %s - add them to _WAKE_CLASS_BY_KIND" % unclassified)
+
+    # ---- C2 -----------------------------------------------------------------------------------
+    def test_c2_liveness_is_exactly_heartbeat_and_armed(self):
+        """The suppression set is frozen by assertion. A third member fails HERE, deliberately.
+
+        Its exclusion is load-bearing: heartbeat fires every 900 s, and armed's exclusion is why
+        "I was not woken" does not mean "nothing arrived". Widening this set silently mutes a channel,
+        which is the one direction this design refuses to fail in.
+        """
+        self.assertEqual(set(km._LIVENESS_KINDS), self.LIVENESS)
+        classified_liveness = {k for k, v in km._WAKE_CLASS_BY_KIND.items()
+                               if v == km.WAKE_CLASS_LIVENESS}
+        self.assertEqual(classified_liveness, self.LIVENESS,
+                         "the table and the closed set disagree about what suppresses")
+
+    def test_c2_liveness_kinds_are_stamped_liveness_on_the_wire(self):
+        for kind in sorted(self.LIVENESS):
+            with self.subTest(kind=kind):
+                self.assertEqual(self._emit(kind)["wake_class"], km.WAKE_CLASS_LIVENESS)
+
+    # ---- C3 -----------------------------------------------------------------------------------
+    def test_c3_unknown_kind_is_constructed_and_wakes(self):
+        """Asserted by CONSTRUCTING a kind that does not exist, not by reading the default.
+
+        A default that is never exercised is a default nobody has tested. Fail-toward-wake is the
+        central inversion of this design: a kind whose author forgot to classify it wakes people, so
+        the omission surfaces as noise someone asks about rather than as a channel that went quiet.
+        """
+        kind = "kind_that_does_not_exist_yet"
+        self.assertNotIn(kind, km._WAKE_CLASS_BY_KIND)
+        row = self._emit(kind)
+        self.assertEqual(row["event"], kind)
+        self.assertEqual(row["wake_class"], km.WAKE_CLASS_DIAGNOSTIC)
+        self.assertNotEqual(row["wake_class"], km.WAKE_CLASS_LIVENESS,
+                            "an unclassified kind must never fall into the suppressing value")
+
+    # ---- C4 -----------------------------------------------------------------------------------
+    def test_c4_persona_added_is_explicit_not_defaulted(self):
+        """It reaches the right answer either way, and that is exactly why it must be written down.
+
+        Correct-by-accident is not correct: the catch-all exists for kinds nobody has thought of, not
+        for kinds we know about and forgot to record. assay's §5at(a) ruling made persona_added a
+        first-class waking kind, so it is a table entry, and this test fails if someone deletes it and
+        leans on the default.
+        """
+        self.assertIn("persona_added", km._WAKE_CLASS_BY_KIND)
+        self.assertEqual(km._WAKE_CLASS_BY_KIND["persona_added"], km.WAKE_CLASS_DIAGNOSTIC)
+
+    def test_c4_all_five_diagnostics_wake(self):
+        for kind in ("state_corrupt", "baseline_skipped", "seed_ahead", "replay_capped",
+                     "persona_added"):
+            with self.subTest(kind=kind):
+                self.assertEqual(self._emit(kind)["wake_class"], km.WAKE_CLASS_DIAGNOSTIC)
+
+    def test_mail_is_the_only_mail(self):
+        mail = {k for k, v in km._WAKE_CLASS_BY_KIND.items() if v == km.WAKE_CLASS_MAIL}
+        self.assertEqual(mail, {"new"})
+
+    # ---- C9: the can-fail pairing --------------------------------------------------------------
+    def test_c9_class_filter_matches_nothing_without_the_stamp(self):
+        """Prove the FIELD carries the wake, not something that merely co-occurs with it.
+
+        A check that cannot be made to fail has not been shown to check anything. So: take a real
+        emitted row, remove `wake_class`, and assert a class-matching consumer filter now misses it -
+        while the same filter matched before. If this passed with the field removed, the filter would
+        be keying on something else and the whole phase would be decorative.
+        """
+        import re
+        class_filter = re.compile(r'"wake_class": ?"(mail|diagnostic)"')
+        row = self._emit("seed_ahead", seeded=1, current_max=2)
+        with_stamp = json.dumps(row, ensure_ascii=False)
+        self.assertTrue(class_filter.search(with_stamp))
+        row.pop("wake_class")
+        self.assertIsNone(class_filter.search(json.dumps(row, ensure_ascii=False)),
+                          "the class filter matched a row with no wake_class - it is keying on "
+                          "something other than the field under test")
+
+    # ---- phase-1 safety: `event` is untouched ---------------------------------------------------
+    def test_phase1_leaves_event_name_and_old_filters_alone(self):
+        """The non-breaking claim, at the level a unit test can reach.
+
+        Phase 1's entire justification for landing with no flag day is that no existing consumer
+        behaves differently. The full form (C5-C7) compares rows captured either side of the landing;
+        what is checkable here is that the `event` field still carries exactly the kind, and that both
+        legacy filter spellings still match and miss exactly what they did before.
+        """
+        import re
+        old_strict = re.compile(r'"event": "(new|alert|recovered)"')
+        old_lenient = re.compile(r'"event": ?"(new|alert|recovered)"')
+        for kind, should_match in (("alert", True), ("recovered", True),
+                                   ("heartbeat", False), ("armed", False),
+                                   ("seed_ahead", False)):   # still invisible to the OLD filter
+            with self.subTest(kind=kind):
+                line = json.dumps(self._emit(kind), ensure_ascii=False)
+                self.assertEqual(bool(old_strict.search(line)), should_match)
+                self.assertEqual(bool(old_lenient.search(line)), should_match)
+        # and the field itself is the bare kind, not decorated
+        self.assertEqual(self._emit("armed")["event"], "armed")

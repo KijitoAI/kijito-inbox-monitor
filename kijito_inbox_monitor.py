@@ -779,6 +779,72 @@ def _emission_stamps():
     return stamps
 
 
+# ----------------------------------------------------------------------------------------------------------------
+# §7.1b WAKE CLASS - so a consumer's filter stops having to learn every new event name (v16 phase 1)
+# ----------------------------------------------------------------------------------------------------------------
+# THE DEFECT THIS CLOSES. Every consumer in the fleet filters on a NAME ALLOWLIST -
+# `"event": ?"(new|alert|recovered)"`. So every diagnostic this module added to kill a silent failure
+# was ITSELF silent: state_corrupt, baseline_skipped, seed_ahead, replay_capped and persona_added
+# matched nobody's filter, and a running `grep` never re-reads its argv, so they stayed invisible even
+# after the docs were fixed. cadence's statement of it: "a diagnostic added to kill a silent failure is
+# itself silent unless the consumer's filter learned its name."
+#
+# THE FIX IS A CLASS THE CONSUMER MATCHES STRUCTURALLY, so a new kind is covered the day it is added
+# rather than the day every seat is re-armed. Three rules make it structural rather than cosmetic:
+#
+#   1. AN UNCLASSIFIED KIND WAKES. The default is `diagnostic`, NOT `liveness` - a kind whose author
+#      forgot to classify it wakes people, so the omission is visible immediately instead of silently
+#      muting a channel. You cannot FALL INTO the suppressing value; it must be typed deliberately.
+#   2. `liveness` IS A CLOSED SET, ASSERTED BY A TEST. Its exclusion is load-bearing: `heartbeat` fires
+#      every 900 s, and `armed`'s exclusion is why "I was not woken" does not mean "nothing arrived".
+#      A small, deliberately-frozen suppression set is the one place an allowlist is correct.
+#   3. ONE TABLE, NEXT TO THE CHOKEPOINT. Not a classification scattered across construction sites -
+#      that is precisely how the consumer-side allowlist rotted in the first place.
+#
+# ⚠️ PHASE 1 ONLY. The producer stamps; `event` is UNTOUCHED, so every existing filter keeps working
+# byte-for-byte and there is no flag day. Consumers switch to `wake_class` per seat, at each owner's
+# pace (phase 2), and the name allowlist dies only when none of them match on `event` (phase 3).
+# ⛔ A consumer that matches `wake_class` against a producer that does not emit it matches NOTHING -
+# a fleet-wide wake outage delivered by the fix for a wake outage. Hence producer FIRST, always.
+WAKE_CLASS_MAIL = "mail"              # a real inbox message
+WAKE_CLASS_DIAGNOSTIC = "diagnostic"  # the producer is reporting something wrong or surprising
+WAKE_CLASS_LIVENESS = "liveness"      # routine "I am alive" ticks - the ONLY suppressing value
+
+# The suppression set, closed and frozen. Adding a member here silently mutes a channel, so a test
+# asserts this exact membership and a third member fails the suite.
+_LIVENESS_KINDS = frozenset({"heartbeat", "armed"})
+
+# Every kind this module can emit. `new` is the only mail; everything that is not mail and not
+# liveness is a diagnostic, INCLUDING kinds absent from this table (see _wake_class).
+_WAKE_CLASS_BY_KIND = {
+    "new":              WAKE_CLASS_MAIL,
+    "alert":            WAKE_CLASS_DIAGNOSTIC,
+    "recovered":        WAKE_CLASS_DIAGNOSTIC,
+    "state_corrupt":    WAKE_CLASS_DIAGNOSTIC,
+    "baseline_skipped": WAKE_CLASS_DIAGNOSTIC,
+    "seed_ahead":       WAKE_CLASS_DIAGNOSTIC,
+    "replay_capped":    WAKE_CLASS_DIAGNOSTIC,
+    # persona_added is listed EXPLICITLY rather than left to the default. It would reach the right
+    # answer either way, and that is the problem: correct-by-accident is not correct. The catch-all
+    # exists for kinds nobody has thought of, not for kinds we know about and did not write down.
+    "persona_added":    WAKE_CLASS_DIAGNOSTIC,
+    "heartbeat":        WAKE_CLASS_LIVENESS,
+    "armed":            WAKE_CLASS_LIVENESS,
+}
+
+
+def _wake_class(kind):
+    """Classify an event kind. An UNKNOWN kind is a `diagnostic`, which means it WAKES.
+
+    Fail toward visible noise, never toward a silently muted channel: a kind added without a
+    classification is a mistake, and the failure mode of a mistake should be "someone got woken and
+    asked why", not "a channel went quiet and nobody noticed for a month". That direction is the whole
+    reason this field is worth having, so it is asserted by a test that CONSTRUCTS an unknown kind
+    rather than by reading this line - a default that is never exercised is a default nobody tested.
+    """
+    return _WAKE_CLASS_BY_KIND.get(kind, WAKE_CLASS_DIAGNOSTIC)
+
+
 class Emitter:
     def __init__(self, mode, exec_cmd, content_chars, no_content, sink=None, suppress_authors=None,
                  sink_template=None, max_bytes=0, keep=5):
@@ -930,6 +996,11 @@ class Emitter:
         # COHERENT triple. `ts` is deliberately left alone: it is stamped in the convenience
         # constructors, microseconds earlier, and consumers already depend on it.
         event["emitted"] = _emission_stamps()
+        # Classified HERE for the same reason event_id is: a future kind added at some other
+        # construction site cannot forget to carry one, because it does not get a choice. `event`
+        # itself is untouched, so every filter that matches on the NAME keeps working unchanged -
+        # which is what makes phase 1 safe to land without coordinating a single consumer.
+        event["wake_class"] = _wake_class(event.get("event"))
         if self.mode == "stdout-jsonl":
             # Sanitised at the SERIALISED line, so one call covers every field an event can carry -
             # content, `from`, an alarm `reason` built from server data - rather than each of them.
