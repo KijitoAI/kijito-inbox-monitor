@@ -2997,8 +2997,11 @@ def report_stranded_inboxes(directory, counts, targets, emitter):
     routing the alarm to every target would therefore write it straight into the unconsumed stream whose
     unconsumed-ness is the fault being reported. Producing an event there is not delivering it.
 
-    The event is an `alert` (not a new event name) so consumers already filtering new|alert|recovered
-    surface it without being rearmed; a fresh event name would itself have gone unwatched.
+    The event is an `alert` (not a new event name) so consumers already filtering `alert` surface it
+    without being rearmed; a fresh event name would itself have gone unwatched, because a running
+    `grep` never re-reads its argv. That is not hypothetical: the diagnostics this module emits
+    (state_corrupt, baseline_skipped, seed_ahead, replay_capped, persona_added) ARE fresh names, and
+    every one of them was invisible to every seated consumer until their filters were widened by hand.
     """
     if not directory:
         return []   # unknown directory: alarming would flag EVERY persona. No data is not evidence of a fault.

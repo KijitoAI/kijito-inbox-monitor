@@ -83,8 +83,9 @@ mkdir -p ~/.cache/kijito-inbox-monitor      # the cache dir must exist before mk
 FIFO="$HOME/.cache/kijito-inbox-monitor/wake.fifo"
 [ -p "$FIFO" ] || mkfifo "$FIFO"   # create the pipe ONCE (idempotent). Without it, `>` writes a PLAIN FILE =
                                    # silently back to capture-only, with no error.
-# Ring the doorbell only on real mail (the filter skips armed/heartbeat; add |alert|recovered to also wake on
-# the source going down/back up). $KIJITOMON_* expand at event time; $FIFO is baked in now.
+# Ring the doorbell only on real mail. To also wake on the source going down/back up and on the producer's
+# diagnostics, test for those kinds too - everything except `armed` and `heartbeat` is worth waking on.
+# $KIJITOMON_* expand at event time; $FIFO is baked in now.
 kijito-inbox-monitor --persona testbot --emit exec-per-event \
   --exec "[ \"\$KIJITOMON_EVENT\" = new ] && echo \"\$KIJITOMON_ID\" > $FIFO"
 ```
@@ -123,11 +124,27 @@ of `exec-per-event`):
   only captures to a file and never wakes you.
   ```
   Monitor(
-    command="tail -n 0 -F ~/.cache/kijito-inbox-monitor/events.testbot.ndjson | grep --line-buffered -E '\"event\": \"(new|alert|recovered)\"'",
+    command="tail -n 0 -F ~/.cache/kijito-inbox-monitor/events.testbot.ndjson | grep --line-buffered -E '\"event\": ?\"(new|alert|recovered|state_corrupt|baseline_skipped|seed_ahead|replay_capped|persona_added)\"'",
     persistent=true)
   ```
-  The filter matches `new` (mail) plus `alert`/`recovered` (the source went down / came back); it skips `armed`
-  and `heartbeat`, which are startup/keepalive ticks, not things to wake on. To stay armed **every session
+  The filter matches `new` (mail), `alert`/`recovered` (the source went down / came back), and the producer's
+  five diagnostics - `state_corrupt`, `baseline_skipped`, `seed_ahead`, `replay_capped`, `persona_added` - which
+  report that something is wrong or surprising and are the whole reason the producer bothers to emit them. It
+  skips exactly `armed` and `heartbeat`, which are startup/keepalive ticks, not things to wake on.
+
+  > Two details in that pattern are load-bearing, and both were learned by getting them wrong.
+  > **The `?` after the colon** makes the space optional. The producer emits with a space (`json.dumps`
+  > default), so a space-less filter matches nothing - and a filter that *requires* the space is one
+  > serializer change away from going silent on every event. **The names are exact and the `"` closes them**:
+  > without the closing quote each name becomes a prefix, so a future `alert_suppressed` would wake you by
+  > accident while `heartbeat_v2` would not - membership decided by which existing name a new kind happens to
+  > start with.
+  > ⚠️ **An earlier version of this README listed only `new|alert|recovered`.** Every diagnostic the producer
+  > added to kill a silent failure was therefore itself silent, because the consumer's filter never learned its
+  > name. If you copied that filter, widen it. A future release replaces this name list with a
+  > producer-stamped class you match structurally, so it cannot drift again.
+
+  To stay armed **every session
   without fail**, put that call behind a SessionStart hook so the harness arms it deterministically instead of
   relying on the agent to remember (and to remember to use Monitor, not a bare tail).
 
@@ -379,8 +396,10 @@ inbox per process - to stderr, and as one `alert` summarising the whole backlog:
 
 Three details matter if you consume these:
 
-- It is an **`alert`, not a new event name**, so a consumer already filtering `new|alert|recovered` surfaces it
-  without being rearmed. If you parse `alert` strictly, note it carries an extra `stranded_inboxes` field and **no
+- It is an **`alert`, not a new event name**, so any consumer already filtering `alert` surfaces it without being
+  rearmed. That choice is load-bearing and the reason is worth stating plainly: **a running `grep` never re-reads
+  its argv**, so introducing a fresh event name would have gone unwatched on every already-armed consumer until
+  its owner happened to restart. If you parse `alert` strictly, note it carries an extra `stranded_inboxes` field and **no
   message id**. On `--exec` the same list arrives comma-separated as `$KIJITOMON_STRANDED`, and
   `$KIJITOMON_FAILURES` is absent (this alert is not a reachability failure).
 - It is delivered **only to real directory personas**. A stranded inbox has mail, so the watcher gives it a target

@@ -326,7 +326,8 @@ reviewer originally assigned never read the request.
   such, naming its twin. Disable with `--no-stranded-alerts`.
 
   Two routing rules are load-bearing and easy to get wrong: the alarm is an `alert` rather than a new event
-  name, so consumers already filtering `new|alert|recovered` surface it without being rearmed; and it is
+  name, so consumers already filtering `alert` surface it without being rearmed - a fresh name would have gone
+  unwatched on every armed consumer, because a running `grep` never re-reads its argv; and it is
   routed only to watchers backed by a real directory persona, because a stranded inbox has mail and
   therefore acquires a watch target and stream of its own - alerting every target would write the alarm
   into the very stream nobody reads. Producing an event is not delivering it.
