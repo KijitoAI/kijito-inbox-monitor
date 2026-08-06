@@ -232,7 +232,17 @@ if [ ! -f kijito_inbox_monitor.py ] || [ ! -f RELEASING.md ]; then
 fi
 echo "specimen: $root"
 
-tracked=$(git ls-files -z | tr '\0' '\n')
+# --cached AND --others, because `git ls-files` alone reproduces one level up the very defect the
+# comment at the top of this file warns about. That comment says a HARDCODED list "silently omits
+# exactly the files added since someone last edited it", and re-deriving from git fixed that - for
+# TRACKED files. An untracked new file is still omitted, and the gate still printed "GATES CLEAN".
+# ⇒ MEASURED 2026-08-06: a new, unstaged kijito-inbox-monitor@.service.template gave
+#   "surface: 17 file(s) -> GATES CLEAN" while that file was never opened; `git add` made it 18.
+# ★ A BRAND-NEW FILE IS THE LIKELIEST ONE TO CARRY A LEAK - nobody has ever reviewed it - and it was
+#   precisely the one the gate could not see. Silence read as approval.
+# --exclude-standard keeps .gitignore'd build artifacts (build/, *.egg-info/, __pycache__/) out, so
+# this widens the surface to unreviewed SOURCE only, never to generated noise.
+tracked=$(git ls-files -z --cached --others --exclude-standard | tr '\0' '\n' | sort -u)
 files=$(printf '%s\n' "$tracked" | grep -vE "$EXEMPT" || true)
 excluded=$(printf '%s\n' "$tracked" | grep -E "$EXEMPT" || true)
 if [ -z "$files" ]; then
