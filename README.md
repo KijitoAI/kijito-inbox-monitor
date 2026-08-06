@@ -151,11 +151,19 @@ cron with a keep-alive). Give it a `--state-file` so a restart resumes the curso
 missing or replaying messages (it is single-writer locked, so a second instance exits non-zero, and identity-
 stamped, so it won't resume a different inbox's cursor).
 
+> ⚠️ **Do NOT put the state file in `~/.cache`.** XDG defines `~/.cache` as non-essential data that anything may
+> delete at any time, and cache cleaners do. **Losing the state file is not a cache miss:** with no state the
+> watcher **baselines to the newest visible id**, so your unread backlog is *skipped*, not re-fetched - mail that
+> would have woken you never does. (The skip is announced as a `baseline_skipped` event rather than happening in
+> silence, but announced-and-skipped is still skipped.) Put it under `~/.local/state` (XDG_STATE_HOME - data that
+> persists between restarts). Earlier versions of this README used `~/.cache` in these examples; that was wrong.
+
 ```sh
 # macOS launchd example (edit paths + persona for your setup):
+mkdir -p ~/.local/state/kijito-inbox-monitor
 kijito-inbox-monitor --persona testbot \
-  --events-file ~/.cache/kijito-inbox-monitor/events.testbot.ndjson \
-  --state-file  ~/.cache/kijito-inbox-monitor/state.testbot.json
+  --events-file ~/.local/state/kijito-inbox-monitor/events.testbot.ndjson \
+  --state-file  ~/.local/state/kijito-inbox-monitor/state.testbot.json
 ```
 
 Don't redirect the producer's stdout to a log file for a supervised run: an external rotator (newsyslog) renames
@@ -181,17 +189,24 @@ owned, rotated event file, and each agent session consumes only its own:
 
 ```sh
 kijito-inbox-monitor --all-personas \
-  --events-file-template ~/.cache/kijito-inbox-monitor/events.{persona}.ndjson \
-  --state-file ~/.cache/kijito-inbox-monitor/state.json
+  --events-file-template ~/.local/state/kijito-inbox-monitor/events.{persona}.ndjson \
+  --state-file ~/.local/state/kijito-inbox-monitor/state.json
 ```
 
 Each session then wakes on its own `events.<persona>.ndjson` using the recipe in
 [Waking your agent](#waking-your-agent). Two per-persona files, easy to mix up:
 
 ```text
-~/.cache/kijito-inbox-monitor/state.<persona>.json     # internal cursor/liveness bookkeeping - do NOT consume it
-~/.cache/kijito-inbox-monitor/events.<persona>.ndjson  # the event stream you consume to wake on your mail
+~/.local/state/kijito-inbox-monitor/state.<persona>.json     # internal cursor/liveness bookkeeping - do NOT consume it
+~/.local/state/kijito-inbox-monitor/events.<persona>.ndjson  # the event stream you consume to wake on your mail
 ```
+
+These paths are yours to choose - the tool has no defaults and requires both flags explicitly. What is *not*
+a free choice is keeping the **state** file out of `~/.cache` (see the warning above): losing it skips your
+backlog rather than re-fetching it. The shipped `kijito-inbox-monitor@.service.template` uses these same
+`~/.local/state` paths. Some examples earlier in this README still write the *events* file under `~/.cache`,
+which is harmless - an events file is a stream you can lose without losing a wake, because the cursor is what
+prevents that.
 
 ## Events
 
