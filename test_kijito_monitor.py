@@ -4759,6 +4759,29 @@ class WakeNonceTest(unittest.TestCase):
     consumer scores LOST and pages on, from the recovery path this producer exists to survive.
     """
 
+    def test_known_vectors_pin_the_alphabet_itself(self):
+        """Literal vectors from an INDEPENDENT reimplementation, so the alphabet cannot drift silently.
+
+        WHY THESE ARE LITERALS AND NOT COMPUTED: every other assertion in this class derives its
+        expectation from km._wake_nonce() itself, so all of them pass unchanged if the derivation
+        changes - the implementation and the expectation drift together. Only a value computed OUTSIDE
+        this module can catch that.
+
+        WHY IT MATTERS SPECIFICALLY HERE: `base62` does not name an alphabet. The digit-first variant
+        (`0-9a-zA-Z`) produces plausible-looking 11-char tokens that match nothing, and it has ALREADY
+        raised one false integrity alarm against correct data - from the most conscientious kind of
+        reader, the one who recomputes instead of trusting. `1953a73` pinned the alphabet in the DOCS;
+        until this test the only code guard on it lived in an exec-path test in another class, so
+        deleting that one test would have left the alphabet unguarded. A doc pin is not a guard.
+        """
+        # base62(sha256(event_id))[:11] with the lowercase-first alphabet a-zA-Z0-9.
+        for event_id, expected in (
+            ("argus:new:12", "vwwTOywuFUr"),
+            ("argus:new:4061", "1FxAMbC27hZ"),   # the drill specimen, observed three times on the wire
+        ):
+            with self.subTest(event_id=event_id):
+                self.assertEqual(km._wake_nonce(event_id), expected)
+
     class Capture:
         def __init__(self):
             self.lines = []
