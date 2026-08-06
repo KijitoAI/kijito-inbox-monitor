@@ -1489,8 +1489,30 @@ class StateFile:
         if unread_hidden:
             d["unread_hidden"] = True
         dirn = os.path.dirname(os.path.abspath(self.path)) or "."
-        _makedirs_private(dirn)
-        fd, tmp = tempfile.mkstemp(dir=dirn, prefix=".kijmon-", suffix=".tmp")
+        # BOTH OF THESE ARE INSIDE THE GUARD, and they did not used to be (drill, 2026-08-05).
+        # This function builds a careful "written but not provably durable" path - _fsync_dir fails ->
+        # return False -> _state_not_durable() announces -> the producer keeps running on the in-memory
+        # cursor. But `_makedirs_private` and `mkstemp` sat OUTSIDE the try, so the MOST ORDINARY way a
+        # state write actually fails - an unwritable state DIRECTORY - raised EACCES before any of that,
+        # escaped save() entirely, and reached only the last-resort top-level handler: exit 2.
+        # ⇒ THE CONSEQUENCE WAS A WHOLE CATEGORY WORSE THAN THE ONE THIS CODE PREPARED FOR. Supervisors
+        #   restart us (launchd KeepAlive; systemd Restart=always, RestartSec=15), and a producer that
+        #   dies before persisting its cursor re-delivers the same mail on every respawn. Measured on the
+        #   drill specimen: 4 wakes/min for ONE message, forever, cursor frozen - a duplicate storm
+        #   arriving through the very path built to prevent one.
+        # ★ A LAST-RESORT HANDLER PLUS SUPERVISED AUTO-RESTART CONVERTS ANY UNGUARDED FAULT INTO A
+        #   PERIODIC STORM. Spend the guard budget per-fault; do not delegate it to the supervisor.
+        #   The top handler's own comment already said reaching it means a guard is missing.
+        try:
+            _makedirs_private(dirn)
+            fd, tmp = tempfile.mkstemp(dir=dirn, prefix=".kijmon-", suffix=".tmp")
+        except OSError as e:
+            sys.stderr.write("kijito-inbox-monitor: WARNING cannot create a temp file in the state "
+                             "directory %s (%s); the cursor is NOT being persisted, so a restart will "
+                             "replay mail from an older cursor. Continuing on the in-memory cursor "
+                             "rather than exiting - a crash here is restarted into a re-delivery "
+                             "loop\n" % (dirn, e))
+            return False
         try:
             with os.fdopen(fd, "w") as f:
                 json.dump(d, f)
