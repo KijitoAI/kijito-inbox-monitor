@@ -1,6 +1,8 @@
+import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -1349,6 +1351,60 @@ class UnreadHiddenPersistenceTest(unittest.TestCase):
         self.assertFalse(km.StateFile(p, "idx").load()["unread_hidden"])
         with open(p) as f:
             self.assertNotIn("unread_hidden", json.load(f))
+
+
+class UnwritableStateDirDegradesRatherThanCrashingTest(unittest.TestCase):
+    """An unwritable state DIRECTORY must degrade honestly, never raise out of save().
+
+    THE DEFECT THIS CLOSES (measured by the unacknowledged-delivery drill, 2026-08-05). save() builds a
+    careful "written but not provably durable" path - _fsync_dir fails -> return False ->
+    _state_not_durable() announces -> the producer keeps running on the in-memory cursor. But
+    `_makedirs_private` and `mkstemp` sat OUTSIDE the try, so the MOST ORDINARY failure - a state
+    directory we cannot write - raised EACCES before any of it and escaped to the last-resort top-level
+    handler: exit 2.
+
+    ★ WHY THAT IS WORSE THAN IT SOUNDS, AND WHY THIS TEST IS NOT ABOUT AN EXCEPTION: supervisors restart
+    us (launchd KeepAlive; systemd Restart=always, RestartSec=15). A producer that dies BEFORE persisting
+    its cursor re-delivers the same mail on every respawn. Measured on the real specimen: 4 wakes/min for
+    one message, forever, cursor frozen. A last-resort handler plus supervised auto-restart converts any
+    unguarded fault into a PERIODIC STORM.
+    """
+
+    def _readonly_dir(self):
+        d = tempfile.mkdtemp()
+        os.chmod(d, 0o555)
+        self.addCleanup(os.chmod, d, 0o755)   # so the temp tree can be cleaned up afterwards
+        return d
+
+    def test_save_returns_False_instead_of_raising(self):
+        p = os.path.join(self._readonly_dir(), "hive.json")
+        try:
+            got = km.StateFile(p, "idx").save(100, "UP", 0)
+        except OSError as e:
+            self.fail("save() raised %r instead of reporting non-durability; under a supervisor that "
+                      "exit becomes a re-delivery loop" % (e,))
+        self.assertIs(got, False, "an unwritable state dir must report NOT-durable, not success")
+
+    def test_it_says_so_on_stderr_rather_than_failing_silently(self):
+        """Clause 5: fail open HONESTLY, never silently. A held cursor nobody is told about is the
+        false-calm class this program exists to kill."""
+        p = os.path.join(self._readonly_dir(), "hive.json")
+        err = io.StringIO()
+        real, sys.stderr = sys.stderr, err
+        try:
+            km.StateFile(p, "idx").save(100, "UP", 0)
+        finally:
+            sys.stderr = real
+        msg = err.getvalue()
+        self.assertIn("NOT being persisted", msg)
+        self.assertIn("replay mail", msg, "the operator must be told the CONSEQUENCE, not just the errno")
+
+    def test_the_writable_case_still_persists_that_is_the_control(self):
+        """The negative control: without it, a save() that returned False unconditionally would pass
+        both tests above while breaking every cursor in the fleet."""
+        p = os.path.join(tempfile.mkdtemp(), "hive.json")
+        self.assertIs(km.StateFile(p, "idx").save(100, "UP", 0), True)
+        self.assertEqual(km.StateFile(p, "idx").load()["cursor"], 100)
 
 
 class BoundedWindowGapTest(unittest.TestCase):
