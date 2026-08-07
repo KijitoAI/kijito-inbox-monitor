@@ -307,6 +307,22 @@ def _declared_omissions(data):
 # None (not 0) means the server did not report a count, so the check must not infer anything from it.
 _PERSONA_MEMORY_COUNTS = {}
 
+# Read count per persona (mail_total - unread), refreshed on every directory fetch. This is the REAL
+# "is anyone consuming this inbox" signal, replacing the memory-count proxy for in-directory inboxes:
+# ownership (ever authored one memory) is MONOTONIC and permanently immunises an inbox, so a typo-variant
+# that ever received one memory (e.g. 'rvier', a variant of 'river') became invisible even while it held
+# unread mail nobody reads. read==0 says the inbox has never been consumed - exact, no threshold.
+# None means the server did not report both fields, so the check degrades to the memory-count signal
+# rather than reading an unknown as zero.
+_PERSONA_READ_COUNTS = {}
+
+# Declared `retired` flag per persona from /api/personas. It is the DECLARED classification that separates
+# clearable debris from a real-but-dormant inbox among inboxes that read==0: retired => loud debris,
+# not-retired (or undeclared) => quiet dormant. None means the server did not report it → treated as
+# not-retired (quiet), because loudly declaring an inbox clearable on absent data is the dangerous
+# direction. A boolean, never a threshold.
+_PERSONA_RETIRED = {}
+
 
 def _row_memory_count(row):
     """Memories owned by this persona, or None if the server did not say.
@@ -319,6 +335,35 @@ def _row_memory_count(row):
     """
     n = row.get("memory_count")
     return n if isinstance(n, int) and n >= 0 else None
+
+
+def _row_read_count(row):
+    """Messages this persona has READ (mail_total - unread), or None if the server did not report both.
+
+    Same tri-state discipline as _row_memory_count: an UNKNOWN read count (either field missing/uninteger)
+    is None, never 0 - the stranded check must degrade to the memory-count signal instead of reading an
+    unknown as "never consumed". bool is excluded explicitly (isinstance(True, int) is True in Python), and
+    a negative result (unread somehow exceeding mail_total) is treated as unknown rather than trusted.
+    """
+    total = row.get("mail_total")
+    unread = row.get("unread")
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        return None
+    if isinstance(unread, bool) or not isinstance(unread, int) or unread < 0:
+        return None
+    read = total - unread
+    return read if read >= 0 else None
+
+
+def _row_retired(row):
+    """The persona's declared `retired` flag as a strict bool, or None if the server did not report it.
+
+    Only a genuine bool counts; anything else (absent, null, a string) is None = no declaration, which the
+    stranded partition treats as NOT retired (quiet/dormant). Declaring an inbox clearable debris - the
+    LOUD tier - must rest on a positive declaration, never on the absence of one.
+    """
+    r = row.get("retired")
+    return r if isinstance(r, bool) else None
 
 
 def fetch_personas(opener, headers):
@@ -341,6 +386,8 @@ def fetch_personas(opener, headers):
         if isinstance(row, dict) and isinstance(row.get("persona"), str) and row["persona"]:
             personas.append(row["persona"])
             _PERSONA_MEMORY_COUNTS[row["persona"]] = _row_memory_count(row)
+            _PERSONA_READ_COUNTS[row["persona"]] = _row_read_count(row)
+            _PERSONA_RETIRED[row["persona"]] = _row_retired(row)
     if not personas:
         raise FatalConfig("/api/personas returned no personas")
     return personas
@@ -1046,6 +1093,7 @@ class Emitter:
                 "seeded": "KIJITOMON_SEEDED", "current_max": "KIJITOMON_CURRENT_MAX",
                 "capped_to": "KIJITOMON_CAPPED_TO", "dropped": "KIJITOMON_DROPPED",
                 "stranded_inboxes": "KIJITOMON_STRANDED",
+                "dormant_inboxes": "KIJITOMON_DORMANT",
             }
             for k, envname in keymap.items():
                 if k in event and event[k] is not None:
@@ -2997,6 +3045,12 @@ def report_urgent_unanswered(directory, targets, emitter):
 
 _REPORTED_STRANDED = set()
 
+# Dormant inboxes already surfaced (quietly) this process. Same once-per-inbox discipline and the same
+# EXACT (never casefolded) keying as _REPORTED_STRANDED, re-armed by intersection_update so a re-dormancy
+# after a rescue is surfaced again. Kept separate from _REPORTED_STRANDED so the loud and quiet tiers
+# never gag one another.
+_REPORTED_DORMANT = set()
+
 
 def stranded_inboxes(directory, counts):
     """Inboxes holding unread mail that the persona DIRECTORY does not know about.
@@ -3021,24 +3075,72 @@ def stranded_inboxes(directory, counts):
     TWO SIGNALS, because directory membership alone stopped being sufficient. A server may build its
     directory as a UNION that includes every registered RECIPIENT - and a recipient is registered the
     moment anyone sends to that name, typo included. On such a server every future phantom is "in the
-    directory" instantly and absence can never fire again. So an inbox also counts as stranded when it
-    holds mail while owning ZERO memories: nothing has ever written as that persona, so nobody is
-    working under it. That tracks the real invariant - whether a CONSUMER exists - rather than a proxy
-    for it. Where the server reports no memory counts at all the second signal simply stays quiet, so
-    this degrades to the original behaviour instead of guessing.
+    directory" instantly and absence can never fire again. So an in-directory inbox also counts as
+    stranded when it holds mail while NEVER HAVING BEEN CONSUMED - read == mail_total - unread == 0.
+
+    read==0 REPLACES the older "owns ZERO memories" proxy for the in-directory case, because that proxy
+    was MONOTONIC: authoring a single memory immunised an inbox forever, so a typo-variant that ever
+    received one memory ('rvier', 'settest', 'qa-e2e' were live examples) went invisible while its mail
+    piled up unread. read count is not monotonic - it tracks whether anyone is ACTUALLY consuming the
+    inbox now. Where the server reports no read data at all this degrades to the original memory-count
+    proxy rather than guessing, and an unknown read is never read as zero.
+
+    stranded_inboxes() returns only the LOUD tier: names the directory doesn't know, plus in-directory
+    inboxes never consumed that are DECLARED `retired` (clearable debris). In-directory inboxes never
+    consumed that are NOT declared retired are real-but-dormant; they are returned by dormant_inboxes()
+    and surfaced quietly instead, so a live member who simply never reads a broadcast inbox does not ride
+    the loud alarm. The partition is exact on both axes (read==0 and the boolean `retired`); no threshold.
+    """
+    return _partition_stranded(directory, counts)[0]
+
+
+def _partition_stranded(directory, counts):
+    """Split inboxes-holding-unread into (loud, dormant). Single classifier so the two tiers cannot drift.
+
+    For each inbox with unread mail:
+      - name not in the directory                         -> LOUD  (signal 1, unchanged)
+      - in directory, read data UNKNOWN, memory_count==0  -> LOUD  (degrade to the original proxy)
+      - in directory, read > 0                            -> not stranded (actively consumed)
+      - in directory, read == 0, retired is True          -> LOUD  (declared clearable debris)
+      - in directory, read == 0, retired False/undeclared -> DORMANT (real-but-idle; quiet)
+    read = mail_total - unread, both from the /api/personas row via _PERSONA_READ_COUNTS. Compared and
+    classified EXACTLY, never casefolded - the same case-sensitivity invariant as the rest of this check.
     """
     known = {p for p in directory if p}
-    out = []
+    loud, dormant = [], []
     for p in sorted(counts):
         if not p or not counts.get(p):
             continue
         if p not in known:
-            out.append(p)
+            loud.append(p)                       # signal 1: no owner in the directory
             continue
-        owned = _PERSONA_MEMORY_COUNTS.get(p)
-        if owned == 0:
-            out.append(p)
-    return out
+        read = _PERSONA_READ_COUNTS.get(p)
+        if read is None:
+            # No read data for this persona: degrade to the original ownership proxy. An UNKNOWN read
+            # count must never be treated as zero, so we consult memory_count exactly as before.
+            if _PERSONA_MEMORY_COUNTS.get(p) == 0:
+                loud.append(p)
+            continue
+        if read > 0:
+            continue                             # someone is consuming it - not stranded at all
+        # read == 0: this inbox has never been consumed. Partition by the DECLARED retired flag.
+        if _PERSONA_RETIRED.get(p) is True:
+            loud.append(p)                       # declared clearable debris -> loud, exactly like today
+        else:
+            dormant.append(p)                    # real-but-dormant -> quiet, must NOT ride the loud alarm
+    return loud, dormant
+
+
+def dormant_inboxes(directory, counts):
+    """In-directory inboxes never consumed (read==0) but NOT declared `retired` - the QUIET tier.
+
+    Separated from stranded_inboxes() on purpose: these are real members who simply do not read a
+    broadcast inbox (measured live: omniview/sterling/vellum/maestro hold hundreds of memories with
+    read==0). Alarming on them loudly would flood the very alert consumers rely on, so they are surfaced
+    quietly (a stderr NOTICE, and an informational `dormant_inboxes` field on any loud alert) and never
+    fire an alert on their own.
+    """
+    return _partition_stranded(directory, counts)[1]
 
 
 def _stranded_detail(persona, directory, counts):
@@ -3051,10 +3153,24 @@ def _stranded_detail(persona, directory, counts):
                  if d and d != persona and d.casefold() == persona.casefold()), None)
     if twin is not None:
         return "%s (%s unread; case-variant of known persona %r)" % (persona, counts.get(persona), twin)
-    if persona in set(directory) and _PERSONA_MEMORY_COUNTS.get(persona) == 0:
+    in_dir = persona in set(directory)
+    if in_dir and _PERSONA_READ_COUNTS.get(persona) == 0 and _PERSONA_RETIRED.get(persona) is True:
+        return ("%s (%s unread; never consumed (read 0) and declared retired, so it is clearable debris)"
+                % (persona, counts.get(persona)))
+    if in_dir and _PERSONA_MEMORY_COUNTS.get(persona) == 0:
         return "%s (%s unread; registered as a recipient but owns no memories, so nobody works as it)" % (
             persona, counts.get(persona))
     return "%s (%s unread)" % (persona, counts.get(persona))
+
+
+def _dormant_detail(persona, counts):
+    """Describe one DORMANT inbox: a real member never observed reading it. Quiet, not an alarm.
+
+    Deliberately does NOT diagnose it as clearable - a dormant inbox is a live persona that simply is not
+    reading here, the opposite of debris, and mislabelling it would invite deleting a real member's mail.
+    """
+    return "%s (%s unread; in the directory but never consumed (read 0), not declared retired)" % (
+        persona, counts.get(persona))
 
 
 def report_stranded_inboxes(directory, counts, targets, emitter):
@@ -3076,18 +3192,33 @@ def report_stranded_inboxes(directory, counts, targets, emitter):
     """
     if not directory:
         return []   # unknown directory: alarming would flag EVERY persona. No data is not evidence of a fault.
-    current = stranded_inboxes(directory, counts)
-    # RELEASE the suppression for anything no longer stranded, so the alarm can fire AGAIN if that inbox
-    # is later re-stranded. Suppressing for the process lifetime made "reported once" mean "reported once
-    # ever", which silently contradicted the documented self-clearing behaviour: an inbox that was rescued
-    # and then stranded a second time would never be announced.
+    loud, dormant = _partition_stranded(directory, counts)
+    # RELEASE the suppression for anything no longer in its tier, so the signal can fire AGAIN if that inbox
+    # is later re-stranded / re-dormant. Suppressing for the process lifetime made "reported once" mean
+    # "reported once ever", which silently contradicted the documented self-clearing behaviour: an inbox
+    # that was rescued and then stranded a second time would never be announced.
     #
     # Keyed EXACTLY, not casefolded - the same asymmetry as stranded_inboxes() itself. The server's inbox
     # namespace is case-sensitive, so 'Claude-chat' and 'claude-chat' are DIFFERENT inboxes; sharing one
     # suppression key between them lets either one hold the other's alarm down.
-    _REPORTED_STRANDED.intersection_update(current)
-    fresh = [p for p in current if p not in _REPORTED_STRANDED]
+    _REPORTED_STRANDED.intersection_update(loud)
+    _REPORTED_DORMANT.intersection_update(dormant)
+    fresh = [p for p in loud if p not in _REPORTED_STRANDED]
+    fresh_dormant = [p for p in dormant if p not in _REPORTED_DORMANT]
+
+    # DORMANT tier (real-but-idle members, not declared retired): recorded QUIETLY and independently of the
+    # loud alarm. A stderr NOTICE is a non-waking channel (the event-stream grep filters new|alert|recovered,
+    # which stderr is not), so a dormant inbox is put on the record without ever waking an agent - and this
+    # happens whether or not any loud inbox exists this tick. Once per inbox, exactly like the loud tier.
+    for persona in fresh_dormant:
+        _REPORTED_DORMANT.add(persona)
+        sys.stderr.write(
+            "kijito-inbox-monitor: NOTICE dormant inbox (quiet, not alarmed) - %s (further notices for %r "
+            "suppressed)\n" % (_dormant_detail(persona, counts), persona))
+
     if not fresh:
+        # The DORMANT tier NEVER fires the loud alert on its own - that is the whole point of the split.
+        # It has already been recorded on stderr above; there is no loud debris/unknown inbox to announce.
         return []
     for persona in fresh:
         _REPORTED_STRANDED.add(persona)
@@ -3096,11 +3227,18 @@ def report_stranded_inboxes(directory, counts, targets, emitter):
             "mail (further reports for %r suppressed)\n" % (_stranded_detail(persona, directory, counts), persona))
     detail = ", ".join(_stranded_detail(p, directory, counts) for p in fresh)
     # Same routing rule as the urgent-unanswered alarm (§5.6) - one predicate for "is anyone there",
-    # because two would drift apart and disagree about the same inbox.
+    # because two would drift apart and disagree about the same inbox. The freshly-detected dormant inboxes
+    # ride along as an INFORMATIONAL `dormant_inboxes` field: consumers already filtering `alert` see them
+    # without being rearmed, but they never caused this alert to fire (only `fresh` loud did).
+    # Attach the informational field ONLY when there is something to say - an absent field means "no
+    # statement", the same tri-state discipline the exec layer relies on ("absent fields are simply
+    # omitted, not defaulted"), so an empty dormant list is left off rather than shipped as [].
+    extra = {"dormant_inboxes": list(fresh_dormant)} if fresh_dormant else {}
     for watcher in deliverable_watchers(directory, targets):
         emitter.lifecycle("alert", persona=watcher,
                           reason="stranded-mail: %d inbox(es) receiving mail nobody watches: %s" % (len(fresh), detail),
-                          stranded_inboxes=list(fresh))
+                          stranded_inboxes=list(fresh),
+                          **extra)
     return fresh
 
 

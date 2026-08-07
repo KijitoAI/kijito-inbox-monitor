@@ -2191,6 +2191,220 @@ class StrandedInboxTest(unittest.TestCase):
         self.assertEqual(sorted(events[0]["stranded_inboxes"]), ["all", "ghost", "typo"])
 
 
+class M167ReadCountPartitionTest(unittest.TestCase):
+    """M167: an in-directory inbox is stranded when it is NEVER CONSUMED (read == mail_total - unread == 0),
+    replacing the monotonic 'owns >=1 memory' proxy that permanently immunised typo-variants like 'rvier'.
+    The stranded set is PARTITIONED by the declared `retired` flag: retired==True is LOUD clearable debris
+    (rides the alert exactly as before), retired False/undeclared is QUIET dormant (a real idle member -
+    surfaced on stderr and as an informational field, never firing the loud alert on its own).
+    Prod `retired` is 0/29, so the module dicts are MOCKED here against the field shape river will populate.
+    """
+
+    class FakeTarget:
+        def __init__(self, persona):
+            self.persona = persona
+
+    class FakeEmitter:
+        def __init__(self):
+            self.events = []
+
+        def lifecycle(self, event, **fields):
+            self.events.append(dict(event=event, **fields))
+
+    def setUp(self):
+        # Save/restore ALL module state the partition reads or mutates, so seeding here cannot leak into
+        # any other test (order-dependent failures are the exact hazard the existing stranded tests note).
+        self._mem = dict(km._PERSONA_MEMORY_COUNTS)
+        self._read = dict(km._PERSONA_READ_COUNTS)
+        self._ret = dict(km._PERSONA_RETIRED)
+        self._rs = set(km._REPORTED_STRANDED)
+        self._rd = set(km._REPORTED_DORMANT)
+        for d in (km._PERSONA_MEMORY_COUNTS, km._PERSONA_READ_COUNTS, km._PERSONA_RETIRED):
+            d.clear()
+        km._REPORTED_STRANDED.clear()
+        km._REPORTED_DORMANT.clear()
+
+    def tearDown(self):
+        for d, saved in ((km._PERSONA_MEMORY_COUNTS, self._mem),
+                         (km._PERSONA_READ_COUNTS, self._read),
+                         (km._PERSONA_RETIRED, self._ret)):
+            d.clear()
+            d.update(saved)
+        km._REPORTED_STRANDED.clear()
+        km._REPORTED_STRANDED.update(self._rs)
+        km._REPORTED_DORMANT.clear()
+        km._REPORTED_DORMANT.update(self._rd)
+
+    def _report(self, directory, counts, watchers):
+        em = self.FakeEmitter()
+        targets = [self.FakeTarget(p) for p in watchers]
+        buf, orig = __import__("io").StringIO(), km.sys.stderr
+        km.sys.stderr = buf
+        try:
+            fresh = km.report_stranded_inboxes(directory, counts, targets, em)
+        finally:
+            km.sys.stderr = orig
+        return fresh, em.events, buf.getvalue()
+
+    # --- helper-level tri-state, since read/retired both must degrade rather than guess -------------------
+    def test_row_read_count_is_mail_total_minus_unread(self):
+        self.assertEqual(km._row_read_count({"mail_total": 161, "unread": 0}), 161)
+        self.assertEqual(km._row_read_count({"mail_total": 3, "unread": 3}), 0)
+
+    def test_row_read_count_is_None_when_either_field_missing_never_zero(self):
+        self.assertIsNone(km._row_read_count({"unread": 0}))            # no mail_total
+        self.assertIsNone(km._row_read_count({"mail_total": 5}))        # no unread
+        self.assertIsNone(km._row_read_count({"mail_total": True, "unread": 0}))  # bool is not a count
+        self.assertIsNone(km._row_read_count({"mail_total": 2, "unread": 9}))     # negative -> unknown
+
+    def test_row_retired_is_a_strict_bool_or_None(self):
+        self.assertIs(km._row_retired({"retired": True}), True)
+        self.assertIs(km._row_retired({"retired": False}), False)
+        self.assertIsNone(km._row_retired({}))                 # undeclared
+        self.assertIsNone(km._row_retired({"retired": "yes"}))  # a string is not a declaration
+
+    # --- case 1: the exact defect. rvier owns 1 memory yet is never read AND is declared retired ---------
+    def test_rvier_read0_retired_is_LOUD_debris_even_though_it_owns_a_memory(self):
+        km._PERSONA_MEMORY_COUNTS.update({"river": 500, "rvier": 1})
+        km._PERSONA_READ_COUNTS.update({"river": 400, "rvier": 0})
+        km._PERSONA_RETIRED.update({"river": False, "rvier": True})
+        directory = ["river", "rvier", "argus"]
+        # the monotonic memory proxy (rvier owns 1) would have hidden it; read==0 exposes it
+        self.assertEqual(km.stranded_inboxes(directory, {"rvier": 1}), ["rvier"])
+        self.assertEqual(km.dormant_inboxes(directory, {"rvier": 1}), [])
+        fresh, events, err = self._report(directory, {"rvier": 1}, watchers=("argus",))
+        self.assertEqual(fresh, ["rvier"])
+        self.assertEqual(events[0]["event"], "alert")
+        self.assertEqual(events[0]["stranded_inboxes"], ["rvier"])
+        self.assertNotIn("dormant_inboxes", events[0])   # no dormant this tick
+        self.assertIn("clearable debris", err)
+
+    # --- case 2: omniview reads nothing but is NOT retired -> DORMANT/quiet, never loud -----------------
+    def test_omniview_read0_not_retired_is_QUIET_dormant_not_loud(self):
+        km._PERSONA_MEMORY_COUNTS.update({"omniview": 149, "argus": 40})
+        km._PERSONA_READ_COUNTS.update({"omniview": 0, "argus": 5})
+        km._PERSONA_RETIRED.update({"omniview": False, "argus": False})
+        directory = ["omniview", "argus"]
+        self.assertEqual(km.stranded_inboxes(directory, {"omniview": 7}), [])       # NOT loud
+        self.assertEqual(km.dormant_inboxes(directory, {"omniview": 7}), ["omniview"])
+        fresh, events, err = self._report(directory, {"omniview": 7}, watchers=("argus",))
+        self.assertEqual(fresh, [])                 # dormant alone fires NO loud alert
+        self.assertEqual(events, [])                # ... and emits NO alert event
+        self.assertIn("dormant inbox", err)         # ... but IS recorded on the quiet stderr channel
+        self.assertIn("not declared retired", err)
+
+    def test_undeclared_retired_is_treated_as_dormant_not_debris(self):
+        # retired missing entirely -> quiet, because declaring an inbox clearable on absent data is wrong.
+        km._PERSONA_MEMORY_COUNTS.update({"newish": 3})
+        km._PERSONA_READ_COUNTS.update({"newish": 0})
+        # deliberately no _PERSONA_RETIRED entry for 'newish'
+        directory = ["newish", "argus"]
+        self.assertEqual(km.stranded_inboxes(directory, {"newish": 2}), [])
+        self.assertEqual(km.dormant_inboxes(directory, {"newish": 2}), ["newish"])
+
+    def test_dormant_rides_a_real_alert_as_an_informational_field(self):
+        # When a loud debris/unknown inbox DOES fire, freshly-detected dormant inboxes ride along on the
+        # same alert as an informational field, so consumers filtering `alert` still see them.
+        km._PERSONA_MEMORY_COUNTS.update({"omniview": 149, "rvier": 1, "argus": 40})
+        km._PERSONA_READ_COUNTS.update({"omniview": 0, "rvier": 0, "argus": 5})
+        km._PERSONA_RETIRED.update({"omniview": False, "rvier": True, "argus": False})
+        directory = ["omniview", "rvier", "river", "argus"]
+        fresh, events, _ = self._report(directory, {"rvier": 1, "omniview": 7}, watchers=("argus",))
+        self.assertEqual(fresh, ["rvier"])                       # only debris is loud
+        self.assertEqual(events[0]["stranded_inboxes"], ["rvier"])
+        self.assertEqual(events[0]["dormant_inboxes"], ["omniview"])  # dormant rides along, informational
+
+    # --- case 3: an actively-consumed inbox is not stranded at all (no false positive) -------------------
+    def test_actively_consumed_inbox_read_positive_is_never_flagged(self):
+        km._PERSONA_MEMORY_COUNTS.update({"river": 500})
+        km._PERSONA_READ_COUNTS.update({"river": 161})   # mail_total 161, unread 0
+        km._PERSONA_RETIRED.update({"river": False})
+        directory = ["river", "argus"]
+        self.assertEqual(km.stranded_inboxes(directory, {"river": 0}), [])   # 0 unread: skipped anyway
+        # even WITH unread, a positive read count means it is being consumed -> not stranded, not dormant
+        km._PERSONA_READ_COUNTS.update({"river": 160})
+        self.assertEqual(km.stranded_inboxes(directory, {"river": 1}), [])
+        self.assertEqual(km.dormant_inboxes(directory, {"river": 1}), [])
+
+    # --- case 4: signal 1 (not-in-directory) is unchanged, and needs no read data -----------------------
+    def test_not_in_directory_stays_loud_regardless_of_read_data(self):
+        km._PERSONA_MEMORY_COUNTS.update({"argus": 40})
+        km._PERSONA_READ_COUNTS.update({"argus": 5})
+        directory = ["argus", "river"]
+        self.assertEqual(km.stranded_inboxes(directory, {"all": 2}), ["all"])   # 'all' not in directory
+        self.assertEqual(km.dormant_inboxes(directory, {"all": 2}), [])
+        fresh, events, err = self._report(directory, {"all": 2}, watchers=("argus",))
+        self.assertEqual(fresh, ["all"])
+        self.assertIn("stranded mail", err)
+
+    # --- case 5: degradation. No read data -> fall back to the memory-count proxy, never crash ----------
+    def test_no_read_data_degrades_to_memory_count_loud_when_zero(self):
+        km._PERSONA_MEMORY_COUNTS.update({"husk": 0, "argus": 40})
+        # deliberately NO _PERSONA_READ_COUNTS entries -> read unknown for everyone
+        directory = ["husk", "argus"]
+        self.assertEqual(km.stranded_inboxes(directory, {"husk": 2}), ["husk"])  # old memory==0 behaviour
+        self.assertEqual(km.dormant_inboxes(directory, {"husk": 2}), [])
+
+    def test_no_read_data_degrades_to_memory_count_quiet_when_nonzero(self):
+        km._PERSONA_MEMORY_COUNTS.update({"vellum": 129})
+        directory = ["vellum", "argus"]
+        self.assertEqual(km.stranded_inboxes(directory, {"vellum": 6}), [])  # owns memories -> not flagged
+        self.assertEqual(km.dormant_inboxes(directory, {"vellum": 6}), [])
+
+    def test_no_read_data_and_unknown_memory_count_does_not_crash_and_flags_nothing(self):
+        km._PERSONA_MEMORY_COUNTS.update({"mystery": None})  # server said nothing about either signal
+        directory = ["mystery", "argus"]
+        self.assertEqual(km.stranded_inboxes(directory, {"mystery": 3}), [])
+        self.assertEqual(km.dormant_inboxes(directory, {"mystery": 3}), [])
+
+    # --- case 6: case-sensitivity preserved across the new read/retired axes ----------------------------
+    def test_case_sensitivity_Loom_and_loom_are_distinct_across_the_read_partition(self):
+        # 'loom' is a live, actively-read member; 'Loom' is a distinct case-variant never consumed.
+        km._PERSONA_MEMORY_COUNTS.update({"loom": 80, "Loom": 0, "argus": 40})
+        km._PERSONA_READ_COUNTS.update({"loom": 79, "Loom": 0})
+        km._PERSONA_RETIRED.update({"loom": False, "Loom": True})
+        directory = ["loom", "Loom", "argus"]
+        # 'Loom' read==0 retired -> loud debris; 'loom' read>0 -> not flagged. Keys never casefolded.
+        self.assertEqual(km.stranded_inboxes(directory, {"loom": 4, "Loom": 1}), ["Loom"])
+        self.assertEqual(km.dormant_inboxes(directory, {"loom": 4, "Loom": 1}), [])
+
+    # --- case 7: _REPORTED_STRANDED / _REPORTED_DORMANT still suppress a second report -------------------
+    def test_debris_report_is_suppressed_after_the_first(self):
+        km._PERSONA_MEMORY_COUNTS.update({"rvier": 1, "argus": 40})
+        km._PERSONA_READ_COUNTS.update({"rvier": 0})
+        km._PERSONA_RETIRED.update({"rvier": True})
+        directory = ["rvier", "river", "argus"]
+        first, ev1, _ = self._report(directory, {"rvier": 1}, watchers=("argus",))
+        second, ev2, err2 = self._report(directory, {"rvier": 1}, watchers=("argus",))
+        self.assertEqual(first, ["rvier"])
+        self.assertEqual(second, [])       # once per process, not once per tick
+        self.assertEqual(ev2, [])
+        self.assertEqual(err2, "")
+
+    def test_dormant_notice_is_suppressed_after_the_first(self):
+        km._PERSONA_MEMORY_COUNTS.update({"omniview": 149, "argus": 40})
+        km._PERSONA_READ_COUNTS.update({"omniview": 0})
+        km._PERSONA_RETIRED.update({"omniview": False})
+        directory = ["omniview", "argus"]
+        _, _, err1 = self._report(directory, {"omniview": 7}, watchers=("argus",))
+        _, _, err2 = self._report(directory, {"omniview": 7}, watchers=("argus",))
+        self.assertIn("dormant inbox", err1)
+        self.assertEqual(err2, "")         # quiet channel is also once-per-inbox, no per-tick spam
+
+    def test_dormant_suppression_releases_so_a_later_re_dormancy_is_surfaced_again(self):
+        km._PERSONA_MEMORY_COUNTS.update({"omniview": 149, "argus": 40})
+        km._PERSONA_READ_COUNTS.update({"omniview": 0})
+        km._PERSONA_RETIRED.update({"omniview": False})
+        directory = ["omniview", "argus"]
+        _, _, err1 = self._report(directory, {"omniview": 7}, watchers=("argus",))
+        self.assertIn("dormant inbox", err1)
+        # rescued: the mail is consumed, so it is no longer dormant this tick ...
+        _, _, _ = self._report(directory, {}, watchers=("argus",))
+        # ... and now it is dormant AGAIN. It must be surfaced again, not held down forever.
+        _, _, err3 = self._report(directory, {"omniview": 2}, watchers=("argus",))
+        self.assertIn("dormant inbox", err3)
+
+
 class ExecEnvTest(unittest.TestCase):
     """--exec is the portable primitive, so every field the NDJSON carries must reach a shell consumer."""
 
@@ -2215,6 +2429,13 @@ class ExecEnvTest(unittest.TestCase):
                              "reason": "stranded-mail: ...", "stranded_inboxes": ["Claude-chat", "all"]})
         self.assertEqual(env["KIJITOMON_STRANDED"], "Claude-chat,all")
         self.assertNotIn("[", env["KIJITOMON_STRANDED"])   # "['Claude-chat', 'all']" is unusable in $VAR
+
+    def test_dormant_list_reaches_exec_comma_separated_like_the_stranded_list(self):
+        env = self._env_for({"event": "alert", "source": "kijito-inbox", "ts": "t", "persona": "argus",
+                             "reason": "stranded-mail: ...", "stranded_inboxes": ["rvier"],
+                             "dormant_inboxes": ["omniview", "sterling"]})
+        self.assertEqual(env["KIJITOMON_DORMANT"], "omniview,sterling")
+        self.assertNotIn("[", env["KIJITOMON_DORMANT"])
 
     def test_absent_fields_are_simply_omitted_not_defaulted_or_fatal(self):
         env = self._env_for({"event": "alert", "source": "kijito-inbox", "ts": "t", "persona": "argus",
