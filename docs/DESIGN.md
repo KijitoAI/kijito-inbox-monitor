@@ -295,7 +295,12 @@ One object per line; every event carries `event`, `source`, `ts` (emit-time UTC 
 {"event":"replay_capped","source":"kijito-inbox","ts":"<iso>","capped_to":539,"dropped":389}      # backlog > --max-replay (§7.0)
 ```
 - `new` carries `id`, `from`, `content`, `created`. `content` is a silent hard cut to `--content-chars` (default 220),
-  with no marker; or it is omitted with `--no-content`. `seconds` in `alert` is nominal (`consecutive_failures × poll_seconds`).
+  with no marker; or it is omitted with `--no-content`. `seconds` in `alert` is **config-derived, not a measurement**:
+  it is exactly `consecutive_failures * poll_seconds` (a function of two flags), while the failure path backs off
+  exponentially from 1 s and detection can lag inside a `--wait` long-poll, so it does not equal the outage duration
+  and is routinely off by more than an order of magnitude (e.g. `seconds:90` observed against a measured ~48 s outage).
+  Do NOT back-date onset as `ts - seconds`. A measured-monotonic replacement (stamp the first failure, subtract) is
+  queued; the row already carries `emitted.monotonic` for it.
 - **Within-poll emit order (deterministic, total):** `alert`/`recovered` (FSM edge), then `replay_capped`/`seed_ahead`,
   then `armed`, then `new` (ascending id), then `heartbeat`. So `armed`/`recovered` set `cursor` before any `new`/`heartbeat`
   in the same cycle, which means `recovered.cursor` is non-null whenever a baseline has occurred (a `recovered` on a poll
