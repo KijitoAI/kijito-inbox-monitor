@@ -2302,6 +2302,22 @@ class M167ReadCountPartitionTest(unittest.TestCase):
         self.assertEqual(km.stranded_inboxes(directory, {"newish": 2}), [])
         self.assertEqual(km.dormant_inboxes(directory, {"newish": 2}), ["newish"])
 
+    def test_absent_retired_read0_is_dormant_at_the_report_layer_not_loud(self):
+        # REDUNDANT coverage for the fail-open direction (assay cert note 5074: this invariant was held by
+        # exactly one test). Treating an ABSENT `retired` as True would loudly declare a real inbox
+        # clearable on NO evidence. Asserted here at the REPORT layer (alert event + stderr) with a
+        # different persona - a distinct angle from the unit-level dormant_inboxes() test above, so a
+        # mutation of the retired guard (None -> loud) fails on more than one axis.
+        km._PERSONA_MEMORY_COUNTS.update({"quietone": 12, "argus": 40})
+        km._PERSONA_READ_COUNTS.update({"quietone": 0})
+        # deliberately NO _PERSONA_RETIRED entry for 'quietone' -> undeclared
+        directory = ["quietone", "argus"]
+        fresh, events, err = self._report(directory, {"quietone": 3}, watchers=("argus",))
+        self.assertEqual(fresh, [])                 # not loud
+        self.assertEqual(events, [])                # no alert event fires
+        self.assertIn("dormant inbox", err)         # recorded only on the quiet channel
+        self.assertIn("quietone", err)
+
     def test_dormant_rides_a_real_alert_as_an_informational_field(self):
         # When a loud debris/unknown inbox DOES fire, freshly-detected dormant inboxes ride along on the
         # same alert as an informational field, so consumers filtering `alert` still see them.
@@ -2356,6 +2372,29 @@ class M167ReadCountPartitionTest(unittest.TestCase):
         directory = ["mystery", "argus"]
         self.assertEqual(km.stranded_inboxes(directory, {"mystery": 3}), [])
         self.assertEqual(km.dormant_inboxes(directory, {"mystery": 3}), [])
+
+    def test_unknown_read_with_retired_true_is_not_loud_because_read_is_unknown(self):
+        # REDUNDANT coverage for the unknown-read degradation invariant (assay cert note 5074). Treating an
+        # UNKNOWN read as 0 would let a persona reach the read==0 retired partition and, being retired,
+        # fire LOUD. It must not: with no read data we do not KNOW the inbox is unconsumed, so it degrades
+        # to the memory-count proxy and `retired` is irrelevant. memory>0 here => nothing flagged.
+        km._PERSONA_MEMORY_COUNTS.update({"ghost": 5, "argus": 40})
+        km._PERSONA_RETIRED.update({"ghost": True})       # declared retired ...
+        # ... but deliberately NO _PERSONA_READ_COUNTS entry for 'ghost' -> read unknown
+        directory = ["ghost", "argus"]
+        self.assertEqual(km.stranded_inboxes(directory, {"ghost": 4}), [])   # NOT loud despite retired=True
+        self.assertEqual(km.dormant_inboxes(directory, {"ghost": 4}), [])
+
+    def test_unknown_read_with_retired_true_and_zero_memory_is_loud_via_proxy_not_partition(self):
+        # The complementary half: unknown read + memory==0 IS loud, but via the OLD memory proxy, NOT the
+        # read==0 retired partition (which it never reaches). Pins that the degrade branch decided it - so
+        # a mutation reading unknown-as-0 changes WHICH branch fires and trips this too, giving the
+        # invariant its second independent kill.
+        km._PERSONA_MEMORY_COUNTS.update({"shell": 0, "argus": 40})
+        km._PERSONA_RETIRED.update({"shell": True})
+        directory = ["shell", "argus"]
+        self.assertEqual(km.stranded_inboxes(directory, {"shell": 4}), ["shell"])  # loud via memory==0
+        self.assertEqual(km.dormant_inboxes(directory, {"shell": 4}), [])
 
     # --- case 6: case-sensitivity preserved across the new read/retired axes ----------------------------
     def test_case_sensitivity_Loom_and_loom_are_distinct_across_the_read_partition(self):
