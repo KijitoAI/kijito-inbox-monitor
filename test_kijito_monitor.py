@@ -2217,9 +2217,10 @@ class M167ReadCountPartitionTest(unittest.TestCase):
         self._mem = dict(km._PERSONA_MEMORY_COUNTS)
         self._read = dict(km._PERSONA_READ_COUNTS)
         self._ret = dict(km._PERSONA_RETIRED)
+        self._wo = dict(km._PERSONA_WRITE_ONLY)
         self._rs = set(km._REPORTED_STRANDED)
         self._rd = set(km._REPORTED_DORMANT)
-        for d in (km._PERSONA_MEMORY_COUNTS, km._PERSONA_READ_COUNTS, km._PERSONA_RETIRED):
+        for d in (km._PERSONA_MEMORY_COUNTS, km._PERSONA_READ_COUNTS, km._PERSONA_RETIRED, km._PERSONA_WRITE_ONLY):
             d.clear()
         km._REPORTED_STRANDED.clear()
         km._REPORTED_DORMANT.clear()
@@ -2227,7 +2228,8 @@ class M167ReadCountPartitionTest(unittest.TestCase):
     def tearDown(self):
         for d, saved in ((km._PERSONA_MEMORY_COUNTS, self._mem),
                          (km._PERSONA_READ_COUNTS, self._read),
-                         (km._PERSONA_RETIRED, self._ret)):
+                         (km._PERSONA_RETIRED, self._ret),
+                         (km._PERSONA_WRITE_ONLY, self._wo)):
             d.clear()
             d.update(saved)
         km._REPORTED_STRANDED.clear()
@@ -2262,6 +2264,69 @@ class M167ReadCountPartitionTest(unittest.TestCase):
         self.assertIs(km._row_retired({"retired": False}), False)
         self.assertIsNone(km._row_retired({}))                 # undeclared
         self.assertIsNone(km._row_retired({"retired": "yes"}))  # a string is not a declaration
+
+    # --- write_only: the human's own inbox is undrained BY DESIGN, never loud (assay ruling 5238/5240) ---
+    def test_row_write_only_is_a_strict_bool_or_None(self):
+        self.assertIs(km._row_write_only({"write_only": True}), True)
+        self.assertIs(km._row_write_only({"write_only": False}), False)
+        self.assertIsNone(km._row_write_only({}))                     # undeclared
+        self.assertIsNone(km._row_write_only({"write_only": "yes"}))  # a string is not a declaration
+
+    def test_jason_write_only_is_QUIET_even_with_unknown_read_and_zero_memory(self):
+        # THE DEFECT cadence found (5232): jason is in the directory, owns no memories, and the server
+        # reports no read data -> the memory-count PROXY flagged him LOUD every tick. write_only declares
+        # the box undrained by design, so he must be DORMANT/quiet regardless of the proxy.
+        km._PERSONA_MEMORY_COUNTS.update({"jason": 0, "argus": 40})   # 0 memories -> proxy would say LOUD
+        km._PERSONA_READ_COUNTS.update({"argus": 5})                  # NO jason entry -> read UNKNOWN (live shape)
+        km._PERSONA_WRITE_ONLY.update({"jason": True, "argus": False})
+        directory = ["jason", "argus"]
+        self.assertEqual(km.stranded_inboxes(directory, {"jason": 30}), [])         # NOT loud
+        self.assertEqual(km.dormant_inboxes(directory, {"jason": 30}), ["jason"])   # quiet
+        fresh, events, err = self._report(directory, {"jason": 30}, watchers=("argus",))
+        self.assertEqual(fresh, [])
+        self.assertEqual(events, [])                        # no loud alert event
+        self.assertIn("write_only", err)                   # named on the quiet stderr channel
+        self.assertIn("undrained BY DESIGN", err)
+
+    def test_absent_write_only_leaves_the_proxy_behaviour_unchanged(self):
+        # GRACEFUL DEGRADATION: with no write_only declaration (the state until river's API PR lands),
+        # jason still classifies exactly as before -> LOUD via the proxy. Proves shipping the producer
+        # ahead of the API populates is a no-op, mirroring how `retired` shipped.
+        km._PERSONA_MEMORY_COUNTS.update({"jason": 0, "argus": 40})
+        km._PERSONA_READ_COUNTS.update({"argus": 5})       # jason read UNKNOWN
+        # deliberately NO _PERSONA_WRITE_ONLY entry for jason
+        directory = ["jason", "argus"]
+        self.assertEqual(km.stranded_inboxes(directory, {"jason": 30}), ["jason"])  # unchanged: LOUD via proxy
+        self.assertEqual(km.dormant_inboxes(directory, {"jason": 30}), [])
+
+    def test_write_only_is_quiet_even_when_read_is_zero(self):
+        # write_only is checked BEFORE read, so a KNOWN read==0 write_only member is still quiet (its
+        # read==0 is the designed steady state), never riding the retired/loud path.
+        km._PERSONA_MEMORY_COUNTS.update({"human": 0, "argus": 1})
+        km._PERSONA_READ_COUNTS.update({"human": 0, "argus": 2})       # KNOWN read 0
+        km._PERSONA_WRITE_ONLY.update({"human": True, "argus": False})
+        directory = ["human", "argus"]
+        self.assertEqual(km.stranded_inboxes(directory, {"human": 4}), [])
+        self.assertEqual(km.dormant_inboxes(directory, {"human": 4}), ["human"])
+
+    def test_write_only_does_not_rescue_a_name_absent_from_the_directory(self):
+        # signal-1 (name not in the directory) is checked FIRST, so a write_only flag can never silence a
+        # phantom/typo inbox that nobody owns. write_only quiets a REAL member, not an unknown name.
+        km._PERSONA_WRITE_ONLY.update({"ghosttypo": True})
+        directory = ["argus"]                              # ghosttypo is NOT in it
+        self.assertEqual(km.stranded_inboxes(directory, {"ghosttypo": 3}), ["ghosttypo"])  # still LOUD
+        self.assertEqual(km.dormant_inboxes(directory, {"ghosttypo": 3}), [])
+
+    def test_write_only_precedes_retired_so_a_contradictory_row_stays_quiet(self):
+        # jason is write_only and NOT retired (live, not debris). A row declared BOTH is a contradiction
+        # the API should never emit, but write_only is checked first -> quiet. Document the precedence.
+        km._PERSONA_MEMORY_COUNTS.update({"weird": 0, "argus": 1})
+        km._PERSONA_READ_COUNTS.update({"weird": 0, "argus": 2})
+        km._PERSONA_WRITE_ONLY.update({"weird": True, "argus": False})
+        km._PERSONA_RETIRED.update({"weird": True, "argus": False})    # contradictory input, tests precedence
+        directory = ["weird", "argus"]
+        self.assertEqual(km.dormant_inboxes(directory, {"weird": 2}), ["weird"])  # write_only wins -> quiet
+        self.assertEqual(km.stranded_inboxes(directory, {"weird": 2}), [])
 
     # --- case 1: the exact defect. rvier owns 1 memory yet is never read AND is declared retired ---------
     def test_rvier_read0_retired_is_LOUD_debris_even_though_it_owns_a_memory(self):

@@ -323,6 +323,15 @@ _PERSONA_READ_COUNTS = {}
 # direction. A boolean, never a threshold.
 _PERSONA_RETIRED = {}
 
+# Declared `write_only` flag per persona from /api/personas. TRUE = an inbox that is undrained BY DESIGN:
+# a real member whose mail is consumed through another surface (a human reading sessions/digests, never
+# the box itself - `jason` is the live case), so read==0 is expected forever and must NEVER alarm. This
+# is a FACT the API declares, not a policy: the classifier derives the alarm tier from it (write_only =>
+# quiet), so if alarm policy ever changes the fact stays true. It is INDEPENDENT of `retired` - a
+# write_only inbox is live, the opposite of clearable debris. None/absent => treated as not-write-only,
+# so the producer can ship before the API populates the field with zero behaviour change. A boolean.
+_PERSONA_WRITE_ONLY = {}
+
 
 def _row_memory_count(row):
     """Memories owned by this persona, or None if the server did not say.
@@ -366,6 +375,18 @@ def _row_retired(row):
     return r if isinstance(r, bool) else None
 
 
+def _row_write_only(row):
+    """The persona's declared `write_only` flag as a strict bool, or None if the server did not report it.
+
+    Same tri-state discipline as _row_retired: only a genuine bool is a declaration; absent/null/a string
+    is None = undeclared, which the partition treats as NOT write-only (no suppression). Quieting an inbox
+    that holds unread mail must rest on a POSITIVE declaration that it is undrained by design, never on the
+    absence of one - the mirror of the retired rule, so an absent field can never silence a real backlog.
+    """
+    w = row.get("write_only")
+    return w if isinstance(w, bool) else None
+
+
 def fetch_personas(opener, headers):
     """Fetch the account persona directory for default/explicit all-persona mode."""
     req = urllib.request.Request(PERSONAS_URL, headers=headers, method="GET")
@@ -388,6 +409,7 @@ def fetch_personas(opener, headers):
             _PERSONA_MEMORY_COUNTS[row["persona"]] = _row_memory_count(row)
             _PERSONA_READ_COUNTS[row["persona"]] = _row_read_count(row)
             _PERSONA_RETIRED[row["persona"]] = _row_retired(row)
+            _PERSONA_WRITE_ONLY[row["persona"]] = _row_write_only(row)
     if not personas:
         raise FatalConfig("/api/personas returned no personas")
     return personas
@@ -3097,14 +3119,20 @@ def stranded_inboxes(directory, counts):
 def _partition_stranded(directory, counts):
     """Split inboxes-holding-unread into (loud, dormant). Single classifier so the two tiers cannot drift.
 
-    For each inbox with unread mail:
+    For each inbox with unread mail (checked in this order):
       - name not in the directory                         -> LOUD  (signal 1, unchanged)
+      - in directory, write_only is True                  -> DORMANT (undrained by design; always quiet)
       - in directory, read data UNKNOWN, memory_count==0  -> LOUD  (degrade to the original proxy)
       - in directory, read > 0                            -> not stranded (actively consumed)
       - in directory, read == 0, retired is True          -> LOUD  (declared clearable debris)
       - in directory, read == 0, retired False/undeclared -> DORMANT (real-but-idle; quiet)
     read = mail_total - unread, both from the /api/personas row via _PERSONA_READ_COUNTS. Compared and
     classified EXACTLY, never casefolded - the same case-sensitivity invariant as the rest of this check.
+    write_only is checked BEFORE read, because an undrained-by-design inbox is quiet regardless of its
+    read count - its read==0 (or unknown read) is the EXPECTED steady state, not evidence of a fault.
+    That is the fix for a live member whose box the proxy would otherwise flag LOUD: the human's own
+    inbox `jason`, in the directory with unknown read and zero memories, was riding the loud alarm every
+    tick until write_only declared it undrained-by-design. FACT declared by the API, policy derived here.
     """
     known = {p for p in directory if p}
     loud, dormant = [], []
@@ -3113,6 +3141,9 @@ def _partition_stranded(directory, counts):
             continue
         if p not in known:
             loud.append(p)                       # signal 1: no owner in the directory
+            continue
+        if _PERSONA_WRITE_ONLY.get(p) is True:
+            dormant.append(p)                    # undrained BY DESIGN (the human's box) -> always quiet, any read
             continue
         read = _PERSONA_READ_COUNTS.get(p)
         if read is None:
@@ -3168,7 +3199,11 @@ def _dormant_detail(persona, counts):
 
     Deliberately does NOT diagnose it as clearable - a dormant inbox is a live persona that simply is not
     reading here, the opposite of debris, and mislabelling it would invite deleting a real member's mail.
+    A write_only member is named as such: its read==0 is by design, not merely unobserved.
     """
+    if _PERSONA_WRITE_ONLY.get(persona) is True:
+        return "%s (%s unread; in the directory and declared write_only - undrained BY DESIGN (drained via another surface), never debris)" % (
+            persona, counts.get(persona))
     return "%s (%s unread; in the directory but never consumed (read 0), not declared retired)" % (
         persona, counts.get(persona))
 
