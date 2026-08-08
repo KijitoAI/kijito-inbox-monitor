@@ -2191,6 +2191,259 @@ class StrandedInboxTest(unittest.TestCase):
         self.assertEqual(sorted(events[0]["stranded_inboxes"]), ["all", "ghost", "typo"])
 
 
+class M167ReadCountPartitionTest(unittest.TestCase):
+    """M167: an in-directory inbox is stranded when it is NEVER CONSUMED (read == mail_total - unread == 0),
+    replacing the monotonic 'owns >=1 memory' proxy that permanently immunised typo-variants like 'rvier'.
+    The stranded set is PARTITIONED by the declared `retired` flag: retired==True is LOUD clearable debris
+    (rides the alert exactly as before), retired False/undeclared is QUIET dormant (a real idle member -
+    surfaced on stderr and as an informational field, never firing the loud alert on its own).
+    Prod `retired` is 0/29, so the module dicts are MOCKED here against the field shape river will populate.
+    """
+
+    class FakeTarget:
+        def __init__(self, persona):
+            self.persona = persona
+
+    class FakeEmitter:
+        def __init__(self):
+            self.events = []
+
+        def lifecycle(self, event, **fields):
+            self.events.append(dict(event=event, **fields))
+
+    def setUp(self):
+        # Save/restore ALL module state the partition reads or mutates, so seeding here cannot leak into
+        # any other test (order-dependent failures are the exact hazard the existing stranded tests note).
+        self._mem = dict(km._PERSONA_MEMORY_COUNTS)
+        self._read = dict(km._PERSONA_READ_COUNTS)
+        self._ret = dict(km._PERSONA_RETIRED)
+        self._rs = set(km._REPORTED_STRANDED)
+        self._rd = set(km._REPORTED_DORMANT)
+        for d in (km._PERSONA_MEMORY_COUNTS, km._PERSONA_READ_COUNTS, km._PERSONA_RETIRED):
+            d.clear()
+        km._REPORTED_STRANDED.clear()
+        km._REPORTED_DORMANT.clear()
+
+    def tearDown(self):
+        for d, saved in ((km._PERSONA_MEMORY_COUNTS, self._mem),
+                         (km._PERSONA_READ_COUNTS, self._read),
+                         (km._PERSONA_RETIRED, self._ret)):
+            d.clear()
+            d.update(saved)
+        km._REPORTED_STRANDED.clear()
+        km._REPORTED_STRANDED.update(self._rs)
+        km._REPORTED_DORMANT.clear()
+        km._REPORTED_DORMANT.update(self._rd)
+
+    def _report(self, directory, counts, watchers):
+        em = self.FakeEmitter()
+        targets = [self.FakeTarget(p) for p in watchers]
+        buf, orig = __import__("io").StringIO(), km.sys.stderr
+        km.sys.stderr = buf
+        try:
+            fresh = km.report_stranded_inboxes(directory, counts, targets, em)
+        finally:
+            km.sys.stderr = orig
+        return fresh, em.events, buf.getvalue()
+
+    # --- helper-level tri-state, since read/retired both must degrade rather than guess -------------------
+    def test_row_read_count_is_mail_total_minus_unread(self):
+        self.assertEqual(km._row_read_count({"mail_total": 161, "unread": 0}), 161)
+        self.assertEqual(km._row_read_count({"mail_total": 3, "unread": 3}), 0)
+
+    def test_row_read_count_is_None_when_either_field_missing_never_zero(self):
+        self.assertIsNone(km._row_read_count({"unread": 0}))            # no mail_total
+        self.assertIsNone(km._row_read_count({"mail_total": 5}))        # no unread
+        self.assertIsNone(km._row_read_count({"mail_total": True, "unread": 0}))  # bool is not a count
+        self.assertIsNone(km._row_read_count({"mail_total": 2, "unread": 9}))     # negative -> unknown
+
+    def test_row_retired_is_a_strict_bool_or_None(self):
+        self.assertIs(km._row_retired({"retired": True}), True)
+        self.assertIs(km._row_retired({"retired": False}), False)
+        self.assertIsNone(km._row_retired({}))                 # undeclared
+        self.assertIsNone(km._row_retired({"retired": "yes"}))  # a string is not a declaration
+
+    # --- case 1: the exact defect. rvier owns 1 memory yet is never read AND is declared retired ---------
+    def test_rvier_read0_retired_is_LOUD_debris_even_though_it_owns_a_memory(self):
+        km._PERSONA_MEMORY_COUNTS.update({"river": 500, "rvier": 1})
+        km._PERSONA_READ_COUNTS.update({"river": 400, "rvier": 0})
+        km._PERSONA_RETIRED.update({"river": False, "rvier": True})
+        directory = ["river", "rvier", "argus"]
+        # the monotonic memory proxy (rvier owns 1) would have hidden it; read==0 exposes it
+        self.assertEqual(km.stranded_inboxes(directory, {"rvier": 1}), ["rvier"])
+        self.assertEqual(km.dormant_inboxes(directory, {"rvier": 1}), [])
+        fresh, events, err = self._report(directory, {"rvier": 1}, watchers=("argus",))
+        self.assertEqual(fresh, ["rvier"])
+        self.assertEqual(events[0]["event"], "alert")
+        self.assertEqual(events[0]["stranded_inboxes"], ["rvier"])
+        self.assertNotIn("dormant_inboxes", events[0])   # no dormant this tick
+        self.assertIn("clearable debris", err)
+
+    # --- case 2: omniview reads nothing but is NOT retired -> DORMANT/quiet, never loud -----------------
+    def test_omniview_read0_not_retired_is_QUIET_dormant_not_loud(self):
+        km._PERSONA_MEMORY_COUNTS.update({"omniview": 149, "argus": 40})
+        km._PERSONA_READ_COUNTS.update({"omniview": 0, "argus": 5})
+        km._PERSONA_RETIRED.update({"omniview": False, "argus": False})
+        directory = ["omniview", "argus"]
+        self.assertEqual(km.stranded_inboxes(directory, {"omniview": 7}), [])       # NOT loud
+        self.assertEqual(km.dormant_inboxes(directory, {"omniview": 7}), ["omniview"])
+        fresh, events, err = self._report(directory, {"omniview": 7}, watchers=("argus",))
+        self.assertEqual(fresh, [])                 # dormant alone fires NO loud alert
+        self.assertEqual(events, [])                # ... and emits NO alert event
+        self.assertIn("dormant inbox", err)         # ... but IS recorded on the quiet stderr channel
+        self.assertIn("not declared retired", err)
+
+    def test_undeclared_retired_is_treated_as_dormant_not_debris(self):
+        # retired missing entirely -> quiet, because declaring an inbox clearable on absent data is wrong.
+        km._PERSONA_MEMORY_COUNTS.update({"newish": 3})
+        km._PERSONA_READ_COUNTS.update({"newish": 0})
+        # deliberately no _PERSONA_RETIRED entry for 'newish'
+        directory = ["newish", "argus"]
+        self.assertEqual(km.stranded_inboxes(directory, {"newish": 2}), [])
+        self.assertEqual(km.dormant_inboxes(directory, {"newish": 2}), ["newish"])
+
+    def test_absent_retired_read0_is_dormant_at_the_report_layer_not_loud(self):
+        # REDUNDANT coverage for the fail-open direction (assay cert note 5074: this invariant was held by
+        # exactly one test). Treating an ABSENT `retired` as True would loudly declare a real inbox
+        # clearable on NO evidence. Asserted here at the REPORT layer (alert event + stderr) with a
+        # different persona - a distinct angle from the unit-level dormant_inboxes() test above, so a
+        # mutation of the retired guard (None -> loud) fails on more than one axis.
+        km._PERSONA_MEMORY_COUNTS.update({"quietone": 12, "argus": 40})
+        km._PERSONA_READ_COUNTS.update({"quietone": 0})
+        # deliberately NO _PERSONA_RETIRED entry for 'quietone' -> undeclared
+        directory = ["quietone", "argus"]
+        fresh, events, err = self._report(directory, {"quietone": 3}, watchers=("argus",))
+        self.assertEqual(fresh, [])                 # not loud
+        self.assertEqual(events, [])                # no alert event fires
+        self.assertIn("dormant inbox", err)         # recorded only on the quiet channel
+        self.assertIn("quietone", err)
+
+    def test_dormant_rides_a_real_alert_as_an_informational_field(self):
+        # When a loud debris/unknown inbox DOES fire, freshly-detected dormant inboxes ride along on the
+        # same alert as an informational field, so consumers filtering `alert` still see them.
+        km._PERSONA_MEMORY_COUNTS.update({"omniview": 149, "rvier": 1, "argus": 40})
+        km._PERSONA_READ_COUNTS.update({"omniview": 0, "rvier": 0, "argus": 5})
+        km._PERSONA_RETIRED.update({"omniview": False, "rvier": True, "argus": False})
+        directory = ["omniview", "rvier", "river", "argus"]
+        fresh, events, _ = self._report(directory, {"rvier": 1, "omniview": 7}, watchers=("argus",))
+        self.assertEqual(fresh, ["rvier"])                       # only debris is loud
+        self.assertEqual(events[0]["stranded_inboxes"], ["rvier"])
+        self.assertEqual(events[0]["dormant_inboxes"], ["omniview"])  # dormant rides along, informational
+
+    # --- case 3: an actively-consumed inbox is not stranded at all (no false positive) -------------------
+    def test_actively_consumed_inbox_read_positive_is_never_flagged(self):
+        km._PERSONA_MEMORY_COUNTS.update({"river": 500})
+        km._PERSONA_READ_COUNTS.update({"river": 161})   # mail_total 161, unread 0
+        km._PERSONA_RETIRED.update({"river": False})
+        directory = ["river", "argus"]
+        self.assertEqual(km.stranded_inboxes(directory, {"river": 0}), [])   # 0 unread: skipped anyway
+        # even WITH unread, a positive read count means it is being consumed -> not stranded, not dormant
+        km._PERSONA_READ_COUNTS.update({"river": 160})
+        self.assertEqual(km.stranded_inboxes(directory, {"river": 1}), [])
+        self.assertEqual(km.dormant_inboxes(directory, {"river": 1}), [])
+
+    # --- case 4: signal 1 (not-in-directory) is unchanged, and needs no read data -----------------------
+    def test_not_in_directory_stays_loud_regardless_of_read_data(self):
+        km._PERSONA_MEMORY_COUNTS.update({"argus": 40})
+        km._PERSONA_READ_COUNTS.update({"argus": 5})
+        directory = ["argus", "river"]
+        self.assertEqual(km.stranded_inboxes(directory, {"all": 2}), ["all"])   # 'all' not in directory
+        self.assertEqual(km.dormant_inboxes(directory, {"all": 2}), [])
+        fresh, events, err = self._report(directory, {"all": 2}, watchers=("argus",))
+        self.assertEqual(fresh, ["all"])
+        self.assertIn("stranded mail", err)
+
+    # --- case 5: degradation. No read data -> fall back to the memory-count proxy, never crash ----------
+    def test_no_read_data_degrades_to_memory_count_loud_when_zero(self):
+        km._PERSONA_MEMORY_COUNTS.update({"husk": 0, "argus": 40})
+        # deliberately NO _PERSONA_READ_COUNTS entries -> read unknown for everyone
+        directory = ["husk", "argus"]
+        self.assertEqual(km.stranded_inboxes(directory, {"husk": 2}), ["husk"])  # old memory==0 behaviour
+        self.assertEqual(km.dormant_inboxes(directory, {"husk": 2}), [])
+
+    def test_no_read_data_degrades_to_memory_count_quiet_when_nonzero(self):
+        km._PERSONA_MEMORY_COUNTS.update({"vellum": 129})
+        directory = ["vellum", "argus"]
+        self.assertEqual(km.stranded_inboxes(directory, {"vellum": 6}), [])  # owns memories -> not flagged
+        self.assertEqual(km.dormant_inboxes(directory, {"vellum": 6}), [])
+
+    def test_no_read_data_and_unknown_memory_count_does_not_crash_and_flags_nothing(self):
+        km._PERSONA_MEMORY_COUNTS.update({"mystery": None})  # server said nothing about either signal
+        directory = ["mystery", "argus"]
+        self.assertEqual(km.stranded_inboxes(directory, {"mystery": 3}), [])
+        self.assertEqual(km.dormant_inboxes(directory, {"mystery": 3}), [])
+
+    def test_unknown_read_with_retired_true_is_not_loud_because_read_is_unknown(self):
+        # REDUNDANT coverage for the unknown-read degradation invariant (assay cert note 5074). Treating an
+        # UNKNOWN read as 0 would let a persona reach the read==0 retired partition and, being retired,
+        # fire LOUD. It must not: with no read data we do not KNOW the inbox is unconsumed, so it degrades
+        # to the memory-count proxy and `retired` is irrelevant. memory>0 here => nothing flagged.
+        km._PERSONA_MEMORY_COUNTS.update({"ghost": 5, "argus": 40})
+        km._PERSONA_RETIRED.update({"ghost": True})       # declared retired ...
+        # ... but deliberately NO _PERSONA_READ_COUNTS entry for 'ghost' -> read unknown
+        directory = ["ghost", "argus"]
+        self.assertEqual(km.stranded_inboxes(directory, {"ghost": 4}), [])   # NOT loud despite retired=True
+        self.assertEqual(km.dormant_inboxes(directory, {"ghost": 4}), [])
+
+    def test_unknown_read_with_retired_true_and_zero_memory_is_loud_via_proxy_not_partition(self):
+        # The complementary half: unknown read + memory==0 IS loud, but via the OLD memory proxy, NOT the
+        # read==0 retired partition (which it never reaches). Pins that the degrade branch decided it - so
+        # a mutation reading unknown-as-0 changes WHICH branch fires and trips this too, giving the
+        # invariant its second independent kill.
+        km._PERSONA_MEMORY_COUNTS.update({"shell": 0, "argus": 40})
+        km._PERSONA_RETIRED.update({"shell": True})
+        directory = ["shell", "argus"]
+        self.assertEqual(km.stranded_inboxes(directory, {"shell": 4}), ["shell"])  # loud via memory==0
+        self.assertEqual(km.dormant_inboxes(directory, {"shell": 4}), [])
+
+    # --- case 6: case-sensitivity preserved across the new read/retired axes ----------------------------
+    def test_case_sensitivity_Loom_and_loom_are_distinct_across_the_read_partition(self):
+        # 'loom' is a live, actively-read member; 'Loom' is a distinct case-variant never consumed.
+        km._PERSONA_MEMORY_COUNTS.update({"loom": 80, "Loom": 0, "argus": 40})
+        km._PERSONA_READ_COUNTS.update({"loom": 79, "Loom": 0})
+        km._PERSONA_RETIRED.update({"loom": False, "Loom": True})
+        directory = ["loom", "Loom", "argus"]
+        # 'Loom' read==0 retired -> loud debris; 'loom' read>0 -> not flagged. Keys never casefolded.
+        self.assertEqual(km.stranded_inboxes(directory, {"loom": 4, "Loom": 1}), ["Loom"])
+        self.assertEqual(km.dormant_inboxes(directory, {"loom": 4, "Loom": 1}), [])
+
+    # --- case 7: _REPORTED_STRANDED / _REPORTED_DORMANT still suppress a second report -------------------
+    def test_debris_report_is_suppressed_after_the_first(self):
+        km._PERSONA_MEMORY_COUNTS.update({"rvier": 1, "argus": 40})
+        km._PERSONA_READ_COUNTS.update({"rvier": 0})
+        km._PERSONA_RETIRED.update({"rvier": True})
+        directory = ["rvier", "river", "argus"]
+        first, ev1, _ = self._report(directory, {"rvier": 1}, watchers=("argus",))
+        second, ev2, err2 = self._report(directory, {"rvier": 1}, watchers=("argus",))
+        self.assertEqual(first, ["rvier"])
+        self.assertEqual(second, [])       # once per process, not once per tick
+        self.assertEqual(ev2, [])
+        self.assertEqual(err2, "")
+
+    def test_dormant_notice_is_suppressed_after_the_first(self):
+        km._PERSONA_MEMORY_COUNTS.update({"omniview": 149, "argus": 40})
+        km._PERSONA_READ_COUNTS.update({"omniview": 0})
+        km._PERSONA_RETIRED.update({"omniview": False})
+        directory = ["omniview", "argus"]
+        _, _, err1 = self._report(directory, {"omniview": 7}, watchers=("argus",))
+        _, _, err2 = self._report(directory, {"omniview": 7}, watchers=("argus",))
+        self.assertIn("dormant inbox", err1)
+        self.assertEqual(err2, "")         # quiet channel is also once-per-inbox, no per-tick spam
+
+    def test_dormant_suppression_releases_so_a_later_re_dormancy_is_surfaced_again(self):
+        km._PERSONA_MEMORY_COUNTS.update({"omniview": 149, "argus": 40})
+        km._PERSONA_READ_COUNTS.update({"omniview": 0})
+        km._PERSONA_RETIRED.update({"omniview": False})
+        directory = ["omniview", "argus"]
+        _, _, err1 = self._report(directory, {"omniview": 7}, watchers=("argus",))
+        self.assertIn("dormant inbox", err1)
+        # rescued: the mail is consumed, so it is no longer dormant this tick ...
+        _, _, _ = self._report(directory, {}, watchers=("argus",))
+        # ... and now it is dormant AGAIN. It must be surfaced again, not held down forever.
+        _, _, err3 = self._report(directory, {"omniview": 2}, watchers=("argus",))
+        self.assertIn("dormant inbox", err3)
+
+
 class ExecEnvTest(unittest.TestCase):
     """--exec is the portable primitive, so every field the NDJSON carries must reach a shell consumer."""
 
@@ -2215,6 +2468,13 @@ class ExecEnvTest(unittest.TestCase):
                              "reason": "stranded-mail: ...", "stranded_inboxes": ["Claude-chat", "all"]})
         self.assertEqual(env["KIJITOMON_STRANDED"], "Claude-chat,all")
         self.assertNotIn("[", env["KIJITOMON_STRANDED"])   # "['Claude-chat', 'all']" is unusable in $VAR
+
+    def test_dormant_list_reaches_exec_comma_separated_like_the_stranded_list(self):
+        env = self._env_for({"event": "alert", "source": "kijito-inbox", "ts": "t", "persona": "argus",
+                             "reason": "stranded-mail: ...", "stranded_inboxes": ["rvier"],
+                             "dormant_inboxes": ["omniview", "sterling"]})
+        self.assertEqual(env["KIJITOMON_DORMANT"], "omniview,sterling")
+        self.assertNotIn("[", env["KIJITOMON_DORMANT"])
 
     def test_absent_fields_are_simply_omitted_not_defaulted_or_fatal(self):
         env = self._env_for({"event": "alert", "source": "kijito-inbox", "ts": "t", "persona": "argus",
@@ -4951,3 +5211,191 @@ class EmissionStampTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WakeClassPhase1Test(unittest.TestCase):
+    """v16 phase 1: the producer stamps a wake_class so consumers stop needing to learn names.
+
+    The criteria are argus's phase-1 DONE-WHEN (docs/v16-phase1-done-when.md), certified by assay.
+    C1-C4 and C9 are the ones a unit suite can settle; C5-C7 (the byte-identical `event` field and the
+    old filters behaving identically against pre/post specimens) need rows captured on either side of
+    a real landing and are deliberately NOT faked here.
+
+    What makes these tests rather than restatements: none of them reads the classification table to
+    build its expectation. C1 derives the vocabulary from the SOURCE's emit sites, C3 constructs a
+    kind that does not exist, and C9 removes the field to prove it is what carries the wake.
+    """
+
+    LIVENESS = {"heartbeat", "armed"}
+
+    class Capture:
+        def __init__(self):
+            self.lines = []
+
+        def write(self, line):
+            self.lines.append(json.loads(line))
+            return True
+
+        def sync(self):
+            return True
+
+    def _emit(self, kind, **fields):
+        cap = self.Capture()
+        em = km.Emitter("stdout-jsonl", None, 220, False, sink=cap)
+        em.lifecycle(kind, **fields)
+        self.assertEqual(len(cap.lines), 1)
+        row = cap.lines[0]
+        # Assert PRESENCE here so a missing stamp fails as a named assertion with a readable message
+        # rather than as a KeyError three frames away. A mutation that kills a test by crashing it is
+        # a FALSE kill: it reports "detected" while saying nothing about the property under test.
+        self.assertIn("wake_class", row,
+                      "no wake_class on an emitted %r row - the emit chokepoint is not stamping" % kind)
+        return row
+
+    # ---- C1 -----------------------------------------------------------------------------------
+    @staticmethod
+    def _kinds_emitted_by_source():
+        """Every event kind the module can emit, derived from the SOURCE rather than from a list.
+
+        ⚠️ A literal `grep 'lifecycle("...")'` finds only FOUR of the ten kinds. The rest arrive as
+        `lifecycle(diag[0], ...)` and `_alarm(event, ...)`, where the kind is passed in a VARIABLE -
+        so a name-literal scan would reproduce, inside the test meant to prove the blindness fixed,
+        exactly the blindness this whole v16 item exists to end. Hence: literal call arguments, the
+        `{"event": "..."}` dict literal, AND the `diag = ("kind", {...})` assignments.
+        """
+        import ast
+        with open(km.__file__, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        kinds = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                fn = node.func
+                name = getattr(fn, "attr", None) or getattr(fn, "id", None)
+                if name in ("lifecycle", "_alarm") and node.args:
+                    a = node.args[0]
+                    if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                        kinds.add(a.value)
+            elif isinstance(node, ast.Dict):
+                for k, v in zip(node.keys, node.values):
+                    if (isinstance(k, ast.Constant) and k.value == "event"
+                            and isinstance(v, ast.Constant) and isinstance(v.value, str)):
+                        kinds.add(v.value)
+            elif isinstance(node, ast.Assign):
+                # diag = ("state_corrupt", {...})
+                for t in node.targets:
+                    if getattr(t, "id", None) == "diag" and isinstance(node.value, ast.Tuple) \
+                            and node.value.elts and isinstance(node.value.elts[0], ast.Constant) \
+                            and isinstance(node.value.elts[0].value, str):
+                        kinds.add(node.value.elts[0].value)
+        return kinds
+
+    def test_c1_every_emittable_kind_is_classified(self):
+        found = self._kinds_emitted_by_source()
+        # Guard the SCANNER before trusting its verdict: an ast walk that silently stopped matching
+        # would report an empty vocabulary, and "every kind is classified" would pass vacuously.
+        for expected in ("new", "alert", "recovered", "heartbeat", "armed",
+                         "persona_added", "state_corrupt", "baseline_skipped",
+                         "seed_ahead", "replay_capped"):
+            self.assertIn(expected, found,
+                          "source scan missed %r - the scanner is broken, not the table" % expected)
+        unclassified = sorted(k for k in found if k not in km._WAKE_CLASS_BY_KIND)
+        self.assertEqual(unclassified, [],
+                         "emitted but unclassified: %s - add them to _WAKE_CLASS_BY_KIND" % unclassified)
+
+    # ---- C2 -----------------------------------------------------------------------------------
+    def test_c2_liveness_is_exactly_heartbeat_and_armed(self):
+        """The suppression set is frozen by assertion. A third member fails HERE, deliberately.
+
+        Its exclusion is load-bearing: heartbeat fires every 900 s, and armed's exclusion is why
+        "I was not woken" does not mean "nothing arrived". Widening this set silently mutes a channel,
+        which is the one direction this design refuses to fail in.
+        """
+        self.assertEqual(set(km._LIVENESS_KINDS), self.LIVENESS)
+        classified_liveness = {k for k, v in km._WAKE_CLASS_BY_KIND.items()
+                               if v == km.WAKE_CLASS_LIVENESS}
+        self.assertEqual(classified_liveness, self.LIVENESS,
+                         "the table and the closed set disagree about what suppresses")
+
+    def test_c2_liveness_kinds_are_stamped_liveness_on_the_wire(self):
+        for kind in sorted(self.LIVENESS):
+            with self.subTest(kind=kind):
+                self.assertEqual(self._emit(kind)["wake_class"], km.WAKE_CLASS_LIVENESS)
+
+    # ---- C3 -----------------------------------------------------------------------------------
+    def test_c3_unknown_kind_is_constructed_and_wakes(self):
+        """Asserted by CONSTRUCTING a kind that does not exist, not by reading the default.
+
+        A default that is never exercised is a default nobody has tested. Fail-toward-wake is the
+        central inversion of this design: a kind whose author forgot to classify it wakes people, so
+        the omission surfaces as noise someone asks about rather than as a channel that went quiet.
+        """
+        kind = "kind_that_does_not_exist_yet"
+        self.assertNotIn(kind, km._WAKE_CLASS_BY_KIND)
+        row = self._emit(kind)
+        self.assertEqual(row["event"], kind)
+        self.assertEqual(row["wake_class"], km.WAKE_CLASS_DIAGNOSTIC)
+        self.assertNotEqual(row["wake_class"], km.WAKE_CLASS_LIVENESS,
+                            "an unclassified kind must never fall into the suppressing value")
+
+    # ---- C4 -----------------------------------------------------------------------------------
+    def test_c4_persona_added_is_explicit_not_defaulted(self):
+        """It reaches the right answer either way, and that is exactly why it must be written down.
+
+        Correct-by-accident is not correct: the catch-all exists for kinds nobody has thought of, not
+        for kinds we know about and forgot to record. assay's §5at(a) ruling made persona_added a
+        first-class waking kind, so it is a table entry, and this test fails if someone deletes it and
+        leans on the default.
+        """
+        self.assertIn("persona_added", km._WAKE_CLASS_BY_KIND)
+        self.assertEqual(km._WAKE_CLASS_BY_KIND["persona_added"], km.WAKE_CLASS_DIAGNOSTIC)
+
+    def test_c4_all_five_diagnostics_wake(self):
+        for kind in ("state_corrupt", "baseline_skipped", "seed_ahead", "replay_capped",
+                     "persona_added"):
+            with self.subTest(kind=kind):
+                self.assertEqual(self._emit(kind)["wake_class"], km.WAKE_CLASS_DIAGNOSTIC)
+
+    def test_mail_is_the_only_mail(self):
+        mail = {k for k, v in km._WAKE_CLASS_BY_KIND.items() if v == km.WAKE_CLASS_MAIL}
+        self.assertEqual(mail, {"new"})
+
+    # ---- C9: the can-fail pairing --------------------------------------------------------------
+    def test_c9_class_filter_matches_nothing_without_the_stamp(self):
+        """Prove the FIELD carries the wake, not something that merely co-occurs with it.
+
+        A check that cannot be made to fail has not been shown to check anything. So: take a real
+        emitted row, remove `wake_class`, and assert a class-matching consumer filter now misses it -
+        while the same filter matched before. If this passed with the field removed, the filter would
+        be keying on something else and the whole phase would be decorative.
+        """
+        import re
+        class_filter = re.compile(r'"wake_class": ?"(mail|diagnostic)"')
+        row = self._emit("seed_ahead", seeded=1, current_max=2)
+        with_stamp = json.dumps(row, ensure_ascii=False)
+        self.assertTrue(class_filter.search(with_stamp))
+        row.pop("wake_class")
+        self.assertIsNone(class_filter.search(json.dumps(row, ensure_ascii=False)),
+                          "the class filter matched a row with no wake_class - it is keying on "
+                          "something other than the field under test")
+
+    # ---- phase-1 safety: `event` is untouched ---------------------------------------------------
+    def test_phase1_leaves_event_name_and_old_filters_alone(self):
+        """The non-breaking claim, at the level a unit test can reach.
+
+        Phase 1's entire justification for landing with no flag day is that no existing consumer
+        behaves differently. The full form (C5-C7) compares rows captured either side of the landing;
+        what is checkable here is that the `event` field still carries exactly the kind, and that both
+        legacy filter spellings still match and miss exactly what they did before.
+        """
+        import re
+        old_strict = re.compile(r'"event": "(new|alert|recovered)"')
+        old_lenient = re.compile(r'"event": ?"(new|alert|recovered)"')
+        for kind, should_match in (("alert", True), ("recovered", True),
+                                   ("heartbeat", False), ("armed", False),
+                                   ("seed_ahead", False)):   # still invisible to the OLD filter
+            with self.subTest(kind=kind):
+                line = json.dumps(self._emit(kind), ensure_ascii=False)
+                self.assertEqual(bool(old_strict.search(line)), should_match)
+                self.assertEqual(bool(old_lenient.search(line)), should_match)
+        # and the field itself is the bare kind, not decorated
+        self.assertEqual(self._emit("armed")["event"], "armed")
