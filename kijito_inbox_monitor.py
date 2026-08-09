@@ -2999,6 +2999,13 @@ def deliverable_watchers(directory, targets):
 
 _REPORTED_URGENT_QUIET = set()
 
+# write_only members holding urgent unread, surfaced QUIETLY this process (a stderr NOTICE, and an
+# informational `urgent_unanswered_write_only` field on any loud urgent alert), never firing the loud
+# alarm on their own. Kept SEPARATE from _REPORTED_URGENT_QUIET so the loud and quiet tiers cannot gag
+# one another, and re-armed by intersection_update so a member re-entering the tier is surfaced again.
+# Same once-per-member, EXACT-keyed discipline as _REPORTED_STRANDED / _REPORTED_DORMANT.
+_REPORTED_URGENT_WO = set()
+
 
 def urgent_unanswered(directory):
     """Directory personas holding SENDER-ESCALATED mail while showing no observed activity (§5.5).
@@ -3030,19 +3037,56 @@ def urgent_unanswered(directory):
     return out
 
 
+def _urgent_writeonly_detail(persona, n):
+    """Name a write_only member holding urgent unread, for the QUIET (non-waking) channel.
+
+    A write_only inbox is undrained BY DESIGN - drained via ANOTHER surface (for `jason`, largely the
+    digest) - so a sender's URGENT flag on it does not mean the member is unresponsive HERE, and firing
+    the loud "nobody is answering escalated mail" alarm on it is the same false-positive class write_only
+    exists to kill (assay ruling 5612). But the COUNT must stay visible so the surface that actually
+    drains the box can still act on it - QUIET, never INVISIBLE. Mirrors _dormant_detail.
+    """
+    return ("%s (%d urgent unread; held by write_only member - drained via another surface, "
+            "not unanswered here)" % (persona, n))
+
+
 def report_urgent_unanswered(directory, targets, emitter):
     """Emit the §5.5 observation. Self-clears when EITHER half of the predicate clears; never an ack.
 
     An ack would let someone silence "nobody is answering escalated mail" while it stayed true, which is
     how a dead-letter surface rots. Releasing the suppression the moment the condition lifts means a
     recurrence is announced again without anyone having to remember to reset anything.
+
+    write_only members are partitioned OUT of the loud tier and surfaced QUIETLY (a stderr NOTICE + an
+    informational `urgent_unanswered_write_only` field), mirroring the stranded/dormant split: their inbox
+    is undrained BY DESIGN (drained via another surface), so a sender's URGENT flag does not make THEM
+    unresponsive here - it is the same false-positive class write_only exists to kill, in the sibling
+    alarm. The count stays NAMED on the quiet channel so the draining surface (the digest) can still read
+    it - quiet, not invisible (assay ruling 5612).
     """
     directory = directory or ()
     current = urgent_unanswered(directory)
-    names = {p for p, _ in current}
-    _REPORTED_URGENT_QUIET.intersection_update(names)   # release: either half clearing re-arms the alarm
-    fresh = [(p, n) for p, n in current if p not in _REPORTED_URGENT_QUIET]
+    # Partition by the DECLARED write_only fact, exactly as _partition_stranded does. `is True` is strict:
+    # an undeclared or False flag leaves the member in the LOUD tier unchanged (graceful degradation, the
+    # same tri-state _row_write_only guarantees).
+    wo_quiet = [(p, n) for p, n in current if _PERSONA_WRITE_ONLY.get(p) is True]
+    alerting = [(p, n) for p, n in current if _PERSONA_WRITE_ONLY.get(p) is not True]
+    _REPORTED_URGENT_QUIET.intersection_update({p for p, _ in alerting})  # release: leaving re-arms alarm
+    _REPORTED_URGENT_WO.intersection_update({p for p, _ in wo_quiet})
+    fresh = [(p, n) for p, n in alerting if p not in _REPORTED_URGENT_QUIET]
+    fresh_wo = [(p, n) for p, n in wo_quiet if p not in _REPORTED_URGENT_WO]
+    # QUIET-BUT-NAMED tier: a stderr NOTICE is a non-waking channel (the event-stream grep filters
+    # new|alert|recovered, which stderr is not), so a write_only member's urgent count goes on the record
+    # without ever waking an agent - and independently of whether any loud member exists this tick. Once
+    # per member, exactly like the dormant tier.
+    for persona, n in fresh_wo:
+        _REPORTED_URGENT_WO.add(persona)
+        sys.stderr.write(
+            "kijito-inbox-monitor: NOTICE urgent-unanswered write_only (quiet, not alarmed) - %s "
+            "(further notices for %r suppressed)\n" % (_urgent_writeonly_detail(persona, n), persona))
     if not fresh:
+        # The write_only tier NEVER fires the loud alert on its own - the whole point of the split. It has
+        # already been recorded on stderr above; there is no unanswered non-write_only member to announce.
         return []
     detail = []
     for persona, n in fresh:
@@ -3053,7 +3097,12 @@ def report_urgent_unanswered(directory, targets, emitter):
             ("last observed message %s" % seen[1]) if seen else "no message from them observed at all"))
     # One summarising event per watcher, exactly as the stranded alarm does - discovering several at once
     # must not become a wake storm. Routed by evidence of a consumer (§5.6), not by directory membership
-    # alone, so the alert does not land in long-dead test personas' streams.
+    # alone, so the alert does not land in long-dead test personas' streams. The freshly-surfaced
+    # write_only members ride along as an INFORMATIONAL `urgent_unanswered_write_only` field (mirroring
+    # `dormant_inboxes`): a digest consumer already filtering `alert` sees the held count without the alarm
+    # having fired on their account. Attached ONLY when non-empty - an absent field means "no statement",
+    # the same tri-state discipline the exec layer relies on.
+    extra = {"urgent_unanswered_write_only": [p for p, _ in fresh_wo]} if fresh_wo else {}
     for watcher in deliverable_watchers(directory, targets):
         emitter.lifecycle(
             "alert", persona=watcher,
@@ -3061,7 +3110,8 @@ def report_urgent_unanswered(directory, targets, emitter):
                     "from them has been observed: %s. OBSERVATION, NOT A DIAGNOSIS: not-yet-read, unable "
                     "to receive, and still working are indistinguishable from here and need different "
                     "responses. Checked: authored mail." % (len(fresh), ", ".join(detail))),
-            urgent_unanswered=[p for p, _ in fresh])
+            urgent_unanswered=[p for p, _ in fresh],
+            **extra)
     return [p for p, _ in fresh]
 
 

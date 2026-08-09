@@ -756,6 +756,8 @@ class UrgentUnansweredAlarmTest(unittest.TestCase):
         km._LAST_AUTHORED.clear()
         km._INBOX_FLOORS.clear()
         km._REPORTED_URGENT_QUIET.clear()
+        km._REPORTED_URGENT_WO.clear()
+        km._PERSONA_WRITE_ONLY.clear()
         km._OBSERVED_SINCE = "2026-07-25T07:00:00+00:00"
 
     def tearDown(self):
@@ -873,6 +875,75 @@ class UrgentUnansweredAlarmTest(unittest.TestCase):
         km._URGENT_UNREAD.update({"loom": 1})
         self._observe([{"id": 100, "from": "river", "created": "t"}])
         self.assertEqual(self._run(directory=())[0], [])
+
+    # ── write_only members are QUIET-BUT-NAMED in urgent-unanswered (assay ruling 5612) ─────────────
+    # A write_only inbox is undrained BY DESIGN (drained via another surface, e.g. the digest), so a
+    # SENDER's URGENT flag on it does not make the member unresponsive here - the same false-positive
+    # class write_only exists to kill, in the sibling alarm. Suppress the loud alert, keep the count NAMED
+    # on the quiet channel. Mirrors the stranded/dormant split.
+    def _run_cap(self, directory=("argus", "loom"), targets=("argus",)):
+        """_run(), but capturing the producer's stderr - the non-waking QUIET channel."""
+        em = self.Emitter()
+        saved = sys.stderr
+        sys.stderr = io.StringIO()
+        try:
+            fresh = km.report_urgent_unanswered(list(directory),
+                                                [self.Target(p) for p in targets], em)
+            err = sys.stderr.getvalue()
+        finally:
+            sys.stderr = saved
+        return fresh, [f for e, f in em.events if e == "alert"], err
+
+    def test_write_only_member_is_quiet_but_named_when_alone(self):
+        # No loud alert may fire, but the count must be NAMED on stderr so the draining surface can see it.
+        km._URGENT_UNREAD.update({"jason": 2})
+        km._PERSONA_WRITE_ONLY.update({"jason": True})
+        self._observe([{"id": 100, "from": "river", "created": "t"}])
+        fresh, alerts, err = self._run_cap(directory=("argus", "jason"))
+        self.assertEqual(fresh, [])                                  # not loud
+        self.assertEqual(alerts, [])                                 # no alert event at all
+        self.assertIn("jason", err)                                  # but NAMED on the quiet channel
+        self.assertIn("write_only", err)
+        self.assertIn("drained via another surface", err)
+        self.assertIn("jason", km._REPORTED_URGENT_WO)               # once-per-process suppression armed
+
+    def test_write_only_rides_along_as_field_when_a_loud_member_coincides(self):
+        # loom (real member, not write_only) fires loud; jason (write_only) does NOT enter the loud list
+        # but rides along as an INFORMATIONAL field, mirroring `dormant_inboxes`.
+        km._URGENT_UNREAD.update({"jason": 2, "loom": 1})
+        km._PERSONA_WRITE_ONLY.update({"jason": True})
+        self._observe([{"id": 100, "from": "river", "created": "t"}])
+        fresh, alerts, err = self._run_cap(directory=("argus", "jason", "loom"))
+        self.assertEqual(fresh, ["loom"])                            # only the non-write_only member
+        self.assertEqual(alerts[0]["urgent_unanswered"], ["loom"])
+        self.assertEqual(alerts[0]["urgent_unanswered_write_only"], ["jason"])
+        self.assertNotIn("jason", alerts[0]["urgent_unanswered"])
+        self.assertIn("jason", err)                                  # also on the quiet channel
+
+    def test_undeclared_or_false_write_only_still_fires_loud(self):
+        # GRACEFUL DEGRADATION + the mutation discriminator: only `is True` quiets. A flag explicitly
+        # False, or absent entirely, still rides the loud alarm exactly as before - and the informational
+        # field is ABSENT (tri-state), not an empty list.
+        km._URGENT_UNREAD.update({"loom": 1, "quill": 3})
+        km._PERSONA_WRITE_ONLY.update({"loom": False})               # quill: no entry at all
+        self._observe([{"id": 100, "from": "river", "created": "t"}])
+        fresh, alerts, err = self._run_cap(directory=("argus", "loom", "quill"))
+        self.assertEqual(sorted(fresh), ["loom", "quill"])           # both still loud
+        self.assertNotIn("urgent_unanswered_write_only", alerts[0])  # field ABSENT, not []
+
+    def test_write_only_quiet_notice_is_once_then_re_arms(self):
+        # Same self-clearing discipline as the loud tier: fires once, suppressed while it holds, re-armed
+        # once the member leaves and re-enters the tier.
+        km._URGENT_UNREAD.update({"jason": 2})
+        km._PERSONA_WRITE_ONLY.update({"jason": True})
+        self._observe([{"id": 100, "from": "river", "created": "t"}])
+        d = ("argus", "jason")
+        self.assertIn("jason", self._run_cap(directory=d)[2])        # first: named
+        self.assertNotIn("jason", self._run_cap(directory=d)[2])     # second: suppressed
+        km._URGENT_UNREAD["jason"] = 0                               # drained -> leaves the tier
+        self.assertEqual(self._run_cap(directory=d)[2], "")
+        km._URGENT_UNREAD["jason"] = 2                               # recurrence -> named again
+        self.assertIn("jason", self._run_cap(directory=d)[2])
 
 
 class DeliverableWatchersTest(unittest.TestCase):
