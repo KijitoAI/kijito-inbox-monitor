@@ -3,7 +3,7 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
-## [Unreleased]
+## [0.5.0] - 2026-08-15
 
 ### Fixed
 - **Darwin `boottime` re-sourced: `CLOCK_MONOTONIC_RAW`, not `CLOCK_MONOTONIC`.** Darwin's `CLOCK_MONOTONIC`
