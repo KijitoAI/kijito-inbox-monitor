@@ -778,19 +778,22 @@ def _clock_map():
     """Map our two SEMANTICS onto this platform's constants. Returns {key: (semantic_name, const)}.
 
     ⛔⛔ THE KEYS NAME SEMANTICS, NOT OS CONSTANTS, AND THE TWO DISAGREE ACROSS PLATFORMS.
-        monotonic := DOES NOT advance while the machine is not executing
-        boottime  := DOES advance while the machine is not executing
+        monotonic := DOES NOT advance while the machine is not executing, and NEVER steps
+        boottime  := DOES advance while the machine is not executing, and NEVER steps
 
     On Linux those are CLOCK_MONOTONIC and CLOCK_BOOTTIME, and the names coincide with the meanings.
-    ON DARWIN THEY DO NOT, AND THE MISMATCH IS SILENT AND INVERTED:
+    ON DARWIN THEY DO NOT, AND THERE ARE TWO SEPARATE TRAPS, BOTH SILENT:
 
-        CLOCK_MONOTONIC    INCLUDES sleep   -> carries Linux CLOCK_BOOTTIME's semantic
-        CLOCK_UPTIME_RAW   EXCLUDES sleep   -> carries Linux CLOCK_MONOTONIC's semantic
-        CLOCK_BOOTTIME     does not exist
+        CLOCK_UPTIME_RAW    EXCLUDES sleep, raw  -> carries Linux CLOCK_MONOTONIC's semantic
+        CLOCK_MONOTONIC_RAW INCLUDES sleep, raw  -> carries Linux CLOCK_BOOTTIME's semantic
+        CLOCK_MONOTONIC     INCLUDES sleep BUT IS CALENDAR-DERIVED: measured 2026-08-15 it read
+                            EXACTLY wall - kern.boottime (201341.498, to 3 decimals), so it absorbs
+                            NTP adjustments to the wall clock -- it can sit BELOW CLOCK_UPTIME_RAW
+        CLOCK_BOOTTIME      does not exist
 
-    Measured on the real Mac (2026-08-05): CLOCK_MONOTONIC 408.19 h vs CLOCK_UPTIME_RAW 389.99 h --
-    an 18.20 h difference that IS the accumulated sleep, matching an independent kern.boottime
-    derivation to two decimals.
+    Measured on the real Mac (2026-08-05): the sleep-including clocks ran 18.20 h ahead of
+    CLOCK_UPTIME_RAW -- a difference that IS the accumulated sleep, matching an independent
+    kern.boottime derivation to two decimals.
 
     An earlier version of this function read CLOCK_MONOTONIC on every platform and omitted boottime
     where the constant was missing. On a Mac that emits the SLEEP-INCLUDING clock under the key
@@ -798,22 +801,54 @@ def _clock_map():
     wall against `monotonic` measures ~0 freeze forever, on every Mac-emitted row, with nothing
     raising. The bug is invisible to a Linux test suite by construction: there, the names are honest.
 
+    The NEXT version sourced Darwin's boottime from CLOCK_MONOTONIC -- right direction, wrong clock:
+    on a fresh-uptime Mac whose wall clock NTP-stepped back ~8.3 s after boot, it emitted
+    boottime 4957.865 < monotonic 4966.194 (measured 2026-08-14), violating the definitional
+    invariant boottime >= monotonic that consumers difference against. The never-steps half of each
+    semantic is as load-bearing as the sleep half, so BOTH must come from RAW clocks:
+    CLOCK_MONOTONIC_RAW and CLOCK_UPTIME_RAW share one tick source (mach_continuous_time vs
+    mach_absolute_time), so boottime >= monotonic holds by construction.
+
     ⇒ Dispatch on the SEMANTIC and record which constant supplied it (see _emission_stamps), so the
     mapping is auditable from the row instead of being a property of the reader's assumptions.
     """
     m = {}
-    if hasattr(time, "CLOCK_UPTIME_RAW"):          # Darwin: the sleep-EXCLUDING clock
+    if hasattr(time, "CLOCK_UPTIME_RAW"):          # Darwin: the sleep-EXCLUDING raw clock
         m["monotonic"] = ("CLOCK_UPTIME_RAW", time.CLOCK_UPTIME_RAW)
     elif hasattr(time, "CLOCK_MONOTONIC"):          # Linux: names and meanings coincide
         m["monotonic"] = ("CLOCK_MONOTONIC", time.CLOCK_MONOTONIC)
     if hasattr(time, "CLOCK_BOOTTIME"):             # Linux: the sleep-INCLUDING clock
         m["boottime"] = ("CLOCK_BOOTTIME", time.CLOCK_BOOTTIME)
-    elif hasattr(time, "CLOCK_UPTIME_RAW") and hasattr(time, "CLOCK_MONOTONIC"):
-        # Darwin: CLOCK_MONOTONIC is the sleep-INCLUDING one. Only claim this when UPTIME_RAW is
-        # also present -- that presence is what identifies the platform as one with the inverted
-        # meaning, rather than a Linux box whose CLOCK_MONOTONIC means the opposite.
-        m["boottime"] = ("CLOCK_MONOTONIC", time.CLOCK_MONOTONIC)
+    elif hasattr(time, "CLOCK_UPTIME_RAW") and hasattr(time, "CLOCK_MONOTONIC_RAW"):
+        # Darwin: the sleep-INCLUDING raw clock. NOT CLOCK_MONOTONIC -- that one is
+        # calendar-derived and absorbs NTP steps (see above). Gate on UPTIME_RAW's presence:
+        # it identifies the platform as Darwin, where MONOTONIC_RAW includes sleep, rather than
+        # a Linux box, where CLOCK_MONOTONIC_RAW EXCLUDES suspend and would be the wrong clock.
+        m["boottime"] = ("CLOCK_MONOTONIC_RAW", time.CLOCK_MONOTONIC_RAW)
     return m
+
+
+def _quarantine_inverted_stamps(stamps, src):
+    """The emission-chokepoint canary: quarantine a (monotonic, boottime) pair that reads inverted.
+
+    boottime >= monotonic is definitional -- boottime is monotonic plus the time the machine did
+    not execute. A pair that reads inverted means the platform mapping above is WRONG (the defect
+    this module actually shipped: Darwin boottime from calendar-derived CLOCK_MONOTONIC read 8.3 s
+    below monotonic at fresh uptime), and the boottime value is then a NON-measurement of its
+    semantic. Publishing it would poison every consumer that differences boottime against
+    monotonic to measure dwell -- so the pair is split at the chokepoint: boottime is REMOVED from
+    the stamp set (omitted, never faked -- absence stays legible as absence) and the rejected
+    reading is preserved LOUDLY under `clock_defect`, so the row itself reports the broken mapping
+    instead of feeding it to consumers as data. Mutates stamps/src in place; returns stamps.
+    """
+    if "monotonic" in stamps and "boottime" in stamps and stamps["boottime"] < stamps["monotonic"]:
+        stamps["clock_defect"] = {
+            "kind": "boottime_below_monotonic",
+            "boottime": stamps.pop("boottime"),
+            "boottime_src": src.pop("boottime", None),
+            "monotonic": stamps["monotonic"],
+        }
+    return stamps
 
 
 def _emission_stamps():
@@ -836,13 +871,15 @@ def _emission_stamps():
     the row rather than assuming the platform's names mean what they say -- see _clock_map(), where
     Darwin's do not. A key is OMITTED, never faked, where its semantic is genuinely unavailable: a
     fabricated value is indistinguishable from a real zero-freeze reading, which is the exact failure
-    these fields exist to detect.
+    these fields exist to detect. The same rule governs a pair the platform hands us inverted --
+    _quarantine_inverted_stamps drops the boottime reading and reports the defect on the row.
     """
     stamps = {"wall": _now_iso()}
     src = {}
     for key, (const_name, const) in _clock_map().items():
         stamps[key] = round(time.clock_gettime(const), 6)
         src[key] = const_name
+    _quarantine_inverted_stamps(stamps, src)
     if src:
         stamps["src"] = src
     return stamps

@@ -5,6 +5,21 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+### Fixed
+- **Darwin `boottime` re-sourced: `CLOCK_MONOTONIC_RAW`, not `CLOCK_MONOTONIC`.** Darwin's `CLOCK_MONOTONIC`
+  does include sleep, but it is calendar-derived - measured 2026-08-15 it read *exactly*
+  `wall − kern.boottime` to three decimals - so it absorbs NTP adjustments to the wall clock. On a
+  fresh-uptime Mac whose wall clock stepped back ~8.3 s after boot, it emitted
+  `boottime 4957.865 < monotonic 4966.194`, violating the definitional invariant `boottime ≥ monotonic`
+  that consumers difference against. Both semantics now come from raw clocks sharing one tick source
+  (`CLOCK_MONOTONIC_RAW` / `CLOCK_UPTIME_RAW`), so the invariant holds by construction.
+- **Inverted-pair quarantine at the emit chokepoint.** If a platform ever hands the producer
+  `boottime < monotonic`, the `boottime` reading is omitted (never faked) and preserved under
+  `emitted.clock_defect` with the rejected value and its source constant, so a broken mapping reports
+  itself on the row instead of poisoning dwell measurements downstream. A positive-control test proves
+  the quarantine fires on a deliberately inverted pair - the prior invariant test passed vacuously on any
+  zero-sleep host, where an inverted mapping reads as an equal pair.
+
 ⚠️ **WHAT THE REVIEW OF THIS SET DOES AND DOES NOT COVER.** The seven alarm/liveness changes were reviewed
 and approved by an independent engine-literate reviewer who re-ran the suite and the mutation harness rather
 than accepting them. Two limits were disclosed rather than discovered: the reviewer did **not** run the

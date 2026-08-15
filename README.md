@@ -388,17 +388,22 @@ gives you the time the machine was not running, which is how you tell "this sat 
 | key | meaning | Linux | macOS |
 |---|---|---|---|
 | `monotonic` | does **not** tick while the machine is asleep/paused | `CLOCK_MONOTONIC` | `CLOCK_UPTIME_RAW` |
-| `boottime` | **does** tick while the machine is asleep/paused | `CLOCK_BOOTTIME` | `CLOCK_MONOTONIC` |
+| `boottime` | **does** tick while the machine is asleep/paused | `CLOCK_BOOTTIME` | `CLOCK_MONOTONIC_RAW` |
 
-macOS `CLOCK_MONOTONIC` *includes* sleep - it means what Linux calls `CLOCK_BOOTTIME` - and macOS has no
-`CLOCK_BOOTTIME` at all. Reading the constant by name there gives you the wrong quantity under the right label,
-and nothing complains. `src` tells you which constant actually supplied each value, so you can check rather than
-assume:
+macOS `CLOCK_MONOTONIC_RAW` *includes* sleep - it means what Linux calls `CLOCK_BOOTTIME` - and macOS has no
+`CLOCK_BOOTTIME` at all. (macOS `CLOCK_MONOTONIC` also includes sleep, but it is calendar-derived and absorbs
+NTP adjustments - measured reading *below* `CLOCK_UPTIME_RAW` at fresh uptime, which a boot-anchored clock can
+never do.) Reading a constant by name there gives you the wrong quantity under the right label, and nothing
+complains. `src` tells you which constant actually supplied each value, so you can check rather than assume:
 
 ```json
 "emitted": {"wall":"...","monotonic":1404080.74,"boottime":1469598.35,
-            "src":{"monotonic":"CLOCK_UPTIME_RAW","boottime":"CLOCK_MONOTONIC"}}
+            "src":{"monotonic":"CLOCK_UPTIME_RAW","boottime":"CLOCK_MONOTONIC_RAW"}}
 ```
+
+If a platform ever hands the producer an inverted pair (`boottime < monotonic` - definitionally impossible from
+correctly mapped clocks), the `boottime` reading is dropped rather than published, and the row carries
+`emitted.clock_defect` naming the rejected value and its source constant.
 
 `boottime - monotonic` is time the machine was not executing (18.20 h on the Mac above). A key is omitted rather
 than faked if its meaning is genuinely unavailable - a made-up value would be indistinguishable from a real

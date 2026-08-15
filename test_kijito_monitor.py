@@ -5294,18 +5294,60 @@ class EmissionStampTest(unittest.TestCase):
                                 cap.lines[0]["emitted"]["monotonic"])
 
     def test_THE_SEMANTIC_INVARIANT_boottime_never_reads_below_monotonic(self):
-        # ★ THE TEST THAT CATCHES AN INVERTED MAPPING, AND IT WORKS ON EVERY PLATFORM.
-        # boottime INCLUDES the time the machine was not executing; monotonic EXCLUDES it. So
-        # boottime >= monotonic always, by definition, whatever the OS calls its constants.
-        # On Linux with no suspend they are equal. On Darwin they differ by the accumulated sleep
-        # (measured on the real Mac: 408.19 h vs 389.99 h = 18.20 h). If the Darwin mapping were
-        # inverted -- which is exactly the defect this replaced -- boottime would read BELOW
-        # monotonic and this fails. A test keyed on which CONSTANT exists could not see that.
+        # ★ LIVE-FIRE HALF OF THE INVARIANT. boottime INCLUDES the time the machine was not
+        # executing; monotonic EXCLUDES it. So boottime >= monotonic always, by definition,
+        # whatever the OS calls its constants. On Linux with no suspend they are equal; on Darwin
+        # they differ by the accumulated sleep (measured 2026-08-15: MONOTONIC_RAW ran 2.39 h
+        # ahead of UPTIME_RAW). ⚠️ ALONE THIS TEST HAS NO TEETH ON A ZERO-SLEEP HOST: an inverted
+        # mapping reads EQUAL there and passes vacuously -- and the calendar-derived-CLOCK_MONOTONIC
+        # defect it missed only surfaced at fresh uptime (boot 4957.865 < mono 4966.194, an NTP
+        # step absorbed after boot). The positive control below is the half that bites.
         em, cap = self._emitter()
         em.lifecycle("heartbeat", persona="argus")
         st = cap.lines[0]["emitted"]
         if "monotonic" in st and "boottime" in st:
             self.assertGreaterEqual(st["boottime"], st["monotonic"])
+
+    def test_CANARY_POSITIVE_CONTROL_an_inverted_pair_is_quarantined_not_published(self):
+        # ★ THE TEETH. Feed the canary river's real fresh-uptime specimen and require it to REJECT
+        # the pair: boottime removed (omitted, never faked), the rejected reading preserved loudly
+        # under clock_defect. A canary that cannot fail on a known-bad input is not a canary.
+        st = {"wall": "w", "monotonic": 4966.194, "boottime": 4957.865}
+        src = {"monotonic": "CLOCK_UPTIME_RAW", "boottime": "CLOCK_MONOTONIC"}
+        out = km._quarantine_inverted_stamps(st, src)
+        self.assertNotIn("boottime", out)
+        self.assertNotIn("boottime", src)
+        d = out["clock_defect"]
+        self.assertEqual(d["kind"], "boottime_below_monotonic")
+        self.assertEqual(d["boottime"], 4957.865)
+        self.assertEqual(d["boottime_src"], "CLOCK_MONOTONIC")
+        self.assertEqual(d["monotonic"], 4966.194)
+
+    def test_the_canary_lets_an_equal_pair_through_untouched(self):
+        # Linux with no suspend reads boottime == monotonic all day; equality is healthy, and a
+        # canary that cries on it would strip boottime from every Linux row.
+        st = {"wall": "w", "monotonic": 100.0, "boottime": 100.0}
+        src = {"monotonic": "CLOCK_MONOTONIC", "boottime": "CLOCK_BOOTTIME"}
+        km._quarantine_inverted_stamps(st, src)
+        self.assertEqual(st["boottime"], 100.0)
+        self.assertNotIn("clock_defect", st)
+        self.assertEqual(src["boottime"], "CLOCK_BOOTTIME")
+
+    def test_the_chokepoint_itself_runs_the_canary(self):
+        # Prove the quarantine fires INSIDE _emission_stamps, not just as a helper nobody calls:
+        # wire a fake platform whose mapping is inverted end-to-end through the real chokepoint.
+        real_map, real_gettime = km._clock_map, time.clock_gettime
+        fake = {901: 4966.194, 902: 4957.865}
+        try:
+            km._clock_map = lambda: {"monotonic": ("FAKE_MONO", 901), "boottime": ("FAKE_BOOT", 902)}
+            time.clock_gettime = lambda const: fake[const]
+            st = km._emission_stamps()
+        finally:
+            km._clock_map, time.clock_gettime = real_map, real_gettime
+        self.assertNotIn("boottime", st)
+        self.assertEqual(st["clock_defect"]["kind"], "boottime_below_monotonic")
+        self.assertEqual(st["clock_defect"]["boottime_src"], "FAKE_BOOT")
+        self.assertEqual(st["src"], {"monotonic": "FAKE_MONO"})
 
     def test_the_row_records_WHICH_constant_supplied_each_semantic(self):
         # The mapping must be auditable FROM THE ROW, not from the reader's assumptions about what
@@ -5324,7 +5366,9 @@ class EmissionStampTest(unittest.TestCase):
         src = cap.lines[0]["emitted"]["src"]
         if hasattr(time, "CLOCK_UPTIME_RAW"):          # Darwin
             self.assertEqual(src["monotonic"], "CLOCK_UPTIME_RAW")
-            self.assertEqual(src["boottime"], "CLOCK_MONOTONIC")
+            # MONOTONIC_RAW, not MONOTONIC: the latter is calendar-derived on Darwin and absorbs
+            # NTP steps -- it read below UPTIME_RAW at fresh uptime (the shipped d1_clocks defect).
+            self.assertEqual(src["boottime"], "CLOCK_MONOTONIC_RAW")
         else:                                           # Linux
             self.assertEqual(src["monotonic"], "CLOCK_MONOTONIC")
             self.assertEqual(src.get("boottime"), "CLOCK_BOOTTIME")

@@ -1,8 +1,11 @@
 # Kijito Inbox Monitor: Design & Implementation Spec
 
-**Updated:** 2026-07-25 (rev 8: the bounded-window / delivery-acknowledgement contracts, from seven rounds of
+**Updated:** 2026-08-15 (rev 9: §6.5 Darwin `boottime` re-sourced from `CLOCK_MONOTONIC_RAW` - Darwin's
+`CLOCK_MONOTONIC` is calendar-derived and read below `CLOCK_UPTIME_RAW` at fresh uptime - plus the
+inverted-pair quarantine at the emit chokepoint).
+Rev 8 (2026-07-25): the bounded-window / delivery-acknowledgement contracts, from seven rounds of
 adversarial audit - §5 pagination consistency, §7.0 acknowledged delivery + durability ordering, §7.3 strict
-persisted schema + corrupt-state recovery + case-only identity migration, §14.7 the three case layers).
+persisted schema + corrupt-state recovery + case-only identity migration, §14.7 the three case layers.
 Rev 7 was remote-only: watches your Kijito inbox at `api.kijito.ai`, token required; the `--url`/SSRF-by-class
 machinery is gone - see §5, §8, §11. Builds on rev 6 (v2 multi-persona + supervised producer).
 **Status:** shipped and live (v2 under launchd).
@@ -456,18 +459,32 @@ chokepoint. It is stamp 1 of a three-stamp wake ledger; the consumer supplies th
 | platform | `monotonic` ← | `boottime` ← |
 |---|---|---|
 | Linux | `CLOCK_MONOTONIC` | `CLOCK_BOOTTIME` |
-| Darwin | `CLOCK_UPTIME_RAW` | `CLOCK_MONOTONIC` |
+| Darwin | `CLOCK_UPTIME_RAW` | `CLOCK_MONOTONIC_RAW` |
 
-On Linux the names coincide with the meanings. **On macOS they do not: `CLOCK_MONOTONIC` INCLUDES sleep** (it
-carries Linux `CLOCK_BOOTTIME`'s semantic), `CLOCK_UPTIME_RAW` is the sleep-excluding clock, and `CLOCK_BOOTTIME`
-does not exist. Measured on a real Mac: `CLOCK_MONOTONIC` 408.19 h against `CLOCK_UPTIME_RAW` 389.99 h - an
-**18.20 h** difference that *is* the accumulated sleep, matching an independent `kern.boottime` derivation to two
-decimals.
+On Linux the names coincide with the meanings. **On macOS they do not, and there are two separate traps.**
+First, `CLOCK_UPTIME_RAW` is the sleep-excluding clock, `CLOCK_MONOTONIC_RAW` includes sleep (it carries Linux
+`CLOCK_BOOTTIME`'s semantic), and `CLOCK_BOOTTIME` does not exist. Measured on a real Mac: the sleep-including
+clocks ran **18.20 h** ahead of `CLOCK_UPTIME_RAW` - a difference that *is* the accumulated sleep, matching an
+independent `kern.boottime` derivation to two decimals. Second, **Darwin's `CLOCK_MONOTONIC` is
+calendar-derived**: measured 2026-08-15 it read *exactly* `wall − kern.boottime` (201341.498, to three
+decimals), so it absorbs NTP adjustments to the wall clock. (On Linux, `CLOCK_MONOTONIC_RAW` EXCLUDES suspend -
+the same constant name carries a different semantic per platform, which is why the dispatch is on semantics.)
 
-An earlier revision read `CLOCK_MONOTONIC` on every platform. On a Mac that publishes the *sleep-including*
-clock under the key `monotonic` and drops the sleep-excluding quantity altogether, so a consumer differencing
-wall against `monotonic` measures **~0 freeze forever, on every Mac row, with nothing raising** - and a
-Linux-only test suite cannot see it, because there the names are honest.
+Two prior revisions each fell into one trap. The first read `CLOCK_MONOTONIC` on every platform: on a Mac that
+publishes the *sleep-including* clock under the key `monotonic` and drops the sleep-excluding quantity
+altogether, a consumer differencing wall against `monotonic` measures **~0 freeze forever, on every Mac row,
+with nothing raising** - and a Linux-only test suite cannot see it, because there the names are honest. The
+second sourced Darwin's `boottime` from `CLOCK_MONOTONIC` - right direction, wrong clock: on a fresh-uptime Mac
+whose wall clock NTP-stepped back ~8.3 s after boot, it emitted `boottime 4957.865 < monotonic 4966.194`
+(measured 2026-08-14), violating the definitional invariant `boottime ≥ monotonic`. Both semantics must come
+from **raw** clocks; `CLOCK_MONOTONIC_RAW` and `CLOCK_UPTIME_RAW` share one tick source, so the invariant holds
+by construction.
+
+**The invariant is also enforced at the chokepoint**: if a platform ever hands the producer an inverted pair,
+the `boottime` reading is quarantined - removed from the stamp set (omitted, never faked) and preserved under
+`emitted.clock_defect` (`kind: "boottime_below_monotonic"`, with the rejected value and its source constant) -
+so the row reports the broken mapping loudly instead of feeding it to consumers as data. A positive-control
+test proves the quarantine fires on a deliberately inverted pair.
 
 `src` records which constant supplied each semantic (`{"monotonic":"CLOCK_UPTIME_RAW", ...}`), so the mapping is
 **auditable from the row** rather than resting on the reader's assumptions about the platform.
@@ -487,7 +504,7 @@ Parallels guest, **72.79 h of hypervisor freeze presented as ordinary elapsed wa
 A key is **omitted, never faked**, where its *semantic* is genuinely unavailable on the platform. A fabricated
 value would be indistinguishable from a genuine zero-freeze reading, which is the failure this field exists to
 prevent. Note the omission rule applies to the semantic, not the constant: Darwin lacks `CLOCK_BOOTTIME` but
-still supplies the sleep-including semantic via `CLOCK_MONOTONIC`, so `boottime` is present there.
+still supplies the sleep-including semantic via `CLOCK_MONOTONIC_RAW`, so `boottime` is present there.
 
 `ts` is deliberately left alone: it is stamped microseconds earlier in the convenience constructors and existing
 consumers depend on it. Use `emitted.wall` when you need the wall reading coherent with the other two clocks.
