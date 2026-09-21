@@ -5613,3 +5613,94 @@ class WakeClassPhase1Test(unittest.TestCase):
                 self.assertEqual(bool(old_lenient.search(line)), should_match)
         # and the field itself is the bare kind, not decorated
         self.assertEqual(self._emit("armed")["event"], "armed")
+class SharedPersonaFilenameRuleTest(unittest.TestCase):
+    """`--safe-persona` is the ONE place the persona->filename rule is published (row M290).
+
+    Three programs had each re-implemented it and drifted: this producer (correct), kijito-tools'
+    SessionStart hook (`sed 's/[^A-Za-z0-9._-]/_/g'` - no casefold, ASCII-only) and producer-health.sh
+    (no sanitising at all). A persona whose name merely contains a CAPITAL LETTER therefore got a path
+    from the hook that the producer never writes, the hook reported "your mail is not being collected",
+    and a Monitor armed on that path waited forever in silence.
+
+    ⚠️ THE REASON IT SURVIVED REVIEW, AND WHY THESE ASSERTIONS ARE SHAPED AS THEY ARE: on macOS the
+    filesystem is case-INSENSITIVE, so the hook's `[ -e ... ]` probe SUCCEEDS on the producer's
+    differently-cased file and everything looks fine. The defect is only observable on Linux. So the
+    tests below pin the RULE ITSELF (casefold; Unicode alnum survives) rather than "the file was
+    found", because the find-the-file question answers YES on the very platform most likely to be
+    running the test.
+    """
+
+    # spaces, parentheses, slashes, unicode and case - the set row M290's DONE-WHEN names, plus the
+    # ordinary name as a control (a fixture of only exotic names cannot tell "correct" from "mangles
+    # everything").
+    NAMES = [
+        "argus", "x", "dots.and_dash-ok",
+        "spaced name", "name (purpose)", "a/b", "tab\tname",
+        "Loom", "UPPER", "Claude-Chat",
+        "café", "Ωmega",
+    ]
+
+    def _run(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        real_out, real_err = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = out, err
+        try:
+            rc = km.main(argv)
+        finally:
+            sys.stdout, sys.stderr = real_out, real_err
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_cli_answer_is_the_function_answer_for_every_name(self):
+        # The CLI is not a second implementation to be kept in step by hand - it must BE the function.
+        for name in self.NAMES:
+            with self.subTest(name=name):
+                rc, out, _ = self._run(["--safe-persona", name])
+                self.assertEqual(rc, 0)
+                self.assertEqual(out, km._state_safe_persona(name) + "\n")
+
+    def test_answer_is_one_bare_line_a_shell_can_capture(self):
+        # `_safe=$(kijito-inbox-monitor --safe-persona "$p")` is the calling convention, so anything
+        # else on stdout silently becomes part of a filename.
+        rc, out, _ = self._run(["--safe-persona", "name (purpose)"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.count("\n"), 1)
+        self.assertEqual(out.strip(), "name__purpose_")
+
+    def test_needs_no_token_no_network_no_state_file(self):
+        # The hook runs at session start with none of the producer's configuration in hand. If asking
+        # for the rule required a token or a state file, every caller would go back to guessing - which
+        # is the defect. Proven by clearing the token env rather than by reading the code.
+        saved = os.environ.pop("KIJITOMON_TOKEN", None)
+        try:
+            rc, out, _ = self._run(["--safe-persona", "Loom"])
+        finally:
+            if saved is not None:
+                os.environ["KIJITOMON_TOKEN"] = saved
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "loom")
+
+    def test_empty_persona_refuses_and_prints_no_component(self):
+        # A blank answer would be interpolated into a path as an empty component, producing a plausible
+        # file that nothing writes. Refuse by name instead (the tool's could-not-do-it code).
+        rc, out, err = self._run(["--safe-persona", ""])
+        self.assertEqual(rc, 2)
+        self.assertEqual(out, "")
+        self.assertIn("--safe-persona", err)
+
+    def test_rule_casefolds_and_keeps_unicode_alphanumerics(self):
+        # ⛔ THE REGRESSION GUARD, pinned as the two PROPERTIES that actually diverged rather than as a
+        # list of observed strings: replace the rule with a hand-written ASCII filter (the hook's old
+        # `[^A-Za-z0-9._-]`) and both of these fail - the first because it would keep the capital, the
+        # second because it would blank a perfectly good Unicode letter.
+        self.assertEqual(km._state_safe_persona("Loom"), "loom")
+        self.assertEqual(km._state_safe_persona("Ωmega"), "ωmega")
+        # and the control: it still replaces what genuinely cannot be in a filename component.
+        self.assertEqual(km._state_safe_persona("a/b"), "a_b")
+
+    def test_the_rule_is_idempotent(self):
+        # Callers chain: the hook sanitises, a script re-sanitises the result. A rule that is not
+        # idempotent turns that into a third distinct filename.
+        for name in self.NAMES:
+            with self.subTest(name=name):
+                once = km._state_safe_persona(name)
+                self.assertEqual(km._state_safe_persona(once), once)

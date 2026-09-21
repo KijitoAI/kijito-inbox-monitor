@@ -3560,6 +3560,16 @@ def build_parser():
                    help="Publish who AUTHORED mail most recently, as JSON, refreshed each tick. Lets a "
                         "harness answer 'has X been active since my message?' from data this watcher "
                         "already collects, instead of polling every inbox itself. Off by default.")
+    p.add_argument("--safe-persona", metavar="PERSONA",
+                   help="Print the FILENAME COMPONENT this producer derives from PERSONA, then exit 0. "
+                        "This is the ONE place the persona->filename rule lives: any other program that "
+                        "needs to name a persona's events/state file (the SessionStart hook, "
+                        "producer-health.sh, docs) must ask HERE rather than re-implement it. Three "
+                        "re-implementations had already drifted (beta feedback #14/#16, row M290): the "
+                        "rule CASEFOLDS and accepts any UNICODE alphanumeric, so 'Loom' and 'Omega' are "
+                        "exactly the names a hand-written [^A-Za-z0-9._-] filter gets wrong -- and it gets "
+                        "them wrong INVISIBLY on a case-insensitive filesystem. A pure string function: no "
+                        "token, no network, no state file.")
     p.add_argument("--check-activity", metavar="PERSONA",
                    help="One-shot: read --activity-file and report whether PERSONA has authored anything "
                         "since --since-id. Exits 0 active, 1 no activity in a covered span (prints the "
@@ -3623,6 +3633,14 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     # A pure read of an existing report: no token, no network, no state file, no watch loop. Placed
     # before validate_args so a heartbeat can call it without satisfying the watcher's own config.
+    # A pure string transform, deliberately reachable with NO other configuration: every caller that
+    # needs the filename rule must be able to ask for it, or it will guess again (row M290).
+    if args.safe_persona is not None:
+        if not args.safe_persona:
+            sys.stderr.write("kijito-inbox-monitor: FATAL --safe-persona needs a non-empty PERSONA\n")
+            return 2
+        sys.stdout.write(_state_safe_persona(args.safe_persona) + "\n")
+        return 0
     if args.check_activity:
         if not args.activity_file:
             sys.stderr.write("kijito-inbox-monitor: FATAL --check-activity requires --activity-file\n")
