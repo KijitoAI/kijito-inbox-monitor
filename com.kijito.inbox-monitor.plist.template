@@ -43,6 +43,7 @@
     <string>__HOME__/.cache/kijito-inbox-monitor/events.{persona}.ndjson</string>
     <string>--heartbeat</string>
     <string>120</string>
+    <string>--no-content</string>
   </array>
   <key>StandardOutPath</key>
   <string>__HOME__/.cache/kijito-inbox-monitor/monitor.out</string>

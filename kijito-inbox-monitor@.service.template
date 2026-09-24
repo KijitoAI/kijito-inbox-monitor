@@ -67,6 +67,7 @@ ExecStart=%h/.local/bin/kijito-inbox-monitor \
   --wait 60 \
   --state-file %h/.local/state/kijito-inbox-monitor/%i.state \
   --events-file %h/.local/state/kijito-inbox-monitor/events.%i.ndjson \
+  --no-content \
   --heartbeat 900
 
 # Create the state directory before the first start, 0700. systemd will not make it
