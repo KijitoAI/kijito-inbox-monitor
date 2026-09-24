@@ -5822,3 +5822,31 @@ class ReservedFlagParseTest(unittest.TestCase):
             for d, keep in zip(dicts, saved):
                 d.clear()
                 d.update(keep)
+
+
+class OpaqueOutputEnforcementTest(unittest.TestCase):
+    """P0-F29/A29 opaque-output enforcement. Two independent legs: (1) the --no-content
+    flag actually omits message content at the Emitter clip point, and (2) BOTH shipped
+    service templates carry --no-content, so a producer deployed from either one runs
+    opaque. Leg 2 is the regression guard: dropping the flag from a template fails here."""
+
+    _HERE = os.path.dirname(os.path.abspath(__file__))
+
+    def test_no_content_clip_omits_message_content(self):
+        opaque = km.Emitter("stdout-jsonl", None, 220, True)
+        self.assertIsNone(opaque._clip("secret mail body"))
+        self.assertIsNone(opaque._clip(None))
+
+    def test_content_kept_when_flag_absent(self):
+        # Control, so the test above proves the flag rather than a constant: without
+        # --no-content the same input is retained (clipped), not dropped.
+        verbose = km.Emitter("stdout-jsonl", None, 220, False)
+        self.assertEqual(verbose._clip("secret mail body"), "secret mail body")
+
+    def test_launchd_template_enforces_no_content(self):
+        with open(os.path.join(self._HERE, "com.kijito.inbox-monitor.plist.template"), encoding="utf-8") as fh:
+            self.assertIn("<string>--no-content</string>", fh.read())
+
+    def test_systemd_template_enforces_no_content(self):
+        with open(os.path.join(self._HERE, "kijito-inbox-monitor@.service.template"), encoding="utf-8") as fh:
+            self.assertIn("--no-content", fh.read())

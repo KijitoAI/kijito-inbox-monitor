@@ -3,6 +3,17 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [0.5.3] - 2026-09-24
+
+### Changed
+- **Both shipped service templates run opaque (`--no-content`).** A producer deployed from
+  `com.kijito.inbox-monitor.plist.template` or `kijito-inbox-monitor@.service.template` now writes
+  event rows that carry a message's identity, sender and timestamps but never its body. An event file
+  is a plain local file that other tools and agents read; message text does not belong in it by
+  default. To keep a bounded content preview, remove `--no-content` from your unit (or pass
+  `--content-chars N`). `OpaqueOutputEnforcementTest` pins both templates and the flag's behaviour.
+  (Previously enforced only in the copy vendored by kijito-tools; upstreamed so the two are identical.)
+
 ## [0.5.2] - 2026-09-24
 
 ### Added
