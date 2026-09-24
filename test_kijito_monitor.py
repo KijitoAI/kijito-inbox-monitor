@@ -4435,6 +4435,40 @@ class Loom7CorruptionPinReleaseTest(unittest.TestCase):
         self.assertEqual(t.cursor, 200)
 
 
+class EmptyFirstWindowBaselineTest(unittest.TestCase):
+    """A brand-new account's first hive message carries id 0. An EMPTY first window used to baseline the
+    cursor to 0 (`max(..., default=0)`), and every emission test is `id > cursor`, so that message could
+    never be emitted: the producer logged a quiet "dormant inbox (1 unread)" and the agent never woke.
+    Measured 2026-09-18 on a fresh account with one persona and one launch of the producer."""
+
+    E2E = BoundedWindowEndToEndTest
+
+    def _fresh(self, em):
+        t = self.E2E()._target(cursor=None, emitter=em)
+        t.armed = False                              # a first launch: nothing persisted, not yet armed
+        return t
+
+    def test_an_EMPTY_first_window_baselines_BELOW_id_zero_so_message_0_is_emitted(self):
+        em = self.E2E.RecordingEmitter()
+        t = self._fresh(em)
+        self.E2E()._run(t, self.E2E()._fetch([], 0))
+        self.assertEqual(t.cursor, -1, "an empty inbox has delivered nothing, so the watermark sits below 0")
+        self.assertEqual(em.new_ids, [])
+        self.E2E()._run(t, self.E2E()._fetch([{"id": 0}], 0))
+        self.assertEqual(em.new_ids, [0], "the account's first message must wake the agent")
+        self.assertEqual(t.cursor, 0)
+
+    def test_a_NON_EMPTY_first_window_still_baselines_to_its_newest_id(self):
+        # The control: a genuine first launch onto an inbox WITH history must not flood the agent.
+        em = self.E2E.RecordingEmitter()
+        t = self._fresh(em)
+        self.E2E()._run(t, self.E2E()._fetch([{"id": 0}, {"id": 5}], 0))
+        self.assertEqual(t.cursor, 5)
+        self.assertEqual(em.new_ids, [])
+        self.E2E()._run(t, self.E2E()._fetch([{"id": 0}, {"id": 5}, {"id": 6}], 0))
+        self.assertEqual(em.new_ids, [6])
+
+
 class Loom7StateFileHygieneTest(unittest.TestCase):
     """Loom re-audit 7, item 7. The lock fd was never closed - two ResourceWarnings, and a real leak."""
 

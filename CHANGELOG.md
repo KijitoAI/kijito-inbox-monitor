@@ -3,6 +3,17 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [0.5.1] - 2026-09-24
+
+### Fixed
+- **An empty first window no longer swallows message id 0.** On a first launch with nothing in the inbox
+  the watcher baselined its cursor to `0` (`max(ids, default=0)`), and every emission test is
+  `id > cursor`, so the very first hive message on a new account (the server numbers it `0`) could
+  never be emitted. The producer only logged a quiet `dormant inbox (1 unread)` notice and the agent
+  never woke. An empty first window now baselines to `-1`, the value the fail-closed corrupt-state
+  branch already produced for an empty window; a non-empty first window still baselines to its newest
+  id. Two regression tests cover both cases (`EmptyFirstWindowBaselineTest`).
+
 ## [0.5.0] - 2026-08-15
 
 ### Fixed

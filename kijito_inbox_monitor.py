@@ -33,7 +33,7 @@ try:
 except ImportError:  # pragma: no cover - Windows
     fcntl = None
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 SOURCE = "kijito-inbox"
 # A named User-Agent is REQUIRED: api.kijito.ai is fronted by a WAF that 403s the default Python-urllib UA.
 USER_AGENT = "kijito-inbox-monitor/%s" % __version__
@@ -2341,7 +2341,14 @@ class WatchTarget:
                                                   "reason": "state file present but unusable; re-emitting the "
                                                             "visible window instead of baselining over it"})
                     elif self.cursor is None:
-                        self.cursor = max((m["id"] for m in items), default=0)
+                        # An EMPTY first window baselines BELOW id 0, not AT it. Message ids start at 0
+                        # on a new account, and every emission test is `id > cursor`, so a cursor of 0
+                        # on an empty inbox swallowed the account's very first message forever - the
+                        # producer only ever logged it as a quiet "dormant inbox (1 unread)". -1 is the
+                        # value the fail-closed branch above already produces for an empty window, so it
+                        # is a value every later comparison already tolerates. A NON-empty first window
+                        # still baselines to its newest id (never flood a new agent with history).
+                        self.cursor = max((m["id"] for m in items), default=-1)
                         # ⛔ AN ABSENT STATE FILE MEANS TWO THINGS THAT DEMAND OPPOSITE BEHAVIOUR, AND
                         # NOTHING HERE CAN TELL THEM APART. A genuine first launch must baseline - never
                         # flood a new agent with inbox history. A LOST state file must not: everything
