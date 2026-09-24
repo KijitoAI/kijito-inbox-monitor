@@ -297,6 +297,7 @@ Each line of the events file (and each `exec-per-event` invocation) is one event
 | `new` | a new inbox message | `KIJITOMON_ID`, `KIJITOMON_FROM`, `KIJITOMON_CONTENT`, `KIJITOMON_CREATED`, `KIJITOMON_PERSONA` |
 | `alert` | the source has been unreachable for `--alert-after` polls (dead-man), **or** mail is stranded in an inbox nobody watches, **or** the server holds unread mail this window did not show (all below) | `KIJITOMON_REASON`, `KIJITOMON_FAILURES`, `KIJITOMON_STRANDED` |
 | `recovered` | the source came back after an `alert` | `KIJITOMON_CURSOR` |
+| `still_unread` | mail already announced as `new` is still **unread** `--still-unread-after` seconds (default 2 h) after it was sent. One event per poll names every such message; each message is reminded at most once per window and at most `--still-unread-max` (default 3) times; never for retired, reserved or write_only inboxes; nothing on the first poll after a restart. Read what you have handled with `mark_read=true` and it stops. | `KIJITOMON_IDS`, `KIJITOMON_OLDEST_AGE`, `KIJITOMON_REASON` |
 | `heartbeat` | optional liveness tick (`--heartbeat N`) | `KIJITOMON_CURSOR` |
 
 Every event also carries `KIJITOMON_EVENT`, `KIJITOMON_SOURCE`, `KIJITOMON_TS`, `KIJITOMON_EVENT_ID`,

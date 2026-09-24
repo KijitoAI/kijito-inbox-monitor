@@ -293,6 +293,7 @@ One object per line; every event carries `event`, `source`, `ts` (emit-time UTC 
 {"event":"armed",       "source":"kijito-inbox","ts":"<iso>","cursor":250}
 {"event":"alert",       "source":"kijito-inbox","ts":"<iso>","reason":"unreachable","consecutive_failures":3,"seconds":180}
 {"event":"recovered",   "source":"kijito-inbox","ts":"<iso>","cursor":250}
+{"event":"still_unread","source":"kijito-inbox","ts":"<iso>","ids":[240,246],"senders":["river"],"oldest_age_seconds":9000,"after_seconds":7200,"reason":"..."}   # M229 backstop, bounded
 {"event":"heartbeat",   "source":"kijito-inbox","ts":"<iso>","cursor":250}     # only if --heartbeat; cursor may be null
 {"event":"seed_ahead",  "source":"kijito-inbox","ts":"<iso>","seeded":600,"current_max":539}      # seed > reality (§7.0)
 {"event":"replay_capped","source":"kijito-inbox","ts":"<iso>","capped_to":539,"dropped":389}      # backlog > --max-replay (§7.0)
