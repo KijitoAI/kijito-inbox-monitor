@@ -757,7 +757,10 @@ class UrgentUnansweredAlarmTest(unittest.TestCase):
         km._INBOX_FLOORS.clear()
         km._REPORTED_URGENT_QUIET.clear()
         km._REPORTED_URGENT_WO.clear()
+        km._REPORTED_URGENT_DEBRIS.clear()
         km._PERSONA_WRITE_ONLY.clear()
+        km._PERSONA_RETIRED.clear()
+        km._PERSONA_RESERVED.clear()
         km._OBSERVED_SINCE = "2026-07-25T07:00:00+00:00"
 
     def tearDown(self):
@@ -919,6 +922,55 @@ class UrgentUnansweredAlarmTest(unittest.TestCase):
         self.assertEqual(alerts[0]["urgent_unanswered_write_only"], ["jason"])
         self.assertNotIn("jason", alerts[0]["urgent_unanswered"])
         self.assertIn("jason", err)                                  # also on the quiet channel
+
+    # ── row M332: DEBRIS (the reserved broadcast-name row, or a retired row) never fires the loud alarm ──
+    # "Nobody is answering escalated mail" presumes a member who could answer. A reserved row (the legacy
+    # 'all' inbox the server marks `reserved`) or a retired one has none by declaration, so its urgent mail
+    # is NAMED on the quiet channel - still readable, still counted - and never wakes anyone.
+    def test_reserved_row_holding_urgent_mail_does_NOT_fire_the_loud_alarm(self):
+        km._URGENT_UNREAD.update({"all": 2})
+        km._PERSONA_RESERVED.update({"all": True})
+        self._observe([{"id": 100, "from": "river", "created": "t"}])
+        fresh, alerts, err = self._run_cap(directory=("argus", "all"))
+        self.assertEqual(fresh, [])
+        self.assertEqual(alerts, [])
+        self.assertIn("all", err)                                    # quiet, not invisible
+        self.assertIn("reserved", err)
+        self.assertIn("still readable", err)
+        self.assertEqual(km._URGENT_UNREAD["all"], 2)                # its mail is still counted
+
+    def test_reserved_is_treated_like_retired(self):
+        # The DONE-WHEN's own comparison, asserted directly: the two declarations behave the same.
+        for flag in (km._PERSONA_RESERVED, km._PERSONA_RETIRED):
+            with self.subTest(flag="reserved" if flag is km._PERSONA_RESERVED else "retired"):
+                self.setUp()
+                km._URGENT_UNREAD.update({"ghost": 1, "loom": 1})
+                flag.update({"ghost": True})
+                self._observe([{"id": 100, "from": "river", "created": "t"}])
+                fresh, alerts, err = self._run_cap(directory=("argus", "ghost", "loom"))
+                self.assertEqual(fresh, ["loom"])                    # the real member still alarms
+                self.assertEqual(alerts[0]["urgent_unanswered"], ["loom"])
+                self.assertIn("ghost", err)
+
+    def test_undeclared_or_false_reserved_still_fires_loud(self):
+        # Only a POSITIVE declaration quiets: a flag explicitly False, or absent (an older server), leaves
+        # the member on the loud alarm exactly as before.
+        km._URGENT_UNREAD.update({"loom": 1, "quill": 3})
+        km._PERSONA_RESERVED.update({"loom": False})                 # quill: no entry at all
+        self._observe([{"id": 100, "from": "river", "created": "t"}])
+        fresh, _alerts, _err = self._run_cap(directory=("argus", "loom", "quill"))
+        self.assertEqual(sorted(fresh), ["loom", "quill"])
+
+    def test_debris_quiet_notice_is_once_then_re_arms(self):
+        km._URGENT_UNREAD.update({"all": 1})
+        km._PERSONA_RESERVED.update({"all": True})
+        self._observe([{"id": 100, "from": "river", "created": "t"}])
+        self.assertIn("all", self._run_cap(directory=("argus", "all"))[2])
+        self.assertEqual(self._run_cap(directory=("argus", "all"))[2], "")   # suppressed while it holds
+        km._URGENT_UNREAD.update({"all": 0})
+        self._run_cap(directory=("argus", "all"))                            # condition clears
+        km._URGENT_UNREAD.update({"all": 1})
+        self.assertIn("all", self._run_cap(directory=("argus", "all"))[2])   # recurrence announced again
 
     def test_undeclared_or_false_write_only_still_fires_loud(self):
         # GRACEFUL DEGRADATION + the mutation discriminator: only `is True` quiets. A flag explicitly
@@ -2289,9 +2341,11 @@ class M167ReadCountPartitionTest(unittest.TestCase):
         self._read = dict(km._PERSONA_READ_COUNTS)
         self._ret = dict(km._PERSONA_RETIRED)
         self._wo = dict(km._PERSONA_WRITE_ONLY)
+        self._rsv = dict(km._PERSONA_RESERVED)
         self._rs = set(km._REPORTED_STRANDED)
         self._rd = set(km._REPORTED_DORMANT)
-        for d in (km._PERSONA_MEMORY_COUNTS, km._PERSONA_READ_COUNTS, km._PERSONA_RETIRED, km._PERSONA_WRITE_ONLY):
+        for d in (km._PERSONA_MEMORY_COUNTS, km._PERSONA_READ_COUNTS, km._PERSONA_RETIRED, km._PERSONA_WRITE_ONLY,
+                  km._PERSONA_RESERVED):
             d.clear()
         km._REPORTED_STRANDED.clear()
         km._REPORTED_DORMANT.clear()
@@ -2300,7 +2354,8 @@ class M167ReadCountPartitionTest(unittest.TestCase):
         for d, saved in ((km._PERSONA_MEMORY_COUNTS, self._mem),
                          (km._PERSONA_READ_COUNTS, self._read),
                          (km._PERSONA_RETIRED, self._ret),
-                         (km._PERSONA_WRITE_ONLY, self._wo)):
+                         (km._PERSONA_WRITE_ONLY, self._wo),
+                         (km._PERSONA_RESERVED, self._rsv)):
             d.clear()
             d.update(saved)
         km._REPORTED_STRANDED.clear()
@@ -2414,6 +2469,27 @@ class M167ReadCountPartitionTest(unittest.TestCase):
         self.assertEqual(events[0]["stranded_inboxes"], ["rvier"])
         self.assertNotIn("dormant_inboxes", events[0])   # no dormant this tick
         self.assertIn("clearable debris", err)
+
+    # --- row M332: the reserved broadcast-name row is classified exactly like a retired one ------------
+    def test_reserved_row_read0_is_classified_like_retired_debris(self):
+        km._PERSONA_MEMORY_COUNTS.update({"all": 0, "argus": 40})
+        km._PERSONA_READ_COUNTS.update({"all": 0, "argus": 3})
+        km._PERSONA_RESERVED.update({"all": True})                     # NOT retired - reserved alone
+        directory = ["all", "argus"]
+        self.assertEqual(km.stranded_inboxes(directory, {"all": 1}), ["all"])
+        self.assertEqual(km.dormant_inboxes(directory, {"all": 1}), [])
+        fresh, events, err = self._report(directory, {"all": 1}, watchers=("argus",))
+        self.assertEqual(fresh, ["all"])
+        self.assertIn("reserved (the broadcast name, not an identity)", err)
+        self.assertIn("clearable debris", err)
+
+    def test_a_reserved_False_row_is_not_debris(self):
+        km._PERSONA_MEMORY_COUNTS.update({"quietone": 3, "argus": 40})
+        km._PERSONA_READ_COUNTS.update({"quietone": 0, "argus": 3})
+        km._PERSONA_RESERVED.update({"quietone": False})
+        directory = ["quietone", "argus"]
+        self.assertEqual(km.stranded_inboxes(directory, {"quietone": 1}), [])
+        self.assertEqual(km.dormant_inboxes(directory, {"quietone": 1}), ["quietone"])
 
     # --- case 2: omniview reads nothing but is NOT retired -> DORMANT/quiet, never loud -----------------
     def test_omniview_read0_not_retired_is_QUIET_dormant_not_loud(self):
@@ -5613,3 +5689,136 @@ class WakeClassPhase1Test(unittest.TestCase):
                 self.assertEqual(bool(old_lenient.search(line)), should_match)
         # and the field itself is the bare kind, not decorated
         self.assertEqual(self._emit("armed")["event"], "armed")
+class SharedPersonaFilenameRuleTest(unittest.TestCase):
+    """`--safe-persona` is the ONE place the persona->filename rule is published (row M290).
+
+    Three programs had each re-implemented it and drifted: this producer (correct), kijito-tools'
+    SessionStart hook (`sed 's/[^A-Za-z0-9._-]/_/g'` - no casefold, ASCII-only) and producer-health.sh
+    (no sanitising at all). A persona whose name merely contains a CAPITAL LETTER therefore got a path
+    from the hook that the producer never writes, the hook reported "your mail is not being collected",
+    and a Monitor armed on that path waited forever in silence.
+
+    ⚠️ THE REASON IT SURVIVED REVIEW, AND WHY THESE ASSERTIONS ARE SHAPED AS THEY ARE: on macOS the
+    filesystem is case-INSENSITIVE, so the hook's `[ -e ... ]` probe SUCCEEDS on the producer's
+    differently-cased file and everything looks fine. The defect is only observable on Linux. So the
+    tests below pin the RULE ITSELF (casefold; Unicode alnum survives) rather than "the file was
+    found", because the find-the-file question answers YES on the very platform most likely to be
+    running the test.
+    """
+
+    # spaces, parentheses, slashes, unicode and case - the set row M290's DONE-WHEN names, plus the
+    # ordinary name as a control (a fixture of only exotic names cannot tell "correct" from "mangles
+    # everything").
+    NAMES = [
+        "argus", "x", "dots.and_dash-ok",
+        "spaced name", "name (purpose)", "a/b", "tab\tname",
+        "Loom", "UPPER", "Claude-Chat",
+        "café", "Ωmega",
+    ]
+
+    def _run(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        real_out, real_err = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = out, err
+        try:
+            rc = km.main(argv)
+        finally:
+            sys.stdout, sys.stderr = real_out, real_err
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_cli_answer_is_the_function_answer_for_every_name(self):
+        # The CLI is not a second implementation to be kept in step by hand - it must BE the function.
+        for name in self.NAMES:
+            with self.subTest(name=name):
+                rc, out, _ = self._run(["--safe-persona", name])
+                self.assertEqual(rc, 0)
+                self.assertEqual(out, km._state_safe_persona(name) + "\n")
+
+    def test_answer_is_one_bare_line_a_shell_can_capture(self):
+        # `_safe=$(kijito-inbox-monitor --safe-persona "$p")` is the calling convention, so anything
+        # else on stdout silently becomes part of a filename.
+        rc, out, _ = self._run(["--safe-persona", "name (purpose)"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.count("\n"), 1)
+        self.assertEqual(out.strip(), "name__purpose_")
+
+    def test_needs_no_token_no_network_no_state_file(self):
+        # The hook runs at session start with none of the producer's configuration in hand. If asking
+        # for the rule required a token or a state file, every caller would go back to guessing - which
+        # is the defect. Proven by clearing the token env rather than by reading the code.
+        saved = os.environ.pop("KIJITOMON_TOKEN", None)
+        try:
+            rc, out, _ = self._run(["--safe-persona", "Loom"])
+        finally:
+            if saved is not None:
+                os.environ["KIJITOMON_TOKEN"] = saved
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "loom")
+
+    def test_empty_persona_refuses_and_prints_no_component(self):
+        # A blank answer would be interpolated into a path as an empty component, producing a plausible
+        # file that nothing writes. Refuse by name instead (the tool's could-not-do-it code).
+        rc, out, err = self._run(["--safe-persona", ""])
+        self.assertEqual(rc, 2)
+        self.assertEqual(out, "")
+        self.assertIn("--safe-persona", err)
+
+    def test_rule_casefolds_and_keeps_unicode_alphanumerics(self):
+        # ⛔ THE REGRESSION GUARD, pinned as the two PROPERTIES that actually diverged rather than as a
+        # list of observed strings: replace the rule with a hand-written ASCII filter (the hook's old
+        # `[^A-Za-z0-9._-]`) and both of these fail - the first because it would keep the capital, the
+        # second because it would blank a perfectly good Unicode letter.
+        self.assertEqual(km._state_safe_persona("Loom"), "loom")
+        self.assertEqual(km._state_safe_persona("Ωmega"), "ωmega")
+        # and the control: it still replaces what genuinely cannot be in a filename component.
+        self.assertEqual(km._state_safe_persona("a/b"), "a_b")
+
+    def test_the_rule_is_idempotent(self):
+        # Callers chain: the hook sanitises, a script re-sanitises the result. A rule that is not
+        # idempotent turns that into a third distinct filename.
+        for name in self.NAMES:
+            with self.subTest(name=name):
+                once = km._state_safe_persona(name)
+                self.assertEqual(km._state_safe_persona(once), once)
+
+
+class ReservedFlagParseTest(unittest.TestCase):
+    """Row M332: `reserved` is read from /api/personas with the same tri-state discipline as `retired`."""
+
+    def test_only_a_genuine_bool_is_a_declaration(self):
+        self.assertIs(km._row_reserved({"reserved": True}), True)
+        self.assertIs(km._row_reserved({"reserved": False}), False)
+        for junk in ({}, {"reserved": None}, {"reserved": "true"}, {"reserved": 1}):
+            with self.subTest(row=junk):
+                self.assertIsNone(km._row_reserved(junk))
+
+    def test_fetch_personas_records_it(self):
+        dicts = (km._PERSONA_RESERVED, km._PERSONA_RETIRED, km._PERSONA_WRITE_ONLY,
+                 km._PERSONA_MEMORY_COUNTS, km._PERSONA_READ_COUNTS)
+        saved = [dict(d) for d in dicts]
+        try:
+            body = json.dumps({"result": [{"persona": "all", "reserved": True, "retired": False},
+                                          {"persona": "argus", "reserved": False}]}).encode()
+
+            class Resp:
+                status = 200
+                def read(self):
+                    return body
+                def __enter__(self):
+                    return self
+                def __exit__(self, *a):
+                    return False
+
+            class Opener:
+                def open(self, req, timeout=None):
+                    return Resp()
+
+            self.assertEqual(km.fetch_personas(Opener(), {}), ["all", "argus"])
+            self.assertIs(km._PERSONA_RESERVED["all"], True)
+            self.assertIs(km._PERSONA_RESERVED["argus"], False)
+            self.assertTrue(km._is_debris("all"))
+            self.assertFalse(km._is_debris("argus"))
+        finally:
+            for d, keep in zip(dicts, saved):
+                d.clear()
+                d.update(keep)

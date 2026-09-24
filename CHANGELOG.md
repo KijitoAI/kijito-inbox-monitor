@@ -3,6 +3,22 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [0.5.2] - 2026-09-24
+
+### Added
+- **`--safe-persona PERSONA`** prints the filename component the producer derives from a persona name
+  (casefold, any Unicode alphanumeric kept) and exits. It is the one published persona->filename rule,
+  so the SessionStart hook, the inbox self-test and health tools ask the producer instead of
+  re-implementing it (three copies had drifted).
+
+### Fixed
+- **The persona `reserved` flag is honoured.** `/api/personas` marks the legacy row named after the
+  hive-wide broadcast name (`all`) as `reserved`: nobody works as it. The watcher now treats that row
+  exactly like a declared-`retired` one for alarm purposes: its urgent mail no longer fires the loud
+  "urgent-unanswered" alert (it is named once on the quiet stderr channel instead, and stays readable
+  and counted), and a never-read reserved inbox is classified as clearable debris. A server that does
+  not send the field changes nothing.
+
 ## [0.5.1] - 2026-09-24
 
 ### Fixed
