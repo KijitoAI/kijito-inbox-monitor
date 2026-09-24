@@ -10,12 +10,15 @@
 #                ~/.config/systemd/user/kijito-inbox-monitor@.service
 #             systemctl --user daemon-reload
 #   run:      systemctl --user enable --now kijito-inbox-monitor@YOURPERSONA
+#             (a persona with spaces, parentheses or non-ASCII: escape it for systemd -
+#              systemctl --user enable --now "kijito-inbox-monitor@$(systemd-escape 'Name (dev)').service")
 #   check:    systemctl --user status kijito-inbox-monitor@YOURPERSONA
 #   logs:     journalctl --user -u kijito-inbox-monitor@YOURPERSONA -f
 #
-# BEFORE IT WILL START, create the token file for that persona (0600):
-#   install -m600 /dev/null ~/.config/kijito-inbox-monitor/token.YOURPERSONA
-#   printf '%s' "$YOUR_KIJITO_API_TOKEN" > ~/.config/kijito-inbox-monitor/token.YOURPERSONA
+# BEFORE IT WILL START, create the token file for that persona (0600). Its name uses the
+# producer's filename component for the persona, which you get from the producer itself:
+#   f=~/.config/kijito-inbox-monitor/token.$(kijito-inbox-monitor --safe-persona YOURPERSONA)
+#   install -m600 /dev/null "$f"; printf '%s' "$YOUR_KIJITO_API_TOKEN" > "$f"
 # A missing token is FATAL and says so - the producer will not start half-configured.
 #
 # ⚠️ THIS CAPTURES; IT DOES NOT WAKE. The unit appends one JSON event per new message
@@ -41,7 +44,7 @@
 # different claims, and so are an ENABLED unit and a unit that survives your logout.
 
 [Unit]
-Description=Kijito inbox monitor (persona: %i)
+Description=Kijito inbox monitor (persona: %I)
 Documentation=https://github.com/KijitoAI/kijito-inbox-monitor
 # Start after the network is genuinely up, not merely configured: the producer's first
 # act is an HTTPS poll, and a DNS failure at boot is an avoidable alert.
@@ -60,13 +63,19 @@ Type=simple
 # that skip is at least ANNOUNCED as a `baseline_skipped` diagnostic instead of
 # happening in silence - but announced-and-skipped is still skipped.)
 # ⇒ state lives under ~/.local/state (XDG_STATE_HOME: persists between restarts).
+# ⛔ THE UNIT NEVER SPELLS A PERSONA INTO A PATH (row M313). It passes the persona (%I, the
+# UNESCAPED instance name - %i is systemd's escaped form, so 'Name (dev)' would arrive as
+# 'Name\x20\x28dev\x29' and watch a persona that does not exist), and every file name is
+# filled in by the producer from `{persona}` using the SAME rule `--safe-persona` prints and
+# the launchd plist uses. For a name that is already a safe component (lowercase ASCII),
+# the paths are byte-identical to the older %i form, so upgrading moves nothing.
 ExecStart=%h/.local/bin/kijito-inbox-monitor \
-  --persona %i \
-  --token-file %h/.config/kijito-inbox-monitor/token.%i \
+  --persona %I \
+  --token-file-template %h/.config/kijito-inbox-monitor/token.{persona} \
   --poll-seconds 30 \
   --wait 60 \
-  --state-file %h/.local/state/kijito-inbox-monitor/%i.state \
-  --events-file %h/.local/state/kijito-inbox-monitor/events.%i.ndjson \
+  --state-file-template %h/.local/state/kijito-inbox-monitor/{persona}.state \
+  --events-file-template %h/.local/state/kijito-inbox-monitor/events.{persona}.ndjson \
   --no-content \
   --heartbeat 900
 

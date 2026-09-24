@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -1715,6 +1716,7 @@ class BoundedWindowEndToEndTest(unittest.TestCase):
     class FullArgs:
         persona = personas = None
         all_personas = False
+        state_file_template = None
         alert_after = 3
         poll_seconds = 60
         heartbeat = 0
@@ -5850,3 +5852,146 @@ class OpaqueOutputEnforcementTest(unittest.TestCase):
     def test_systemd_template_enforces_no_content(self):
         with open(os.path.join(self._HERE, "kijito-inbox-monitor@.service.template"), encoding="utf-8") as fh:
             self.assertIn("--no-content", fh.read())
+
+
+class SupervisorPersonaPathParityTest(unittest.TestCase):
+    """Row M313. The systemd unit used to interpolate `%i` - systemd's ESCAPED instance name - into
+    --state-file / --events-file / --token-file, so the UNIT decided the file names and disagreed with the
+    producer (and with the launchd plist) for any persona that is not already a safe component. Now the
+    unit passes the persona (%I, unescaped) and the producer fills every `{persona}` path from its own
+    rule. These tests expand BOTH shipped templates the way their supervisors do and require every
+    persona-named file to carry exactly the component `--safe-persona` prints."""
+
+    NAMES = ["argus", "Loom", "name (purpose)", "\u03a9mega", "two words", "Claude-chat"]
+    HOME = "/HOMEDIR"
+    _HERE = os.path.dirname(os.path.abspath(__file__))
+
+    def _systemd_argv_home(self, persona, home):
+        saved, self.HOME = self.HOME, home
+        try:
+            return self._systemd_argv(persona)
+        finally:
+            self.HOME = saved
+
+    def _systemd_argv(self, persona):
+        with open(os.path.join(self._HERE, "kijito-inbox-monitor@.service.template"), encoding="utf-8") as fh:
+            text = fh.read().replace("\\\n", " ")
+        line = next(l for l in text.splitlines() if l.startswith("ExecStart="))
+        self.assertNotIn("%i", line, "the unit must not spell the escaped instance name into ExecStart")
+        # systemd's own expansion: %h = home, %I = the UNESCAPED instance name (measured on systemd 255:
+        # an instance escaped by systemd-escape expands %i to 'Name\\x20...' and %I to 'Name ...').
+        # It is ONE argv word even with spaces in it - systemd splits the line before substituting.
+        words = line[len("ExecStart="):].split()
+        return [w.replace("%h", self.HOME).replace("%I", persona) for w in words][1:]
+
+    def _launchd_events_template(self):
+        with open(os.path.join(self._HERE, "com.kijito.inbox-monitor.plist.template"), encoding="utf-8") as fh:
+            strings = re.findall(r"<string>([^<]*)</string>", fh.read())
+        return strings[strings.index("--events-file-template") + 1].replace("__HOME__", self.HOME)
+
+    def test_every_persona_named_file_uses_the_producers_component_on_both_supervisors(self):
+        for name in self.NAMES:
+            with self.subTest(persona=name):
+                safe = km._state_safe_persona(name)
+                args = km.build_parser().parse_args(self._systemd_argv(name))
+                km.validate_args(args)
+                self.assertEqual(args.persona, [name], "the unit must hand the producer the REAL persona")
+                events = km._persona_path(args.events_file_template, name)
+                state = km._persona_path(args.state_file_template, name)
+                self.assertEqual(os.path.basename(events), "events.%s.ndjson" % safe)
+                self.assertEqual(os.path.basename(state), "%s.state" % safe)
+                self.assertEqual(os.path.basename(args.token_file), "token.%s" % safe)
+                launchd = km._persona_path(self._launchd_events_template(), name)
+                self.assertEqual(os.path.basename(events), os.path.basename(launchd),
+                                 "launchd and systemd must name a persona's event stream identically")
+
+    def test_upgrading_a_safe_named_unit_moves_nothing(self):
+        # Every persona on a real fleet today is lowercase ASCII; for those the new unit resolves to the
+        # SAME paths the %i form did, so an upgrade needs no migration and no consumer re-arm.
+        args = km.build_parser().parse_args(self._systemd_argv("argus"))
+        km.validate_args(args)
+        base = self.HOME + "/.local/state/kijito-inbox-monitor/"
+        self.assertEqual(km._persona_path(args.events_file_template, "argus"), base + "events.argus.ndjson")
+        self.assertEqual(km._persona_path(args.state_file_template, "argus"), base + "argus.state")
+        self.assertEqual(args.token_file, self.HOME + "/.config/kijito-inbox-monitor/token.argus")
+
+    def test_the_state_file_template_reaches_the_watch_target(self):
+        d = tempfile.mkdtemp()
+
+        class A(BoundedWindowEndToEndTest.FullArgs):
+            state_file = None
+            state_file_template = os.path.join(d, "{persona}.state")
+            seed_at = None
+        t = km.WatchTarget("Loom", "http://x/api/inbox?persona=Loom", None, {}, A(),
+                           BoundedWindowEndToEndTest.RecordingEmitter())
+        self.addCleanup(t.state_file.unlock)
+        self.assertEqual(t.state_file.path, os.path.join(d, "loom.state"))
+
+    def test_template_flags_are_validated(self):
+        def err(argv):
+            try:
+                km.validate_args(km.build_parser().parse_args(argv))
+            except km.FatalConfig as e:
+                return str(e)
+            return None
+        self.assertIn("mutually exclusive", err(["--persona", "a", "--state-file", "x", "--state-file-template", "{persona}"]))
+        self.assertIn("placeholder", err(["--persona", "a", "--state-file-template", "x.state"]))
+        self.assertIn("mutually exclusive", err(["--persona", "a", "--token-file", "x", "--token-file-template", "t.{persona}"]))
+        self.assertIn("placeholder", err(["--persona", "a", "--token-file-template", "tok"]))
+        self.assertIn("exactly one --persona", err(["--persona", "a", "--persona", "b", "--token-file-template", "t.{persona}"]))
+        self.assertIsNone(err(["--persona", "A b", "--token-file-template", "/t.{persona}"]))
+
+
+class SystemdUnitMigrationRewriteTest(unittest.TestCase):
+    """Row M313: scripts/migrate-systemd-unit.sh rewrites a DEPLOYED pre-M313 unit into the producer-named
+    form. Its end-to-end behaviour (files moved, stopped instances restarted, an old-path `tail -F` kept
+    alive) was proven against real systemd when it was written; this pins the REWRITE, which is the part
+    that must stay right on every machine, by running the script's dry run on the pre-M313 unit text."""
+
+    OLD = ("[Unit]\nDescription=Kijito inbox monitor (persona: %i)\n[Service]\n"
+           "ExecStart=%h/.local/bin/kijito-inbox-monitor \\\n  --persona %i \\\n"
+           "  --token-file %h/.config/kijito-inbox-monitor/token.%i \\\n  --poll-seconds 30 \\\n"
+           "  --state-file %h/.local/state/kijito-inbox-monitor/%i.state \\\n"
+           "  --events-file %h/.local/state/kijito-inbox-monitor/events.%i.ndjson \\\n  --heartbeat 900\n")
+
+    def _run(self, unit_text):
+        d = tempfile.mkdtemp()
+        with open(os.path.join(d, "kjt-m313-rewrite-test@.service"), "w") as fh:
+            fh.write(unit_text)
+        here = os.path.dirname(os.path.abspath(__file__))
+        return subprocess.run(["bash", os.path.join(here, "scripts", "migrate-systemd-unit.sh"),
+                               "--unit", "kjt-m313-rewrite-test", "--unit-dir", d, "--bin", "/nonexistent"],
+                              capture_output=True, text=True)
+
+    def test_every_percent_i_path_becomes_a_producer_template(self):
+        r = self._run(self.OLD)
+        after = next(l for l in r.stdout.splitlines() if l.startswith("ExecStart after:"))
+        self.assertNotIn("%i", after)
+        self.assertIn("--persona %I", after)
+        for flag, path in (("--token-file-template", "token.{persona}"),
+                           ("--state-file-template", "{persona}.state"),
+                           ("--events-file-template", "events.{persona}.ndjson")):
+            self.assertRegex(after, re.escape(flag) + r" \S*" + re.escape(path))
+        self.assertIn("--poll-seconds 30", after)          # everything else untouched
+        self.assertIn("REFUSING to rewrite", r.stdout)       # /nonexistent lacks the new flags
+        self.assertEqual(r.returncode, 0, "a dry run never fails")
+
+    def test_the_rewritten_unit_resolves_to_the_same_paths_the_shipped_template_does(self):
+        r = self._run(self.OLD)
+        after = next(l for l in r.stdout.splitlines() if l.startswith("ExecStart after:"))
+        argv = [w.replace("%h", "/h").replace("%I", "Loom") for w in after.split()[3:]]
+        args = km.build_parser().parse_args(argv)
+        km.validate_args(args)
+        shipped = km.build_parser().parse_args(SupervisorPersonaPathParityTest()._systemd_argv_home("Loom", "/h"))
+        km.validate_args(shipped)
+        self.assertEqual(args.token_file, shipped.token_file)
+        self.assertEqual(args.state_file_template, shipped.state_file_template)
+        self.assertEqual(args.events_file_template, shipped.events_file_template)
+
+    def test_an_already_migrated_unit_is_left_alone(self):
+        # The shipped template IS the migrated form, so running the script on it must be a no-op report.
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "kijito-inbox-monitor@.service.template"), encoding="utf-8") as fh:
+            r = self._run(fh.read())
+        self.assertIn("already migrated", r.stdout)
+        self.assertNotIn("ExecStart after:", r.stdout)

@@ -545,6 +545,9 @@ four sat above it. Only the newest page's count answers the question "is there u
 | `--events-file PATH` | Write NDJSON events to an owned, size-rotated file (survives rotation) instead of stdout. Consumers `tail -F` it. |
 | `--events-file-template PATH` | Per-persona owned, rotated files, e.g. `events.{persona}.ndjson`; each session consumes its own. Must contain `{persona}`. Mutually exclusive with `--events-file`. |
 | `--state-file PATH` | Persist and resume cursor/liveness; single-writer locked. Persona targets derive one file per persona. Recommended under a supervisor. |
+| `--state-file-template PATH` | Like `--state-file`, with `{persona}` filled in by the producer (the component `--safe-persona` prints). Use it in a supervisor unit so the unit never spells a persona into a path. |
+| `--token-file-template PATH` | Like `--token-file`, with `{persona}` filled in by the producer for the one `--persona` target. |
+| `--safe-persona NAME` | Print the filename component the producer uses for NAME, then exit. Anything that needs to name a persona's files should ask this rather than re-implement the rule. |
 | `--wait N` | Long-poll hold (s) requested from the server so new mail wakes the watcher near-instantly at ~the same request rate (default 50; `0` disables). Falls back to interval polling against a server that doesn't support it, and auto-upgrades when it does. |
 | `--poll-seconds N` | Interval between polls when long-poll is off/unsupported (default 60). |
 | `--alert-after N` | Consecutive failures before an `alert` (default 3, min 1). A single transient failure is normal. |

@@ -33,7 +33,7 @@ try:
 except ImportError:  # pragma: no cover - Windows
     fcntl = None
 
-__version__ = "0.5.3"
+__version__ = "0.5.4"
 SOURCE = "kijito-inbox"
 # A named User-Agent is REQUIRED: api.kijito.ai is fronted by a WAF that 403s the default Python-urllib UA.
 USER_AGENT = "kijito-inbox-monitor/%s" % __version__
@@ -1841,6 +1841,17 @@ def make_opener_for(url):
     return build_opener(pinned)
 
 
+def _persona_path(template, persona):
+    """Fill a `{persona}` path template with the producer's OWN filename component for PERSONA (row M313).
+
+    Every per-persona path a supervisor needs - events, state, token - goes through here, so the unit file
+    (systemd `%i`, a plist, a shell script) never spells a filename itself. `%i` is systemd's ESCAPED
+    instance name and passes a persona's raw case through, so a unit that interpolated it disagreed with
+    the producer for any name that is not already a safe component ('Loom', 'name (purpose)', 'Ωmega').
+    """
+    return template.replace("{persona}", _state_safe_persona(persona))
+
+
 def _state_path_for_persona(base_path, persona):
     if not base_path or not persona:
         return base_path
@@ -1991,7 +2002,8 @@ class WatchTarget:
         cp = urllib.parse.urlsplit(url)
         self.unread_persona = dict(urllib.parse.parse_qsl(cp.query)).get("persona") or persona
 
-        state_path = _state_path_for_persona(args.state_file, persona)
+        state_path = (_persona_path(args.state_file_template, persona) if args.state_file_template
+                      else _state_path_for_persona(args.state_file, persona))
         if state_path:
             self.state_file = StateFile(state_path, self.identity)
             if not args.self_test:
@@ -3606,6 +3618,11 @@ def build_parser():
     p.add_argument("--state-file",
                    help="Persist+resume cursor/FSM; single-writer locked. Kijito persona targets derive one "
                         "file per persona from this base path. Recommended w/ a supervisor.")
+    p.add_argument("--state-file-template",
+                   help="Per-persona state file named by the PRODUCER, e.g. ~/.local/state/kijito-inbox-monitor/"
+                        "{persona}.state; '{persona}' is replaced by the same filename component --safe-persona "
+                        "prints. Use it in a supervisor unit instead of spelling the persona into --state-file "
+                        "(row M313). Mutually exclusive with --state-file.")
     p.add_argument("--heartbeat", type=int, help="Emit a heartbeat event every N seconds (external dead-man's-switch).")
     p.add_argument("--activity-file",
                    help="Publish who AUTHORED mail most recently, as JSON, refreshed each tick. Lets a "
@@ -3632,6 +3649,10 @@ def build_parser():
                         "(reported verbatim, so a reader can judge magnitude). Default 1.")
     p.add_argument("--auth-header", help="Header NAME for the token (default Authorization: Bearer).")
     p.add_argument("--token-file", help="File holding the auth token (wins over $KIJITOMON_TOKEN).")
+    p.add_argument("--token-file-template",
+                   help="Like --token-file, with '{persona}' replaced by the producer's filename component for the "
+                        "ONE --persona target (row M313), e.g. ~/.config/kijito-inbox-monitor/token.{persona}. "
+                        "Mutually exclusive with --token-file.")
     p.add_argument("--no-fast-path", action="store_true",
                    help="Disable the /api/notify/pending unread pre-check; always full-poll the inbox list.")
     p.add_argument("--resync-every", type=int, default=10,
@@ -3673,6 +3694,19 @@ def validate_args(args):
         raise FatalConfig("--events-file-template must contain the '{persona}' placeholder")
     if (args.events_file or args.events_file_template) and args.emit != "stdout-jsonl":
         sys.stderr.write("kijito-inbox-monitor: WARNING --events-file/-template ignored (emit mode is %s)\n" % args.emit)
+    # Row M313: the persona-named paths come from the producer's rule, never from the supervisor.
+    if args.state_file and args.state_file_template:
+        raise FatalConfig("--state-file and --state-file-template are mutually exclusive")
+    if args.state_file_template and "{persona}" not in args.state_file_template:
+        raise FatalConfig("--state-file-template must contain the '{persona}' placeholder")
+    if args.token_file and args.token_file_template:
+        raise FatalConfig("--token-file and --token-file-template are mutually exclusive")
+    if args.token_file_template:
+        if "{persona}" not in args.token_file_template:
+            raise FatalConfig("--token-file-template must contain the '{persona}' placeholder")
+        if len(args.persona or []) != 1 or args.personas or args.all_personas:
+            raise FatalConfig("--token-file-template needs exactly one --persona target (one token file per unit)")
+        args.token_file = _persona_path(args.token_file_template, args.persona[0])
     if args.seed_at is not None:
         single = len(args.persona or []) == 1 and not args.personas and not args.all_personas
         if not single:

@@ -3,6 +3,25 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [0.5.4] - 2026-09-24
+
+### Fixed
+- **The systemd unit no longer decides file names.** `kijito-inbox-monitor@.service.template` spelled
+  systemd's `%i` into `--state-file`, `--events-file` and `--token-file`. `%i` is the ESCAPED instance
+  name, so for any persona that is not already lowercase ASCII (`Loom`, `name (purpose)`, `Ωmega`) the unit
+  named its files differently from the producer and from the launchd plist, and passed the escaped
+  string as the persona itself. The unit now passes `--persona %I` (unescaped) and the producer fills in
+  every path from `{persona}` with the same rule `--safe-persona` prints. For names that are already
+  lowercase ASCII the paths are byte-identical to before, so upgrading moves nothing.
+
+### Added
+- `--state-file-template` and `--token-file-template`, the `{persona}` counterparts of `--state-file` and
+  `--token-file`.
+- `scripts/migrate-systemd-unit.sh` migrates a deployed unit: dry run by default, `--apply` to act,
+  idempotent, keeps the old unit file, refuses to rewrite until the installed producer supports the new
+  flags, and for an instance whose files do move keeps the old event path working (hard link) so a
+  running `tail -F` consumer is not cut off.
+
 ## [0.5.3] - 2026-09-24
 
 ### Changed
