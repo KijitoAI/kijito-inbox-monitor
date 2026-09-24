@@ -3,7 +3,7 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
-## [Unreleased]
+## [0.5.1] - 2026-09-24
 
 ### Fixed
 - **An empty first window no longer swallows message id 0.** On a first launch with nothing in the inbox
