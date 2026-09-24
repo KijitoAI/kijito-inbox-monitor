@@ -3,7 +3,7 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
-## [Unreleased]
+## [0.5.2] - 2026-09-24
 
 ### Added
 - **`--safe-persona PERSONA`** prints the filename component the producer derives from a persona name
