@@ -3,6 +3,19 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [0.5.5] - 2026-09-24
+
+### Added
+- **`still_unread`: a bounded reminder for mail that was announced and then left unread (row M229).**
+  The watcher announces each message once (`new`), so a message an agent looked at without marking it
+  read used to sit unread forever with nothing to bring it back. Now, when already-announced mail is still
+  unread `--still-unread-after` seconds after it was sent (default 7200; `0` turns it off), ONE
+  `still_unread` event per poll lists those messages. Each message is reminded at most once per window
+  and at most `--still-unread-max` times (default 3); retired, reserved and write_only inboxes are never
+  reminded; the first poll after a restart only takes note, so restarts do not produce a burst. It never
+  moves the cursor. Its `wake_class` is `diagnostic` (it wakes; `new` remains the only `mail`). Consumers
+  that filter by event name should add `still_unread` to their list.
+
 ## [0.5.4] - 2026-09-24
 
 ### Fixed

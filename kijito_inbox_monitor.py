@@ -33,7 +33,7 @@ try:
 except ImportError:  # pragma: no cover - Windows
     fcntl = None
 
-__version__ = "0.5.4"
+__version__ = "0.5.5"
 SOURCE = "kijito-inbox"
 # A named User-Agent is REQUIRED: api.kijito.ai is fronted by a WAF that 403s the default Python-urllib UA.
 USER_AGENT = "kijito-inbox-monitor/%s" % __version__
@@ -952,6 +952,11 @@ _LIVENESS_KINDS = frozenset({"heartbeat", "armed"})
 # liveness is a diagnostic, INCLUDING kinds absent from this table (see _wake_class).
 _WAKE_CLASS_BY_KIND = {
     "new":              WAKE_CLASS_MAIL,
+    # Row M229: a reminder ABOUT mail (already-notified messages still unread past the threshold), not a
+    # message itself - one event names several ids and carries no body, so it is NOT `mail` (`new` stays
+    # the only mail, pinned by a test). As a diagnostic it WAKES, which is its whole job. Bounded by
+    # construction; see WatchTarget._resurface_still_unread.
+    "still_unread":     WAKE_CLASS_DIAGNOSTIC,
     "alert":            WAKE_CLASS_DIAGNOSTIC,
     "recovered":        WAKE_CLASS_DIAGNOSTIC,
     "state_corrupt":    WAKE_CLASS_DIAGNOSTIC,
@@ -1181,6 +1186,7 @@ class Emitter:
                 "capped_to": "KIJITOMON_CAPPED_TO", "dropped": "KIJITOMON_DROPPED",
                 "stranded_inboxes": "KIJITOMON_STRANDED",
                 "dormant_inboxes": "KIJITOMON_DORMANT",
+                "ids": "KIJITOMON_IDS", "oldest_age_seconds": "KIJITOMON_OLDEST_AGE",
             }
             for k, envname in keymap.items():
                 if k in event and event[k] is not None:
@@ -1852,6 +1858,20 @@ def _persona_path(template, persona):
     return template.replace("{persona}", _state_safe_persona(persona))
 
 
+def _created_epoch(created):
+    """A message's `created` as epoch seconds, or None if it cannot be read. The server writes naive UTC
+    ('2026-09-24 21:34:24.943580'); an explicit offset or 'Z' is honoured when present."""
+    if not isinstance(created, str) or not created:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(created.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.timestamp()
+
+
 def _state_path_for_persona(base_path, persona):
     if not base_path or not persona:
         return base_path
@@ -2153,6 +2173,69 @@ class WatchTarget:
         sys.stderr.write("kijito-inbox-monitor: WARNING delivery of message %s to persona %r FAILED; HOLDING the "
                          "cursor below it so it is re-delivered rather than skipped (further reports "
                          "suppressed until delivery recovers)\n" % (mid, self.persona))
+
+    def _resurface_still_unread(self, items, now=None):
+        """Row M229 BACKSTOP: re-surface mail that was notified once and then left UNREAD.
+
+        The producer is edge-triggered per id - it emits `new` exactly once per message - so a message the
+        agent peeked at (mark_read=false), acted on or meant to, and never consumed sits unread and INERT:
+        never notified again, visible only to a staleness alarm. The ROOT fix is the consumer's (read
+        what you handled with mark_read=true, shipped as wake-workflow doctrine 2026-08-12); this is the
+        bounded backstop for what still slips through, and it is built so it cannot become a storm:
+          * only for ids AT OR BELOW the cursor (already notified) whose server `read` flag is False and
+            whose `created` is at least --still-unread-after seconds old;
+          * at most once per id per window (--still-unread-after), and at most --still-unread-max times per
+            id in this process - deliberately deferred mail is reminded a few times, not forever;
+          * ONE summarising `still_unread` event per poll however many ids are due (one wake, not N);
+          * never for debris (retired/reserved, row M332) or a write_only inbox;
+          * the FIRST full poll of a process only notes what is already aged and emits nothing, so every
+            restart (a deploy, a reboot) does not replay a burst of reminders.
+        The ledger is per process: a restart can remind again, at most --still-unread-max times per id.
+        It never touches the cursor - a reminder is not a delivery, and failing to emit one loses nothing.
+        """
+        after = getattr(self.args, "still_unread_after", 0) or 0
+        if after <= 0 or _is_debris(self.persona) or _PERSONA_WRITE_ONLY.get(self.persona) is True:
+            return []
+        cap = max(1, getattr(self.args, "still_unread_max", 3) or 1)
+        now = time.time() if now is None else now
+        ledger = self.__dict__.setdefault("still_unread_seen", {})     # id -> (times reminded, last at)
+        primed = self.__dict__.get("still_unread_primed", False)
+        cursor = self.cursor if isinstance(self.cursor, int) else -1
+        due, visible = [], set()
+        for m in items:
+            mid = m.get("id")
+            if not isinstance(mid, int) or isinstance(mid, bool) or mid > cursor or m.get("read") is not False:
+                continue
+            visible.add(mid)
+            born = _created_epoch(m.get("created"))
+            if born is None or now - born < after:
+                continue
+            n, last = ledger.get(mid, (0, None))
+            if not primed:
+                ledger[mid] = (n, now)          # restart: note it, remind one full window from now
+                continue
+            if n >= cap or (last is not None and now - last < after):
+                continue
+            due.append((mid, m, now - born, n))
+        for mid in list(ledger):                # read, or gone from the window: forget it
+            if mid not in visible:
+                del ledger[mid]
+        self.still_unread_primed = True
+        if not due:
+            return []
+        oldest = max(age for _, _, age, _ in due)
+        ok = self.emitter.lifecycle(
+            "still_unread", persona=self.persona,
+            ids=[mid for mid, _, _, _ in due],
+            senders=sorted({m.get("from") for _, m, _, _ in due if m.get("from")}),
+            oldest_age_seconds=int(oldest), after_seconds=int(after),
+            reason=("still-unread: %d message(s) in this inbox were notified and are still UNREAD after "
+                    "%ds or more (oldest %ds). Read what you have handled with mark_read=true; this "
+                    "reminder repeats at most %d time(s) per message." % (len(due), after, int(oldest), cap)))
+        if ok is True:
+            for mid, _, _, n in due:
+                ledger[mid] = (n + 1, now)
+        return [mid for mid, _, _, _ in due]
 
     def _delivery_recovered(self):
         if not self.delivery_blocked:
@@ -2579,6 +2662,7 @@ class WatchTarget:
                     delivered = set()
                 if blocked_at is None:
                     self._delivery_recovered()
+                self._resurface_still_unread(items)
 
                 # §5.2 UNREAD MAIL WE CANNOT SEE. Fires on the FALSE->TRUE edge and releases itself when
                 # the condition clears, so it needs no ack: an ack would let someone silence "there is
@@ -3655,6 +3739,13 @@ def build_parser():
                         "Mutually exclusive with --token-file.")
     p.add_argument("--no-fast-path", action="store_true",
                    help="Disable the /api/notify/pending unread pre-check; always full-poll the inbox list.")
+    p.add_argument("--still-unread-after", type=int, default=7200, metavar="SECONDS",
+                   help="Row M229: emit ONE `still_unread` event per poll for mail that was already notified and "
+                        "is still unread this many seconds after it was sent (default 7200; 0 disables). At most "
+                        "once per message per window, capped by --still-unread-max; never for retired/reserved or "
+                        "write_only inboxes.")
+    p.add_argument("--still-unread-max", type=int, default=3, metavar="N",
+                   help="How many times one message may be re-surfaced as still_unread per process (default 3).")
     p.add_argument("--resync-every", type=int, default=10,
                    help="Fast-path safety floor: force a full inbox poll after at most N consecutive cheap "
                         "skips, so a stale/wrong unread count can never blind the watcher (default 10, min 1).")
@@ -3688,6 +3779,10 @@ def validate_args(args):
         raise FatalConfig("--max-replay must be >= 0")
     if args.keep_logs < 1:
         raise FatalConfig("--keep-logs must be >= 1")
+    if args.still_unread_after < 0:
+        raise FatalConfig("--still-unread-after must be >= 0 (0 disables)")
+    if args.still_unread_max < 1:
+        raise FatalConfig("--still-unread-max must be >= 1")
     if args.events_file and args.events_file_template:
         raise FatalConfig("--events-file and --events-file-template are mutually exclusive")
     if args.events_file_template and "{persona}" not in args.events_file_template:

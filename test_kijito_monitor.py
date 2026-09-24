@@ -5995,3 +5995,122 @@ class SystemdUnitMigrationRewriteTest(unittest.TestCase):
             r = self._run(fh.read())
         self.assertIn("already migrated", r.stdout)
         self.assertNotIn("ExecStart after:", r.stdout)
+
+
+class StillUnreadBackstopTest(unittest.TestCase):
+    """Row M229: mail that was notified once and then left UNREAD is re-surfaced - boundedly. The producer
+    is edge-triggered per id, so without this such a message sits inert forever. These pin the bounds that
+    keep a reminder from becoming a storm: priming on start, once per id per window, a per-id cap, one
+    event per poll, and silence for debris and write_only inboxes."""
+
+    E2E = BoundedWindowEndToEndTest
+    T0 = km._created_epoch("2026-09-24 00:00:00")
+    H = 3600
+
+    def setUp(self):
+        self._saved = [dict(d) for d in (km._PERSONA_RETIRED, km._PERSONA_RESERVED, km._PERSONA_WRITE_ONLY)]
+        for d in (km._PERSONA_RETIRED, km._PERSONA_RESERVED, km._PERSONA_WRITE_ONLY):
+            d.clear()
+
+    def tearDown(self):
+        for d, keep in zip((km._PERSONA_RETIRED, km._PERSONA_RESERVED, km._PERSONA_WRITE_ONLY), self._saved):
+            d.clear()
+            d.update(keep)
+
+    def _target(self, after=7200, cap=3, cursor=10, em=None):
+        em = em or self.E2E.RecordingEmitter()
+        t = self.E2E()._target(cursor=cursor, emitter=em)
+        t.args.still_unread_after, t.args.still_unread_max = after, cap
+        return t, em
+
+    def _alerts(self, em):
+        return [f for e, f in em.events if e == "still_unread"]
+
+    ITEMS = [{"id": 5, "from": "river", "read": False, "created": "2026-09-24 00:00:00"},
+             {"id": 6, "from": "river", "read": True, "created": "2026-09-24 00:00:00"},    # already read
+             {"id": 11, "from": "river", "read": False, "created": "2026-09-24 00:00:00"}]  # not yet notified
+
+    def test_primes_on_start_then_reminds_once_per_window_up_to_the_cap(self):
+        t, em = self._target()
+        now = self.T0 + 3 * self.H
+        self.assertEqual(t._resurface_still_unread(self.ITEMS, now), [], "a restart must not burst")
+        self.assertEqual(t._resurface_still_unread(self.ITEMS, now + 60), [], "not before a full window")
+        seen = [t._resurface_still_unread(self.ITEMS, now + k * 7200) for k in range(1, 6)]
+        self.assertEqual(seen, [[5], [5], [5], [], []], "once per window, capped at 3")
+        self.assertEqual(len(self._alerts(em)), 3)
+        self.assertEqual(self._alerts(em)[0]["ids"], [5])
+        self.assertEqual(self._alerts(em)[0]["senders"], ["river"])
+
+    def test_young_mail_is_not_reminded(self):
+        t, em = self._target()
+        t.still_unread_primed = True
+        self.assertEqual(t._resurface_still_unread(self.ITEMS, self.T0 + 3000), [])
+
+    def test_several_due_messages_are_ONE_event(self):
+        items = [dict(self.ITEMS[0]), dict(self.ITEMS[0], id=7, **{"from": "assay"})]
+        t, em = self._target()
+        t.still_unread_primed = True
+        self.assertEqual(t._resurface_still_unread(items, self.T0 + 3 * self.H), [5, 7])
+        self.assertEqual(len(self._alerts(em)), 1)
+        self.assertEqual(self._alerts(em)[0]["senders"], ["assay", "river"])
+
+    def test_read_mail_leaves_the_ledger(self):
+        t, _ = self._target()
+        t.still_unread_primed = True
+        t._resurface_still_unread(self.ITEMS, self.T0 + 3 * self.H)
+        self.assertIn(5, t.still_unread_seen)
+        t._resurface_still_unread([dict(self.ITEMS[0], read=True)], self.T0 + 4 * self.H)
+        self.assertNotIn(5, t.still_unread_seen)
+
+    def test_a_failed_emit_is_retried_not_counted(self):
+        class Refusing(self.E2E.RecordingEmitter):
+            def lifecycle(self, event, **f):
+                self.events.append((event, f))
+                return False
+        t, em = self._target(em=Refusing())
+        t.still_unread_primed = True
+        now = self.T0 + 3 * self.H
+        t._resurface_still_unread(self.ITEMS, now)
+        self.assertEqual(t._resurface_still_unread(self.ITEMS, now + 1), [5], "undelivered = not reminded yet")
+
+    def test_debris_and_write_only_inboxes_are_never_reminded(self):
+        for flag in (km._PERSONA_RETIRED, km._PERSONA_RESERVED, km._PERSONA_WRITE_ONLY):
+            with self.subTest(flag=flag):
+                self.setUp()
+                flag["argus"] = True
+                t, em = self._target()
+                t.still_unread_primed = True
+                self.assertEqual(t._resurface_still_unread(self.ITEMS, self.T0 + 9 * self.H), [])
+                self.assertEqual(self._alerts(em), [])
+
+    def test_zero_disables(self):
+        t, em = self._target(after=0)
+        t.still_unread_primed = True
+        self.assertEqual(t._resurface_still_unread(self.ITEMS, self.T0 + 99 * self.H), [])
+
+    def test_it_is_wired_into_the_full_poll(self):
+        t, em = self._target(after=1, cursor=10)
+        t.still_unread_primed = True
+        old = [{"id": 5, "from": "river", "read": False, "created": "2020-01-01 00:00:00"}]
+        self.E2E()._run(t, self.E2E()._fetch(old, 0))
+        alerts = self._alerts(em)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["ids"], [5])
+        self.assertEqual(t.cursor, 10, "a reminder never moves the cursor")
+        self.assertEqual(em.new_ids, [], "and is never re-emitted as `new`")
+
+    def test_created_parsing(self):
+        self.assertEqual(km._created_epoch("2026-09-24 00:00:00"), km._created_epoch("2026-09-24T00:00:00Z"))
+        self.assertEqual(km._created_epoch("2026-09-24T02:00:00+02:00"), self.T0)
+        for junk in (None, "", "yesterday", 17):
+            self.assertIsNone(km._created_epoch(junk))
+
+    def test_flags_are_validated(self):
+        def err(argv):
+            try:
+                km.validate_args(km.build_parser().parse_args(argv))
+            except km.FatalConfig as e:
+                return str(e)
+        self.assertIn(">= 0", err(["--persona", "a", "--still-unread-after", "-1"]))
+        self.assertIn(">= 1", err(["--persona", "a", "--still-unread-max", "0"]))
+        self.assertIsNone(err(["--persona", "a", "--still-unread-after", "0"]))
