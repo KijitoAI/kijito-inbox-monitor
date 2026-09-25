@@ -592,7 +592,13 @@ read-state-neutral (DONE-WHEN #5 holds after self-test).
 - **Content (JSON):** `{"identity":<canonical-id>, "cursor":<int|null>, "state":"UP|DOWN",
   "consecutive_failures":<int>}`, plus the optional pin fields written only when they are in force:
   `emitted_above` (list of int), `gap_alerted` (int), `pin_forced` (true), `pin_evidence_intact` (false),
-  `state_corrupt` (true), `pin_release_at` (int).
+  `state_corrupt` (true), `pin_release_at` (int). Also `unread_hidden` (true) while the unread-not-shown alarm
+  is announced, and `unread` (non-negative int, row M309): the watched persona's unread count as of the poll that
+  wrote the file. `unread` is INFORMATIONAL - it is written for local readers (a status line, a health check) and
+  nothing in the producer reads it back to decide what to emit. It is written only by a poll whose
+  `/api/notify/pending` read succeeded (a persona missing from a good response is a real 0 - the server omits
+  personas with nothing pending); a poll without that read writes no `unread`, so its absence means UNKNOWN,
+  never zero. A reader should also judge freshness from the file's mtime: the file is rewritten every poll.
 - **Every persisted field is read STRICTLY, and anything unrecognised fails CLOSED** (Loom re-audit 7, HIGH 2).
   Booleans must be JSON booleans and integers must be real integers - a JSON `1` for `pin_forced` used to
   normalise to `false` and silently UNPIN the watermark, letting the replay cap cross the very span the pin was

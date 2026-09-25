@@ -3,6 +3,17 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [0.5.7] - 2026-09-25
+
+### Added
+- **The state file carries the watched persona's unread count (row M309).** The producer read every persona's
+  unread count from `/api/notify/pending` each poll and kept it only in memory, so nothing local - a status
+  line, a health check - could show one. Each poll that had a count now writes it as `unread` (a
+  non-negative integer); a poll that had no count writes no `unread`, so its absence means unknown, never
+  zero. It is written with the fast path on or off. Nothing in the producer reads it back to decide what to
+  emit. It is read as strictly as the other persisted fields: anything but a non-negative integer makes the
+  file CORRUPT. Files written by older versions, which lack the field, load as before.
+
 ## [0.5.6] - 2026-09-25
 
 ### Fixed

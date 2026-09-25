@@ -6193,3 +6193,84 @@ class NegativeFailureCountStateTest(unittest.TestCase):
 
     def test_zero_still_loads(self):
         self.assertIsNot(self._load(0), km.CORRUPT_STATE)
+
+
+class PersistedUnreadCountTest(unittest.TestCase):
+    """Row M309: the producer knew every persona's unread count and threw it away, so nothing local - a
+    status line, a health check - could show one. The count now rides in the state file, written by every
+    poll that HAD a count, absent from every poll that did not (absent = unknown, never zero), and read as
+    strictly as every other persisted field."""
+
+    RecordingEmitter = BoundedWindowEndToEndTest.RecordingEmitter
+    FullArgs = BoundedWindowEndToEndTest.FullArgs
+    _target = BoundedWindowEndToEndTest._target
+    _fetch = BoundedWindowEndToEndTest._fetch
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.path = os.path.join(self._dir.name, "argus.state")
+
+    def _poll(self, counts_available, unread_counts, no_fast_path=True):
+        t = self._target(100, self.RecordingEmitter())
+        t.args.no_fast_path = no_fast_path
+        t.state_file = km.StateFile(self.path, "idx")
+        orig, km.fetch = km.fetch, self._fetch([], 0)
+        try:
+            t.poll_once(counts_available=counts_available, unread_counts=unread_counts)
+        finally:
+            km.fetch = orig
+        with open(self.path) as f:
+            return json.load(f)
+
+    def _load(self, extra):
+        d = {"identity": "idx", "cursor": 100, "state": "UP", "consecutive_failures": 0}
+        d.update(extra)
+        with open(self.path, "w") as f:
+            json.dump(d, f)
+        err, sys.stderr = sys.stderr, io.StringIO()
+        try:
+            return km.StateFile(self.path, "idx").load()
+        finally:
+            sys.stderr = err
+
+    def test_a_poll_WITH_a_count_persists_it(self):
+        self.assertEqual(self._poll(True, {"argus": 7, "river": 2})["unread"], 7)
+
+    def test_it_is_persisted_with_the_fast_path_OFF(self):
+        # The fast path's `last_unread` only exists while the fast path is on; the fleet's systemd units
+        # and every --no-fast-path user would otherwise publish nothing at all.
+        self.assertEqual(self._poll(True, {"argus": 3}, no_fast_path=True)["unread"], 3)
+        self.assertEqual(self._poll(True, {"argus": 4}, no_fast_path=False)["unread"], 4)
+
+    def test_a_persona_missing_from_a_GOOD_response_is_zero(self):
+        # /api/notify/pending omits a persona with nothing pending (measured 2026-09-25: river absent).
+        self.assertEqual(self._poll(True, {"river": 2})["unread"], 0)
+
+    def test_a_poll_WITHOUT_a_count_writes_NO_count(self):
+        # Unknown must not be published as zero, and must not leave the PREVIOUS figure standing either.
+        self._poll(True, {"argus": 9})
+        self.assertNotIn("unread", self._poll(False, {}))
+
+    def test_the_count_round_trips_through_load(self):
+        self._poll(True, {"argus": 5})
+        err, sys.stderr = sys.stderr, io.StringIO()
+        try:
+            st = km.StateFile(self.path, "idx").load()
+        finally:
+            sys.stderr = err
+        self.assertIsNot(st, km.CORRUPT_STATE)
+        self.assertEqual(st["unread"], 5)
+        self.assertEqual(st["cursor"], 100)
+
+    def test_an_OLDER_file_without_the_field_still_loads(self):
+        st = self._load({})
+        self.assertIsNot(st, km.CORRUPT_STATE)
+        self.assertIsNone(st["unread"])
+
+    def test_a_malformed_count_is_CORRUPT(self):
+        for bad in (-1, 1.5, "3", True, [], {}):
+            self.assertIs(self._load({"unread": bad}), km.CORRUPT_STATE, "unread=%r must fail closed" % (bad,))
+
+    def test_zero_loads(self):
+        self.assertEqual(self._load({"unread": 0})["unread"], 0)
