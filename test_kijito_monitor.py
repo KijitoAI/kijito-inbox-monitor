@@ -6114,3 +6114,82 @@ class StillUnreadBackstopTest(unittest.TestCase):
         self.assertIn(">= 0", err(["--persona", "a", "--still-unread-after", "-1"]))
         self.assertIn(">= 1", err(["--persona", "a", "--still-unread-max", "0"]))
         self.assertIsNone(err(["--persona", "a", "--still-unread-after", "0"]))
+
+
+class StateFileNameAgreementTest(unittest.TestCase):
+    """Row M289 (second half): the launchd template, the docs and the producer must agree on the state file's
+    NAME. The template used to pass a base (`--state-file <dir>/hive.json`) that the producer silently turned
+    into `hive.<persona>.json`, so a reader of the template looked for a file that never existed. Now the
+    template names the file with a `{persona}` template and this test derives the name from the template's
+    OWN argv, through the producer's OWN parser and `_state_path_from_args` - one constant, no second copy."""
+
+    NAMES = ["argus", "Loom", "name (purpose)", "Ωmega", "two words", "Claude-chat"]
+    HOME = "/HOMEDIR"
+    _HERE = os.path.dirname(os.path.abspath(__file__))
+
+    def _launchd_argv(self):
+        with open(os.path.join(self._HERE, "com.kijito.inbox-monitor.plist.template"), encoding="utf-8") as fh:
+            text = fh.read()
+        block = re.search(r"<key>ProgramArguments</key>\s*<array>(.*?)</array>", text, re.S).group(1)
+        words = [w.replace("__HOME__", self.HOME) for w in re.findall(r"<string>([^<]*)</string>", block)]
+        return words[words.index("__PROGRAM__") + 1:]
+
+    def _args(self):
+        args = km.build_parser().parse_args(self._launchd_argv())
+        km.validate_args(args)
+        return args
+
+    def test_the_launchd_template_names_exactly_the_state_file_the_producer_writes(self):
+        args = self._args()
+        self.assertIsNotNone(args.state_file_template, "the template must NAME the per-persona file, not a base")
+        for name in self.NAMES:
+            with self.subTest(persona=name):
+                path = km._state_path_from_args(args, name)
+                self.assertEqual(os.path.basename(path), "hive.%s.json" % km._state_safe_persona(name))
+
+    def test_existing_launchd_installs_keep_their_state_file(self):
+        # The old template's base `hive.json` was derived to `hive.<safe>.json`; the new template must land on
+        # the SAME file, or an upgrade would baseline over every persona's cursor (skipping its backlog).
+        args = self._args()
+        legacy = self.HOME + "/.cache/kijito-inbox-monitor/hive.json"
+        for name in self.NAMES:
+            with self.subTest(persona=name):
+                self.assertEqual(km._state_path_from_args(args, name), km._state_path_for_persona(legacy, name))
+
+    def test_the_producer_opens_the_path_state_path_from_args_returns(self):
+        # Pins that the watch target uses THIS function, so the test above speaks for the running producer.
+        with open(os.path.join(self._HERE, "kijito_inbox_monitor.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("state_path = _state_path_from_args(args, persona)", src)
+
+    def test_the_readme_multi_persona_example_writes_the_file_it_documents(self):
+        with open(os.path.join(self._HERE, "README.md"), encoding="utf-8") as fh:
+            readme = fh.read()
+        m = re.search(r"--all-personas \\\n(?:.*\\\n)*?\s*--state-file-template (\S+)", readme)
+        self.assertIsNotNone(m, "the multi-persona example must name its state file with a {persona} template")
+        args = km.build_parser().parse_args(["--all-personas", "--state-file-template", m.group(1)])
+        self.assertEqual(os.path.basename(km._state_path_from_args(args, "argus")), "state.argus.json")
+        self.assertIn("state.<persona>.json", readme)
+
+
+class NegativeFailureCountStateTest(unittest.TestCase):
+    """A persisted `consecutive_failures` below zero is not a count: resumed as-is it would postpone the
+    dead-man edge by that many polls, silently. `_is_int` alone accepted it (a negative is a real integer)."""
+
+    def _load(self, failures):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "s.json")
+            with open(p, "w") as f:
+                json.dump({"identity": "idx", "cursor": 100, "state": "UP", "consecutive_failures": failures}, f)
+            err, sys.stderr = sys.stderr, io.StringIO()
+            try:
+                return km.StateFile(p, "idx").load()
+            finally:
+                sys.stderr = err
+
+    def test_a_negative_count_is_CORRUPT(self):
+        for bad in (-1, -1000):
+            self.assertIs(self._load(bad), km.CORRUPT_STATE, "consecutive_failures=%r must not be resumed" % bad)
+
+    def test_zero_still_loads(self):
+        self.assertIsNot(self._load(0), km.CORRUPT_STATE)

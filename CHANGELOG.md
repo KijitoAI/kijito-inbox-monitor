@@ -3,6 +3,19 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [0.5.6] - 2026-09-25
+
+### Fixed
+- **The launchd template names the state file the producer actually writes (row M289).** It passed a base
+  (`--state-file <dir>/hive.json`) that the producer turned into `hive.<persona>.json`, so anyone reading the
+  template looked for a file that never existed. It now passes `--state-file-template <dir>/hive.{persona}.json`,
+  which resolves to the SAME file as before, so upgrading moves nothing. The README's multi-persona example
+  likewise names `state.{persona}.json`. A new `_state_path_from_args()` is the one place the producer
+  decides a persona's state file, and `StateFileNameAgreementTest` derives the name from the template's own
+  argv through it.
+- **A negative persisted `consecutive_failures` makes the state file CORRUPT.** A count below zero was
+  resumed as-is and silently postponed the dead-man alert by that many polls.
+
 ## [0.5.5] - 2026-09-24
 
 ### Added

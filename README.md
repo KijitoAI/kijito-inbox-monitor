@@ -269,7 +269,7 @@ owned, rotated event file, and each agent session consumes only its own:
 ```sh
 kijito-inbox-monitor --all-personas \
   --events-file-template ~/.local/state/kijito-inbox-monitor/events.{persona}.ndjson \
-  --state-file ~/.local/state/kijito-inbox-monitor/state.json
+  --state-file-template ~/.local/state/kijito-inbox-monitor/state.{persona}.json
 ```
 
 Each session then wakes on its own `events.<persona>.ndjson` using the recipe in

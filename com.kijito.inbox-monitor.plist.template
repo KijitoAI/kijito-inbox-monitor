@@ -37,8 +37,8 @@
     <string>__PROGRAM__</string>
     <string>--token-file</string>
     <string>__HOME__/.config/kijito-inbox-monitor/token</string>
-    <string>--state-file</string>
-    <string>__HOME__/.cache/kijito-inbox-monitor/hive.json</string>
+    <string>--state-file-template</string>
+    <string>__HOME__/.cache/kijito-inbox-monitor/hive.{persona}.json</string>
     <string>--events-file-template</string>
     <string>__HOME__/.cache/kijito-inbox-monitor/events.{persona}.ndjson</string>
     <string>--heartbeat</string>
