@@ -1543,7 +1543,7 @@ class StateFile:
                              "%s\n" % self.path)
             return CORRUPT_STATE
         if not ((cursor is None or _is_int(cursor)) and state in ("UP", "DOWN")
-                and _is_int(failures)):
+                and _is_int(failures) and failures >= 0):   # a failure COUNT is never negative
             sys.stderr.write("kijito-inbox-monitor: WARNING state-file has a valid envelope but invalid "
                              "fields; refusing to baseline over it: %s\n" % self.path)
             return CORRUPT_STATE
@@ -1858,6 +1858,15 @@ def _persona_path(template, persona):
     return template.replace("{persona}", _state_safe_persona(persona))
 
 
+def _state_path_from_args(args, persona):
+    """THE state file a persona's watch target opens (row M289): the `{persona}` template when given, else the
+    per-persona derivation of the `--state-file` base. One function, so a supervisor template, the docs and a
+    test can ask the producer which file it will write instead of re-deriving the name and drifting."""
+    if getattr(args, "state_file_template", None):
+        return _persona_path(args.state_file_template, persona)
+    return _state_path_for_persona(getattr(args, "state_file", None), persona)
+
+
 def _created_epoch(created):
     """A message's `created` as epoch seconds, or None if it cannot be read. The server writes naive UTC
     ('2026-09-24 21:34:24.943580'); an explicit offset or 'Z' is honoured when present."""
@@ -2022,8 +2031,7 @@ class WatchTarget:
         cp = urllib.parse.urlsplit(url)
         self.unread_persona = dict(urllib.parse.parse_qsl(cp.query)).get("persona") or persona
 
-        state_path = (_persona_path(args.state_file_template, persona) if args.state_file_template
-                      else _state_path_for_persona(args.state_file, persona))
+        state_path = _state_path_from_args(args, persona)
         if state_path:
             self.state_file = StateFile(state_path, self.identity)
             if not args.self_test:
