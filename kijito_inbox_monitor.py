@@ -1644,10 +1644,18 @@ class StateFile:
         # a re-announce after an upgrade costs one event and is honest about the current condition,
         # whereas defaulting to True would silence a live condition for the rest of the run.
         hidden = d.get("unread_hidden") is True
+        # `unread` (row M309) is read as strictly as every other field: a count that is not a non-negative
+        # integer is evidence the file was not written by us, and the answer to that is the same fail-closed
+        # one. Absent (an older file, or a poll with no count) is fine and means unknown.
+        unread = d.get("unread")
+        if unread is not None and not (_is_int(unread) and unread >= 0):
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file 'unread' is not a non-negative integer "
+                             "(%r); treating the whole file as CORRUPT (fail closed): %s\n" % (unread, self.path))
+            return CORRUPT_STATE
         return {"cursor": cursor, "state": state, "failures": failures, "emitted_above": emitted,
                 "gap_alerted": alerted, "pin_evidence_intact": intact,
                 "pin_forced": pin_forced, "pin_release_at": release_at,
-                "state_corrupt": state_corrupt, "unread_hidden": hidden}
+                "state_corrupt": state_corrupt, "unread_hidden": hidden, "unread": unread}
 
     def unlock(self):
         """Release the single-writer flock and close the sidecar fd.
@@ -1664,7 +1672,7 @@ class StateFile:
 
     def save(self, cursor, state, failures, emitted_above=None, gap_alerted=None,
              pin_forced=False, pin_evidence_intact=True, state_corrupt=False, pin_release_at=None,
-             unread_hidden=False):
+             unread_hidden=False, unread=None):
         """Persist the cursor. Returns True IFF the write is DURABLE (Loom re-audit 8, HIGH 3).
 
         The directory fsync used to be called and its answer thrown away, so a failure returned success
@@ -1700,6 +1708,11 @@ class StateFile:
         # act on any faster for being told twice.
         if unread_hidden:
             d["unread_hidden"] = True
+        # The persona's unread count as of this poll (row M309) - the one LOCAL place a status line or a
+        # health check can read it. INFORMATIONAL: nothing here reads it back to decide what to emit.
+        # Omitted when this poll had no count, so its absence means "unknown", never "zero".
+        if unread is not None:
+            d["unread"] = unread
         dirn = os.path.dirname(os.path.abspath(self.path)) or "."
         # BOTH OF THESE ARE INSIDE THE GUARD, and they did not used to be (drill, 2026-08-05).
         # This function builds a careful "written but not provably durable" path - _fsync_dir fails ->
@@ -1998,6 +2011,10 @@ class WatchTarget:
         self.armed = False
         self.fast_path = False
         self.last_unread = None
+        # What THIS poll learned about the persona's unread count, for the state file (row M309). Kept apart
+        # from `last_unread`, which is the fast-path's wake TRIGGER and only exists while the fast path is on:
+        # reusing it would publish nothing under --no-fast-path, and a status line would read that as zero.
+        self.observed_unread = None
         self.skips = 0
         self.first_poll = True
         self.last_heartbeat = _monotonic()
@@ -2408,6 +2425,11 @@ class WatchTarget:
     def poll_once(self, counts_available=False, unread_counts=None):
         args = self.args
         unread_counts = unread_counts or {}
+        # A count the server did NOT give us this tick is UNKNOWN, never zero: the state file then carries no
+        # `unread` at all, so a reader shows nothing rather than a stale or invented figure. A persona missing
+        # from a GOOD response is a real zero - /api/notify/pending omits personas with nothing pending.
+        self.observed_unread = (unread_counts.get(self.unread_persona, 0)
+                                if counts_available and self.unread_persona else None)
 
         skip_full = False
         if self.armed and self.fast_path and not args.no_fast_path and self.unread_persona:
@@ -2832,7 +2854,8 @@ class WatchTarget:
                                  pin_evidence_intact=self.pin_evidence_intact,
                                  state_corrupt=self.state_corrupt,
                                  pin_release_at=self.pin_release_at,
-                                 unread_hidden=self.unread_hidden)
+                                 unread_hidden=self.unread_hidden,
+                                 unread=self.observed_unread)
             # ★ CONSUME THE ANSWER (Loom re-audit 9, MEDIUM). Round 8 taught me to RETURN a durability
             # status; this is the same defect one layer out - I produced an answer and then discarded it
             # at the call site, which is the exact thing the previous round was about. A cursor whose
