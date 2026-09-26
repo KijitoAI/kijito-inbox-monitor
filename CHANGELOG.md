@@ -3,7 +3,7 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
-## [Unreleased]
+## [0.5.9] - 2026-09-26
 
 ### Fixed
 - **A short server restart no longer raises an `alert`/`recovered` pair** (the dead-man `alert` now needs a
