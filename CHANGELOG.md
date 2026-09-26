@@ -3,6 +3,28 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [Unreleased]
+
+### Fixed
+- **A short server restart no longer raises an `alert`/`recovered` pair** (the dead-man `alert` now needs a
+  MEASURED span, not only a failure count: `--alert-floor-seconds`, default `(--alert-after - 1) *
+  --poll-seconds` = 120 s; DESIGN.md §7.1 rev 10). In long-poll mode a failed poll is retried after 1/2/4 s,
+  so `--alert-after 3` was reached ~3-7 s into any outage: every routine server restart (a ~10-20 s window
+  of edge 502s) woke the consumer twice for no mail. `seconds` is now the measured span and `floor_seconds`
+  names the floor; the first-failure stamp (`down_since`) is persisted so a supervisor restart mid-outage
+  resumes the span. Plain interval polling is unchanged (the default floor is what N failed polls take at
+  the configured interval); `--alert-floor-seconds 0` restores the count-only edge.
+  In long-poll mode the row's `consecutive_failures` is usually well above `--alert-after` (retries keep
+  counting until the floor is reached). A `down_since` that is not a finite, positive number makes the state
+  file CORRUPT, like any other malformed field (including a huge integer literal, which would otherwise crash
+  the strict read itself).
+
+### Added
+- **A failed long-poll honours the server's retry hint.** When the server answers a long-poll with an error
+  that carries `Retry-After` (delta-seconds or HTTP-date) or a JSON `retry_after_seconds`, the next attempt
+  waits at least that long (rounded up, capped at 120 s) instead of retrying at 1/2/4 s into a restarting
+  server. The hint only paces retries; the alert decision is still the measured floor.
+
 ## [0.5.8] - 2026-09-26
 
 ### Fixed

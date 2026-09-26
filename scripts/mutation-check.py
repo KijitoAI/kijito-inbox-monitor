@@ -281,7 +281,8 @@ M=[
   '                    self._alarm("alert", "source is DOWN: %s" % down_reason,\n'
   '                                reason=down_reason,\n'
   '                                consecutive_failures=self.failures,\n'
-  '                                seconds=self.failures * args.poll_seconds)',
+  '                                seconds=int(round(span)),\n'
+  '                                floor_seconds=int(floor))',
   '                    pass'),
  ("L11-F1: the DOWN alert loses its stderr fallback (undelivered == silent again)",
   '            sys.stderr.write("kijito-inbox-monitor: %s EVENT UNDELIVERED (persona %r): %s\\n"\n'
@@ -332,6 +333,27 @@ M=[
  ("A1: the urgent-unanswered alarm is re-coupled to --no-stranded-alerts (one flag silences both again)",
   "        if counts_available and not args.no_urgent_alerts:",
   "        if counts_available and not args.no_stranded_alerts:"),
+ # Row M375 (bug #19): a ~20 s server restart woke consumers twice (alert + recovered) because the
+ # dead-man edge was a failure COUNT reached in ~7 s of long-poll retries. The floor and the retry hint
+ # are the fix; each mutant below removes exactly one piece of it.
+ ("M375a: the default alert floor is zero again (count-only edge: a 20 s restart alerts)",
+  "    return (args.alert_after - 1) * args.poll_seconds",
+  "    return 0"),
+ ("M375b: the fast-path recovery announces `recovered` after a run that never alerted",
+  "            # count endpoint reachable + no unread increase = a HEALTHY poll with no new items\n            if self.fsm_state == \"DOWN\":",
+  "            # count endpoint reachable + no unread increase = a HEALTHY poll with no new items\n            if self.fsm_state == \"DOWN\" or self.failures:"),
+ ("M375c: a 502's Retry-After is read and thrown away",
+  "        _RETRY_HINT[\"seconds\"] = _retry_after_seconds(e.headers, body)",
+  "        pass"),
+ ("M375d: the backoff ignores the server's retry hint",
+  "        backoff = max(backoff, hint)",
+  "        pass"),
+ ("M375e: the retry hint is not clamped (a hostile Retry-After parks the producer)",
+  "    return max(0, min(secs, RETRY_AFTER_CAP))",
+  "    return max(0, secs)"),
+ ("M375f: a stale retry hint survives into the next, unrelated failure",
+  "    req = urllib.request.Request(url, headers=headers, method=\"GET\")\n    _RETRY_HINT[\"seconds\"] = None\n",
+  "    req = urllib.request.Request(url, headers=headers, method=\"GET\")\n"),
 ]
 def run(src):
     # RELEASE WHAT WE ACQUIRE (Loom re-audit 10, L6). The temp tree was never removed and the source file
@@ -340,7 +362,12 @@ def run(src):
     # both is not merely untidy - it is the harness exhibiting the class it is meant to detect.
     d=tempfile.mkdtemp()
     try:
-        shutil.copy(TESTS, os.path.join(d,"test_kijito_monitor.py"))
+        # COPY THE WHOLE TREE, not two files. The suite also reads the README and the supervisor templates
+        # (the state-file-name and opaque-output agreement tests), so a two-file copy made the BASELINE red
+        # and the gate refused to run at all - a harness that cannot run proves nothing, green or red.
+        shutil.copytree(os.path.dirname(SRC), os.path.join(d, "t"),
+                        ignore=shutil.ignore_patterns(".git", "__pycache__", "node_modules", ".venv"))
+        d=os.path.join(d, "t")
         with open(os.path.join(d,"kijito_inbox_monitor.py"),"w") as fh:
             fh.write(src)
         # PIN THE WARNING FILTER. Inherited PYTHONWARNINGS=error turns a mutant's leaked fd into an ERROR,
@@ -356,7 +383,7 @@ def run(src):
             return None, "HUNG"
         return p.returncode, p.stderr
     finally:
-        shutil.rmtree(d, ignore_errors=True)
+        shutil.rmtree(os.path.dirname(d) if d.endswith(os.sep + "t") else d, ignore_errors=True)
 with open(SRC) as fh: base=fh.read()
 rc,_=run(base)
 if rc!=0: print("BASELINE NOT GREEN"); sys.exit(1)

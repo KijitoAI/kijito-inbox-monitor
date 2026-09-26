@@ -1,6 +1,10 @@
 # Kijito Inbox Monitor: Design & Implementation Spec
 
-**Updated:** 2026-08-15 (rev 9: §6.5 Darwin `boottime` re-sourced from `CLOCK_MONOTONIC_RAW` - Darwin's
+**Updated:** 2026-09-26 (rev 10: §7.1 the dead-man edge needs a MEASURED span, not only a failure count -
+`--alert-floor-seconds`, default `(alert_after - 1) * poll_seconds`; `seconds` on the `alert` is now that
+measurement and `floor_seconds` names the floor; a failed poll's `Retry-After` paces the next retry. Before
+this, the count-only edge fired ~3-7 s into any short server restart, and `seconds` read a nominal 90.)
+Rev 9 (2026-08-15: §6.5 Darwin `boottime` re-sourced from `CLOCK_MONOTONIC_RAW` - Darwin's
 `CLOCK_MONOTONIC` is calendar-derived and read below `CLOCK_UPTIME_RAW` at fresh uptime - plus the
 inverted-pair quarantine at the emit chokepoint).
 Rev 8 (2026-07-25): the bounded-window / delivery-acknowledgement contracts, from seven rounds of
@@ -293,7 +297,7 @@ One object per line; every event carries `event`, `source`, `ts` (emit-time UTC 
 ```
 {"event":"new",         "source":"kijito-inbox","ts":"<iso>","id":246,"from":"river","content":"<≤N or omitted>","created":"<iso>"}
 {"event":"armed",       "source":"kijito-inbox","ts":"<iso>","cursor":250}
-{"event":"alert",       "source":"kijito-inbox","ts":"<iso>","reason":"unreachable","consecutive_failures":3,"seconds":180}
+{"event":"alert",       "source":"kijito-inbox","ts":"<iso>","reason":"unreachable","consecutive_failures":3,"seconds":121,"floor_seconds":120}
 {"event":"recovered",   "source":"kijito-inbox","ts":"<iso>","cursor":250}
 {"event":"still_unread","source":"kijito-inbox","ts":"<iso>","ids":[240,246],"senders":["river"],"oldest_age_seconds":9000,"after_seconds":7200,"reason":"..."}   # M229 backstop, bounded
 {"event":"heartbeat",   "source":"kijito-inbox","ts":"<iso>","cursor":250}     # only if --heartbeat; cursor may be null
@@ -301,12 +305,14 @@ One object per line; every event carries `event`, `source`, `ts` (emit-time UTC 
 {"event":"replay_capped","source":"kijito-inbox","ts":"<iso>","capped_to":539,"dropped":389}      # backlog > --max-replay (§7.0)
 ```
 - `new` carries `id`, `from`, `content`, `created`. `content` is a silent hard cut to `--content-chars` (default 220),
-  with no marker; or it is omitted with `--no-content`. `seconds` in `alert` is **config-derived, not a measurement**:
-  it is exactly `consecutive_failures * poll_seconds` (a function of two flags), while the failure path backs off
-  exponentially from 1 s and detection can lag inside a `--wait` long-poll, so it does not equal the outage duration
-  and is routinely off by more than an order of magnitude (e.g. `seconds:90` observed against a measured ~48 s outage).
-  Do NOT back-date onset as `ts - seconds`. A measured-monotonic replacement (stamp the first failure, subtract) is
-  queued; the row already carries `emitted.monotonic` for it.
+  with no marker; or it is omitted with `--no-content`. `seconds` in the reachability `alert` is the **measured**
+  monotonic span from the first failure of the run to the failure that crossed the edge (rev 10; it used to be the
+  nominal `consecutive_failures * poll_seconds`, routinely an order of magnitude off - `seconds:90` against an 11 s
+  outage). `floor_seconds` is the floor the run had to reach (§7.1). `ts - seconds` is a LOWER bound on how long the
+  source had been failing not the onset: the stamp is taken when the first failing
+  fetch RETURNS, so detection lag (a blackholed `--wait` hold plus its socket timeout, or a plain-poll interval)
+  precedes it; and after a supervisor restart the span resumes from the persisted stamp, so it can include time
+  nobody was observing (a forward wall-clock step at boot lengthens it; a backward one is clamped to zero).
 - **Within-poll emit order (deterministic, total):** `alert`/`recovered` (FSM edge), then `replay_capped`/`seed_ahead`,
   then `armed`, then `new` (ascending id), then `heartbeat`. So `armed`/`recovered` set `cursor` before any `new`/`heartbeat`
   in the same cycle, which means `recovered.cursor` is non-null whenever a baseline has occurred (a `recovered` on a poll
@@ -576,12 +582,30 @@ peek, edge-alerts, and the replay cap).
 ### 7.1 Liveness alert FSM (dead-man's-switch)
 States are **UP** (default) and **DOWN**; `consecutive_failures` counts from 0. A "failure" is any non-healthy poll (§5).
 - **Healthy poll:** set `consecutive_failures = 0`; if DOWN, go UP and emit one `recovered`.
-- **Failure:** `consecutive_failures += 1`; the UP-to-DOWN edge is crossed when `consecutive_failures` first
-  reaches `--alert-after` while state is UP. Then set DOWN and emit one `alert`. (The `state==UP` guard is what makes
-  it edge-once; a resumed `state==DOWN` never re-crosses the edge, so there is no duplicate `alert`.)
+- **Failure:** on the first failure of a run stamp `down_since` (monotonic + wall clock); `consecutive_failures += 1`;
+  the UP-to-DOWN edge is crossed on the first failure at which BOTH `consecutive_failures >= --alert-after` AND the
+  measured span since `down_since` `>= floor` hold while state is UP, where `floor = --alert-floor-seconds` if given,
+  else `(--alert-after - 1) * --poll-seconds` (rev 10). Then set DOWN and emit one `alert` carrying the measured
+  `seconds` and `floor_seconds`. (The `state==UP` guard is what makes it edge-once; a resumed `state==DOWN` never
+  re-crosses the edge, so there is no duplicate `alert`.) WHY A FLOOR: in long-poll mode a failed poll is retried
+  after 1/2/4 s, so the count alone was reached ~3 s into any outage and every planned restart alerted (measured
+  on 11-20 s server restarts); the default floor is exactly what N failed polls take at the
+  configured interval, so plain interval polling keeps alerting on the N-th failure. A run under the floor emits
+  neither edge. `down_since` (wall) is persisted with `consecutive_failures` (§7.3) so a supervisor restart
+  mid-outage resumes the span rather than restarting the floor; an older file without it measures from the restart.
 - `alert`/`recovered` are per-edge: a run may alert, recover, then alert again. A sub-threshold blip emits neither.
 - `--alert-after` has a minimum of 1 (0 is rejected) and a default of 3 (a single transient failure is normal,
-  bouncing in ~1-2s). SIGUSR1-triggered polls participate identically.
+  bouncing in ~1-2s). SIGUSR1-triggered polls count toward `consecutive_failures` like any other; they do not
+  advance the measured span, so triggered polls alone cannot cross the floor - the floor is time, by design.
+  In long-poll mode `consecutive_failures` on the row is therefore usually well above `--alert-after` (the
+  1/2/4/8/16/30 s retries keep counting until the floor is reached); the count says how many retries were made,
+  the floor says when the edge was allowed.
+- **Server retry hint (rev 10).** A failed long-poll that carries the server's own hint - a `Retry-After` header
+  (delta-seconds or HTTP-date) or a JSON `retry_after_seconds` field, header first - waits AT LEAST that long
+  before the next attempt (rounded up, clamped to 0..120 s; the exponential 1/2/4/8/16/30 s backoff still
+  applies when it is longer). The hint only paces retries; it never touches the alert decision, which stays
+  the measured floor above. A later failure with no hint clears it, so a stale hint cannot pace an unrelated
+  failure.
 
 ### 7.2 `--self-test`: runs once and exits (no poll loop)
 Runs for the selected persona(s) (default: every persona in the account). (a) One real peek-mode (`mark_read=false`)
@@ -601,11 +625,18 @@ read-state-neutral (DONE-WHEN #5 holds after self-test).
   `/api/notify/pending` read succeeded (a persona missing from a good response is a real 0 - the server omits
   personas with nothing pending); a poll without that read writes no `unread`, so its absence means UNKNOWN,
   never zero. A reader should also judge freshness from the file's mtime: the file is rewritten every poll.
+  `down_since` (number: wall-clock epoch of the first failure of the current run, written only while
+  `consecutive_failures > 0`; §7.1 rev 10).
 - **Every persisted field is read STRICTLY, and anything unrecognised fails CLOSED** (Loom re-audit 7, HIGH 2).
   Booleans must be JSON booleans and integers must be real integers - a JSON `1` for `pin_forced` used to
   normalise to `false` and silently UNPIN the watermark, letting the replay cap cross the very span the pin was
   protecting; `pin_evidence_intact: 0` had the mirror bug. A malformed field is evidence the file cannot be
   trusted, so it is treated as CORRUPT (below), never as a permissive default. `true` is not a message id.
+  `down_since` is the one float: it must be a finite, positive number (JSON's `-Infinity`/`NaN`/`1e400` all
+  parse, a 400-digit integer literal makes `math.isfinite` itself raise, and an infinite span would raise at the
+  alert edge - a crash loop fed by the file the supervisor re-reads; so the value is normalised through `float()`
+  with overflow caught, then checked). A bool, string, zero, negative or non-finite value makes the WHOLE file
+  CORRUPT (cursor discarded, pin forced), the same consequence as any other malformed field.
 - **Canonical identity (`<canonical-id>`)** is computed before DNS resolution so trivial URL variations don't flip
   it. From the effective inbox URL, it is the tuple `(scheme.lower(), host.lower(), effective_port, path,
   sorted(query_params except the constant mark_read))`. Normalize by stripping a trailing `/` on path, filling the

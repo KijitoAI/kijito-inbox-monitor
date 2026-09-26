@@ -1,3 +1,6 @@
+import datetime
+import email.message
+import email.utils
 import io
 import json
 import os
@@ -276,6 +279,11 @@ class ValidationGuardTest(unittest.TestCase):
     def test_poll_seconds_must_be_positive(self):
         with self.assertRaises(km.FatalConfig):
             km.validate_args(self._args(["--persona", "argus", "--poll-seconds", "0"]))
+
+    def test_alert_floor_seconds_must_not_be_negative(self):
+        with self.assertRaises(km.FatalConfig):
+            km.validate_args(self._args(["--persona", "argus", "--alert-floor-seconds", "-1"]))
+        km.validate_args(self._args(["--persona", "argus", "--alert-floor-seconds", "0"]))  # must not raise
 
     def test_seed_at_rejected_in_multipersona(self):
         with self.assertRaises(km.FatalConfig):
@@ -1718,6 +1726,7 @@ class BoundedWindowEndToEndTest(unittest.TestCase):
         all_personas = False
         state_file_template = None
         alert_after = 3
+        alert_floor_seconds = None
         poll_seconds = 60
         heartbeat = 0
         max_replay = 50
@@ -1730,6 +1739,7 @@ class BoundedWindowEndToEndTest(unittest.TestCase):
         t.persona, t.url, t.headers = "argus", "http://x/api/inbox?persona=argus", {}
         t.opener, t.emitter, t.args = None, emitter, self.FullArgs()
         t.cursor, t.armed, t.fsm_state, t.failures = cursor, True, "UP", 0
+        t.down_since = None
         t.state_file = t.last_unread = None
         t.fast_path = False
         t.skips = t.first_poll = 0
@@ -1982,6 +1992,7 @@ class CorruptPinStateTest(unittest.TestCase):
         t.emitter, t.args = em, BoundedWindowEndToEndTest.FullArgs()
         t.args.max_replay = 1
         t.cursor, t.armed, t.fsm_state, t.failures = 100, False, "UP", 0
+        t.down_since = None
         t.state_file = t.last_unread = None
         t.fast_path = False
         t.skips = t.first_poll = 0
@@ -2701,6 +2712,15 @@ class ExecEnvTest(unittest.TestCase):
                              "id": 41, "from": "river", "persona": "argus"})
         self.assertEqual(env["KIJITOMON_ID"], "41")
         self.assertEqual(env["KIJITOMON_FROM"], "river")
+
+    def test_the_reachability_alert_exports_its_measured_span_and_floor(self):
+        # §7.1 rev 10: `seconds` is a measurement now, so an exec consumer gets it (and the floor it
+        # cleared) instead of having to infer onset from flags it cannot see.
+        env = self._env_for({"event": "alert", "source": "kijito-inbox", "ts": "t", "persona": "argus",
+                             "reason": "http 502", "consecutive_failures": 7, "seconds": 61,
+                             "floor_seconds": 60})
+        self.assertEqual((env["KIJITOMON_FAILURES"], env["KIJITOMON_SECONDS"], env["KIJITOMON_FLOOR_SECONDS"]),
+                         ("7", "61", "60"))
 
 
 class WarnOncePerPersonaTest(unittest.TestCase):
@@ -4608,6 +4628,7 @@ class Loom11AlarmDeliveryTest(unittest.TestCase):
         t.opener, t.emitter = None, emitter
         t.args = BoundedWindowEndToEndTest.FullArgs()
         t.cursor, t.armed, t.fsm_state, t.failures = cursor, True, fsm, 0
+        t.down_since = None
         t.state_file = t.last_unread = None
         t.fast_path = False
         t.skips = t.first_poll = 0
@@ -4631,22 +4652,47 @@ class Loom11AlarmDeliveryTest(unittest.TestCase):
     def _down_fetch(reason="http 502"):
         return lambda opener, url, headers: km.Poll(False, reason=reason)
 
+    def _clock(self, start=1000.0):
+        """Take over km._monotonic for ONE test; returns the mutable [now]. §7.1 the alert floor is a
+        MEASURED span, so a liveness test has to say WHEN each poll happens, not only how many."""
+        clock = [start]
+        real = km._monotonic
+        km._monotonic = lambda: clock[0]
+        self.addCleanup(lambda: setattr(km, "_monotonic", real))
+        return clock
+
+    def _run_at(self, t, fetch_fn, clock, at):
+        """poll_once at each monotonic instant in `at` (seconds after the clock's start)."""
+        orig, km.fetch = km.fetch, fetch_fn
+        try:
+            for when in at:
+                clock[0] = 1000.0 + when
+                t.poll_once()
+        finally:
+            km.fetch = orig
+
     # ---- F2: the dead-man's switch had NO test. These are it. --------------------------------------
     def test_the_liveness_DOWN_alert_IS_EMITTED_after_alert_after_failures(self):
         # THE GAP A1 EXPOSED: deleting this alert entirely left all 242 tests green, because nothing
         # asserted the one event README sells as the dead-man's switch.
         em = self.Recorder()
+        clock = self._clock()
         t = self._target(em)
-        self._run(t, self._down_fetch(), times=t.args.alert_after)
+        # §7.1: alert_after failures AT THE CONFIGURED CADENCE (poll_seconds apart) - the count AND the
+        # measured floor ((alert_after - 1) * poll_seconds) are both reached on the third poll.
+        self._run_at(t, self._down_fetch(), clock, at=[0, 60, 120])
         alerts = [f for e, f in em.events if e == "alert"]
         self.assertEqual(len(alerts), 1, "the source went down and no alert was emitted")
         self.assertEqual(alerts[0]["reason"], "http 502")
         self.assertEqual(alerts[0]["consecutive_failures"], t.args.alert_after)
+        self.assertEqual(alerts[0]["seconds"], 120)          # MEASURED, not failures * poll_seconds
+        self.assertEqual(alerts[0]["floor_seconds"], 120)
         self.assertEqual(t.fsm_state, "DOWN")
 
     def test_the_DOWN_alert_does_not_fire_before_the_threshold(self):
         em = self.Recorder()
         t = self._target(em)
+        t.args.alert_floor_seconds = 0   # floor off, so this test is about the COUNT guard alone
         self._run(t, self._down_fetch(), times=t.args.alert_after - 1)
         self.assertEqual([f for e, f in em.events if e == "alert"], [])
         self.assertEqual(t.fsm_state, "UP")
@@ -4656,9 +4702,10 @@ class Loom11AlarmDeliveryTest(unittest.TestCase):
         # edge is crossed exactly once and a reverted transition would never re-fire). So the
         # announcement gets the guaranteed second channel instead.
         em = self.Recorder(deliver=False)
+        clock = self._clock()
         t = self._target(em)
         buf = _capture_stderr(self)
-        self._run(t, self._down_fetch(), times=t.args.alert_after)
+        self._run_at(t, self._down_fetch(), clock, at=[0, 60, 120])
         self.assertEqual(t.fsm_state, "DOWN")
         self.assertIn("UNDELIVERED", buf.getvalue())
         self.assertIn("http 502", buf.getvalue())
@@ -4742,6 +4789,273 @@ def _capture_stderr(test):
     test.addCleanup(lambda: setattr(km.sys, "stderr", err))
     return buf
 
+
+
+class RetryAfterPacingTest(unittest.TestCase):
+    """A failed long-poll is paced by the server's own Retry-After hint (row M375, bug #19).
+
+    The edge's restart page says "restarting; retry shortly" and carries `Retry-After` plus a JSON
+    `retry_after_seconds`. The hint only ever LENGTHENS the wait before the next retry, is clamped to
+    RETRY_AFTER_CAP, and never feeds the alert decision - that stays the measured floor's job.
+    """
+    class H(dict):
+        def get(self, k, d=None):
+            return dict.get(self, k, d)
+
+    def test_header_delta_seconds(self):
+        self.assertEqual(km._retry_after_seconds(self.H({"Retry-After": "15"})), 15)
+        self.assertEqual(km._retry_after_seconds(self.H({"Retry-After": " 0 "})), 0)
+
+    def test_header_http_date(self):
+        when = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=30)
+        got = km._retry_after_seconds(self.H({"Retry-After": email.utils.format_datetime(when, usegmt=True)}))
+        self.assertTrue(28 <= got <= 31, got)
+        past = email.utils.format_datetime(when - datetime.timedelta(hours=1), usegmt=True)
+        self.assertEqual(km._retry_after_seconds(self.H({"Retry-After": past})), 0)   # clamped, never negative
+
+    def test_body_field_when_no_header(self):
+        body = json.dumps({"error": "edge_bad_gateway", "retry_after_seconds": 7.2}).encode()
+        self.assertEqual(km._retry_after_seconds(self.H(), body), 8)       # rounded UP, never shorter
+        self.assertEqual(km._retry_after_seconds(self.H({"Retry-After": "3"}), body), 3)  # header wins
+
+    def test_garbage_and_absent_hints_are_none(self):
+        for h, b in [(None, None), (self.H(), None), (self.H({"Retry-After": "soon"}), None),
+                     (self.H({"Retry-After": "-5"}), None), (self.H(), b"<html>502</html>"),
+                     (self.H(), json.dumps({"retry_after_seconds": True}).encode()),
+                     (self.H(), json.dumps({"retry_after_seconds": "9"}).encode()),
+                     (self.H(), b'{"retry_after_seconds": NaN}'), (self.H(), json.dumps([1]).encode())]:
+            self.assertIsNone(km._retry_after_seconds(h, b), (h, b))
+
+    def test_hint_is_clamped_to_the_cap(self):
+        self.assertEqual(km._retry_after_seconds(self.H({"Retry-After": "86400"})), km.RETRY_AFTER_CAP)
+        self.assertEqual(km._retry_after_seconds(self.H(), b'{"retry_after_seconds": 1e308}'), km.RETRY_AFTER_CAP)
+
+    def test_longpoll_502_records_the_hint_and_keeps_the_cursor(self):
+        body = io.BytesIO(json.dumps({"error": "edge_bad_gateway", "retry_after_seconds": 10}).encode())
+        err = urllib.error.HTTPError(km.NOTIFY_PENDING_URL, 502, "Bad Gateway",
+                                     email.message.Message(), body)
+        err.headers["Retry-After"] = "12"
+        available, counts, cursor = km.fetch_unread_counts_longpoll(FakeOpener(exc=err), {}, 50, "keep")
+        self.assertEqual((available, counts, cursor), (False, {}, "keep"))
+        self.assertEqual(km._RETRY_HINT["seconds"], 12)
+        # a later failure WITHOUT a hint clears it - a stale hint must never pace an unrelated failure
+        km.fetch_unread_counts_longpoll(FakeOpener(exc=urllib.error.URLError("dropped")), {}, 50, "keep")
+        self.assertIsNone(km._RETRY_HINT["seconds"])
+
+    def test_backoff_never_shorter_than_the_hint_and_exponential_without_one(self):
+        seq, b = [], 0
+        for _ in range(7):
+            b = km.next_longpoll_backoff(b, None)
+            seq.append(b)
+        self.assertEqual(seq, [1, 2, 4, 8, 16, 30, 30])
+        self.assertEqual(km.next_longpoll_backoff(0, 15), 15)
+        self.assertEqual(km.next_longpoll_backoff(15, 15), 30)
+        self.assertEqual(km.next_longpoll_backoff(30, 90), 90)
+
+
+class MeasuredAlertFloorTest(unittest.TestCase):
+    """§7.1 THE DEAD-MAN EDGE NEEDS A MEASURED SPAN, NOT ONLY A FAILURE COUNT.
+
+    With `--wait` the loop retries a failed long-poll after 1/2/4 s, so `--alert-after 3` was reached
+    ~3 s into ANY outage and every routine server restart - 11 s edge windows included - alerted, while `seconds`
+    reported the nominal 90. The floor is now (alert_after - 1) * poll_seconds of MEASURED time since the
+    first failure (or --alert-floor-seconds), and `seconds` is that measurement.
+    """
+    # Borrow the liveness fixtures rather than subclass: subclassing re-runs the parent's tests.
+    Recorder = Loom11AlarmDeliveryTest.Recorder
+    _target = Loom11AlarmDeliveryTest._target
+    _down_fetch = staticmethod(Loom11AlarmDeliveryTest._down_fetch)
+    _clock = Loom11AlarmDeliveryTest._clock
+    _run_at = Loom11AlarmDeliveryTest._run_at
+
+    def test_the_count_alone_does_not_cross_the_edge_the_measured_floor_does(self):
+        em = self.Recorder()
+        clock = self._clock()
+        t = self._target(em)
+        # long-poll retry shape: failures at +0, +1, +3 - the count is reached in 3 s
+        self._run_at(t, self._down_fetch(), clock, at=[0, 1, 3])
+        self.assertEqual([f for e, f in em.events if e == "alert"], [], "count-only edge is the defect")
+        self.assertEqual((t.fsm_state, t.failures), ("UP", 3))
+        self._run_at(t, self._down_fetch(), clock, at=[7, 15, 31, 63])
+        self.assertEqual([f for e, f in em.events if e == "alert"], [], "still under the 120 s floor")
+        self._run_at(t, self._down_fetch(), clock, at=[120])
+        alerts = [f for e, f in em.events if e == "alert"]
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["consecutive_failures"], 8)
+        self.assertEqual(alerts[0]["seconds"], 120)
+        self.assertEqual(alerts[0]["floor_seconds"], 120)
+        self.assertEqual(t.fsm_state, "DOWN")
+        # edge-once: more failures past the floor never re-alert
+        self._run_at(t, self._down_fetch(), clock, at=[130, 200])
+        self.assertEqual(len([f for e, f in em.events if e == "alert"]), 1)
+
+    def test_a_restart_bracket_under_the_floor_is_silent_and_leaves_no_debt(self):
+        em = self.Recorder()
+        clock = self._clock()
+        t = self._target(em)
+        self._run_at(t, self._down_fetch(), clock, at=[0, 1, 3, 7])
+        self._run_at(t, BoundedWindowEndToEndTest()._fetch([{"id": 101}], 0), clock, at=[12])
+        self.assertEqual([e for e, f in em.events if e in ("alert", "recovered")], [],
+                         "an 11 s bracket must produce neither edge")
+        self.assertEqual((t.fsm_state, t.failures, t.down_since), ("UP", 0, None))
+        self.assertEqual(em.new_ids, [101])   # and the mail from the healthy poll still flows
+
+    def test_bug19_a_20s_restart_of_502s_raises_zero_wake_events(self):
+        # Row M375 / bug #19: a ~20 s server restart answered every poll with 502 while the producer
+        # retried at its long-poll backoff (1, 2, 4, 8 s). Before the floor that was alert + recovered -
+        # two wakes, no mail. Now: nothing at all, and the mail after the restart still flows.
+        em = self.Recorder()
+        clock = self._clock()
+        t = self._target(em)
+        self._run_at(t, self._down_fetch(), clock, at=[0, 1, 3, 7, 15])
+        self._run_at(t, BoundedWindowEndToEndTest()._fetch([{"id": 101}], 0), clock, at=[20])
+        wake = [e for e, f in em.events if km._wake_class(e) == km.WAKE_CLASS_DIAGNOSTIC]
+        self.assertEqual(wake, [], "a 20 s restart must wake nobody")
+        self.assertEqual((t.fsm_state, t.failures, t.down_since), ("UP", 0, None))
+        self.assertEqual(em.new_ids, [101])
+
+    def test_bug19_a_20s_restart_recovering_on_the_count_fast_path_is_silent_too(self):
+        # The same restart, but the first healthy tick is the /api/notify/pending fast path (no unread
+        # increase, so the full inbox poll is skipped) - the path a long-polling producer usually
+        # recovers through. It must not announce a recovery nobody was told about.
+        em = self.Recorder()
+        clock = self._clock()
+        t = self._target(em)
+        t.args.no_fast_path = False
+        t.fast_path, t.last_unread = True, 0
+        self._run_at(t, self._down_fetch(), clock, at=[0, 1, 3, 7, 15])
+        self.assertEqual(t.failures, 5)
+        clock[0] = 1000.0 + 20
+        t.poll_once(counts_available=True, unread_counts={"argus": 0})
+        self.assertEqual([e for e, f in em.events if km._wake_class(e) == km.WAKE_CLASS_DIAGNOSTIC], [])
+        self.assertEqual((t.fsm_state, t.failures, t.down_since), ("UP", 0, None))
+
+    def test_an_outage_past_the_floor_raises_exactly_one_alert_then_one_recovered(self):
+        em = self.Recorder()
+        clock = self._clock()
+        t = self._target(em)
+        self._run_at(t, self._down_fetch(), clock, at=[0, 1, 3, 7, 15, 31, 61, 91, 121, 151])
+        self._run_at(t, BoundedWindowEndToEndTest()._fetch([{"id": 101}], 0), clock, at=[160, 170])
+        self.assertEqual([e for e, f in em.events if e in ("alert", "recovered")], ["alert", "recovered"])
+        self.assertEqual(t.fsm_state, "UP")
+
+    def test_plain_poll_cadence_alerts_on_the_Nth_failure_exactly_as_before(self):
+        em = self.Recorder()
+        clock = self._clock()
+        t = self._target(em)
+        self._run_at(t, self._down_fetch(), clock, at=[0, 60])
+        self.assertEqual([f for e, f in em.events if e == "alert"], [])
+        self._run_at(t, self._down_fetch(), clock, at=[120])
+        alerts = [f for e, f in em.events if e == "alert"]
+        self.assertEqual([a["consecutive_failures"] for a in alerts], [3])
+
+    def test_alert_floor_seconds_override_is_honoured_and_zero_restores_count_only(self):
+        em = self.Recorder()
+        clock = self._clock()
+        t = self._target(em)
+        t.args.alert_floor_seconds = 5
+        self._run_at(t, self._down_fetch(), clock, at=[0, 1, 3])
+        self.assertEqual([f for e, f in em.events if e == "alert"], [])
+        self._run_at(t, self._down_fetch(), clock, at=[6])
+        alerts = [f for e, f in em.events if e == "alert"]
+        self.assertEqual((alerts[0]["seconds"], alerts[0]["floor_seconds"]), (6, 5))
+        # 0 = the pre-fix count-only edge, for anyone who wants it back
+        em2 = self.Recorder()
+        t2 = self._target(em2)
+        t2.args.alert_floor_seconds = 0
+        self._run_at(t2, self._down_fetch(), clock, at=[300, 301, 303])
+        self.assertEqual([f["consecutive_failures"] for e, f in em2.events if e == "alert"], [3])
+
+    def test_a_run_restored_by_WatchTarget_init_resumes_the_measured_span(self):
+        # EXERCISES the restore path in __init__ (not a restatement of it - the review found that
+        # deleting the block, or flipping its sign, left the suite green when the fixture hand-set the
+        # attributes). A supervisor restart mid-outage rebuilds the target from the state file: the
+        # persisted wall stamp says the run began 100 s ago, so the floor (120 s) is reached 20 s after
+        # the restart, not 120 s after it.
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        base = os.path.join(d, "state.json")
+        url = "http://x/api/inbox?persona=argus"
+        clock = self._clock()
+        km.StateFile(km._state_path_for_persona(base, "argus"), km.canonical_identity(url)).save(
+            100, "UP", 2, down_since=time.time() - 100.0)
+
+        class A(BoundedWindowEndToEndTest.FullArgs):
+            state_file = base
+            seed_at = None
+        em = self.Recorder()
+        t = km.WatchTarget("argus", url, None, {}, A(), em)
+        self.addCleanup(t.state_file.unlock)
+        self.assertEqual(t.failures, 2)
+        self.assertAlmostEqual(t.down_since[0], 1000.0 - 100.0, delta=2.0)   # mapped onto the patched clock
+        self._run_at(t, self._down_fetch(), clock, at=[0])        # span ~100 < 120
+        self.assertEqual([f for e, f in em.events if e == "alert"], [])
+        self._run_at(t, self._down_fetch(), clock, at=[21])       # span ~121 >= 120
+        alerts = [f for e, f in em.events if e == "alert"]
+        self.assertEqual(alerts[0]["consecutive_failures"], 4)
+        self.assertGreaterEqual(alerts[0]["seconds"], 120)
+        # and the healthy poll that follows clears the persisted stamp
+        self._run_at(t, BoundedWindowEndToEndTest()._fetch([{"id": 101}], 0), clock, at=[30])
+        with open(km._state_path_for_persona(base, "argus")) as f:
+            self.assertNotIn("down_since", json.load(f))
+
+    def test_an_older_state_file_without_the_stamp_measures_from_the_restart(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        base = os.path.join(d, "state.json")
+        url = "http://x/api/inbox?persona=argus"
+        clock = self._clock()
+        km.StateFile(km._state_path_for_persona(base, "argus"), km.canonical_identity(url)).save(100, "UP", 2)
+
+        class A(BoundedWindowEndToEndTest.FullArgs):
+            state_file = base
+            seed_at = None
+        em = self.Recorder()
+        t = km.WatchTarget("argus", url, None, {}, A(), em)
+        self.addCleanup(t.state_file.unlock)
+        self.assertEqual(t.failures, 2)
+        self.assertAlmostEqual(t.down_since[0], 1000.0, delta=2.0)          # the run starts NOW
+        self._run_at(t, self._down_fetch(), clock, at=[0, 60, 119])
+        self.assertEqual([f for e, f in em.events if e == "alert"], [], "conservative: never earlier")
+        self._run_at(t, self._down_fetch(), clock, at=[120])
+        self.assertEqual(len([f for e, f in em.events if e == "alert"]), 1)
+
+    def test_the_first_failure_stamp_round_trips_through_the_state_file_and_is_read_strictly(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        path = os.path.join(d, "s.json")
+        sf = km.StateFile(path, "idx")
+        self.assertTrue(sf.save(100, "UP", 2, down_since=1234.5))
+        self.assertEqual(sf.load()["down_since"], 1234.5)
+        self.assertTrue(sf.save(100, "UP", 0))                  # healthy: the stamp is not written
+        with open(path) as f:
+            self.assertNotIn("down_since", json.load(f))
+        self.assertIsNone(sf.load()["down_since"])
+        with open(path, "w") as f:                               # a non-number is not a timestamp
+            json.dump({"identity": "idx", "cursor": 100, "state": "UP", "consecutive_failures": 2,
+                       "down_since": "yesterday"}, f)
+        _capture_stderr(self)
+        self.assertIs(sf.load(), km.CORRUPT_STATE)
+        with open(path, "w") as f:                               # and neither is a bool
+            json.dump({"identity": "idx", "cursor": 100, "state": "UP", "consecutive_failures": 2,
+                       "down_since": True}, f)
+        self.assertIs(sf.load(), km.CORRUPT_STATE)
+        # json accepts every one of these; the 400-digit int is the one math.isfinite itself chokes on
+        # (OverflowError, not False), and 0/-0.0 are finite but no stamp - a run cannot have begun at epoch 0.
+        for bad in ("-Infinity", "Infinity", "NaN", "-5", "1e400", "1" + "0" * 400, "0", "-0.0"):
+            with open(path, "w") as f:
+                f.write('{"identity": "idx", "cursor": 100, "state": "UP", "consecutive_failures": 2, '
+                        '"down_since": %s}' % bad)
+            self.assertIs(sf.load(), km.CORRUPT_STATE, bad)      # an infinite span would raise at the edge
+
+    def test_the_default_floor_is_derived_from_the_two_flags(self):
+        class A:
+            alert_after, poll_seconds, alert_floor_seconds = 3, 30, None
+        self.assertEqual(km.alert_floor_seconds(A()), 60)        # the VM units: 3 polls at 30 s
+        A.alert_floor_seconds = 7
+        self.assertEqual(km.alert_floor_seconds(A()), 7)
+        A.alert_after, A.alert_floor_seconds = 1, None
+        self.assertEqual(km.alert_floor_seconds(A()), 0)         # --alert-after 1 keeps its meaning
 
 class Loom10ClassSweepTest(unittest.TestCase):
     """Loom re-audit 10 - the CLASS, swept rather than patched one finding at a time.

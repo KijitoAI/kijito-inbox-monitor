@@ -295,7 +295,7 @@ Each line of the events file (and each `exec-per-event` invocation) is one event
 |---------|---------|----------------------|
 | `armed` | emitted once per persona on the first healthy poll (baseline set) | `KIJITOMON_CURSOR` |
 | `new` | a new inbox message | `KIJITOMON_ID`, `KIJITOMON_FROM`, `KIJITOMON_CONTENT`, `KIJITOMON_CREATED`, `KIJITOMON_PERSONA` |
-| `alert` | the source has been unreachable for `--alert-after` polls (dead-man), **or** mail is stranded in an inbox nobody watches, **or** the server holds unread mail this window did not show (all below) | `KIJITOMON_REASON`, `KIJITOMON_FAILURES`, `KIJITOMON_STRANDED` |
+| `alert` | the source has been failing for `--alert-after` polls **and** for a measured `--alert-floor-seconds` (dead-man; `seconds` is the measured span), **or** mail is stranded in an inbox nobody watches, **or** the server holds unread mail this window did not show (all below) | `KIJITOMON_REASON`, `KIJITOMON_FAILURES`, `KIJITOMON_SECONDS`, `KIJITOMON_FLOOR_SECONDS`, `KIJITOMON_STRANDED` |
 | `recovered` | the source came back after an `alert` | `KIJITOMON_CURSOR` |
 | `still_unread` | mail already announced as `new` is still **unread** `--still-unread-after` seconds (default 2 h) after it was sent. One event per poll names every such message; each message is reminded at most once per window and at most `--still-unread-max` (default 3) times; never for retired, reserved or write_only inboxes; nothing on the first poll after a restart. Read what you have handled with `mark_read=true` and it stops. | `KIJITOMON_IDS`, `KIJITOMON_OLDEST_AGE`, `KIJITOMON_REASON` |
 | `heartbeat` | optional liveness tick (`--heartbeat N`) | `KIJITOMON_CURSOR` |
@@ -549,9 +549,10 @@ four sat above it. Only the newest page's count answers the question "is there u
 | `--state-file-template PATH` | Like `--state-file`, with `{persona}` filled in by the producer (the component `--safe-persona` prints). Use it in a supervisor unit so the unit never spells a persona into a path. |
 | `--token-file-template PATH` | Like `--token-file`, with `{persona}` filled in by the producer for the one `--persona` target. |
 | `--safe-persona NAME` | Print the filename component the producer uses for NAME, then exit. Anything that needs to name a persona's files should ask this rather than re-implement the rule. |
-| `--wait N` | Long-poll hold (s) requested from the server so new mail wakes the watcher near-instantly at ~the same request rate (default 50; `0` disables). Falls back to interval polling against a server that doesn't support it, and auto-upgrades when it does. |
-| `--poll-seconds N` | Interval between polls when long-poll is off/unsupported (default 60). |
+| `--wait N` | Long-poll hold (s) requested from the server so new mail wakes the watcher near-instantly at ~the same request rate (default 50; `0` disables). Falls back to interval polling against a server that doesn't support it, and auto-upgrades when it does. A failed long-poll waits at least as long as the server's `Retry-After` (or `retry_after_seconds`) asks, capped at 120 s. |
+| `--poll-seconds N` | Interval between polls when long-poll is off/unsupported (default 60). Also sets the default alert floor in every mode: `(--alert-after - 1) * --poll-seconds` (see `--alert-floor-seconds`). |
 | `--alert-after N` | Consecutive failures before an `alert` (default 3, min 1). A single transient failure is normal. |
+| `--alert-floor-seconds N` | Measured seconds the source must have been failing before the `alert` fires, in addition to the failure count (min 0). Default `(--alert-after - 1) * --poll-seconds` - what N consecutive failed polls take at the configured interval - so long-poll's fast retries (1/2/4 s after a failure) cannot alert on a 10-15 s restart. `0` restores the count-only edge. The alert's `seconds` is the measured span, never a nominal product of flags. |
 | `--heartbeat N` | Emit a `heartbeat` every N seconds (external dead-man's switch). |
 | `--content-chars N` / `--no-content` | Truncate (default 220) or omit message content. |
 | `--suppress-author P` | Don't emit `new` events authored by persona P (repeatable); drops self-echo when watching all personas. |
