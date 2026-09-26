@@ -3,6 +3,23 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [0.5.8] - 2026-09-26
+
+### Fixed
+- **Runs on native Windows** (reported from Windows 11, CPython 3.14). Four problems, each of which stopped
+  the producer or corrupted delivery there:
+  - Startup crashed with `AttributeError: module 'os' has no attribute 'geteuid'`. The private-file guard's
+    owner and 0600 checks are POSIX-only now; on Windows it still refuses anything that is not a regular
+    file.
+  - A new events file never became durable. Windows cannot open a directory to fsync it, so every sync
+    reported failure and the cursor was held forever, re-delivering the same mail. The directory fsync is
+    skipped on Windows (NTFS journals directory metadata).
+  - Every directory level printed a "writable by other local users" warning, because Windows reports
+    directories as mode 0777. That warning is POSIX-only now.
+  - On a cp1252 console or Git Bash pipe, `--help` crashed with `UnicodeEncodeError`, and so did any event
+    whose message body had a character outside cp1252 (an emoji, CJK) - mid-delivery. stdout is now
+    written as UTF-8, which JSON Lines requires anyway, and the help text is ASCII.
+
 ## [0.5.7] - 2026-09-25
 
 ### Added

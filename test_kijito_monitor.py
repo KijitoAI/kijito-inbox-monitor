@@ -6274,3 +6274,83 @@ class PersistedUnreadCountTest(unittest.TestCase):
 
     def test_zero_loads(self):
         self.assertEqual(self._load({"unread": 0})["unread"], 0)
+
+
+class WindowsNativeTest(unittest.TestCase):
+    """praetor's report (Windows 11 native, CPython 3.14, 2026-09-26): the producer crashed at startup on
+    `os.geteuid` (POSIX-only) in _assert_private_fd, and `--help` crashed on a cp1252 console. The next two
+    walls after that were `_fsync_dir` (Windows cannot open a directory to fsync it, so the events sink held
+    its cursor forever on a new file) and a spurious "writable by other users" warning (Windows reports
+    every directory as 0777). Windows is SIMULATED here: IS_POSIX False and os.geteuid removed."""
+
+    def setUp(self):
+        self._d = tempfile.TemporaryDirectory()
+        self.addCleanup(self._d.cleanup)
+        self._posix, km.IS_POSIX = km.IS_POSIX, False
+        self.addCleanup(setattr, km, "IS_POSIX", self._posix)
+        self._geteuid = getattr(os, "geteuid", None)
+        if self._geteuid is not None:
+            del os.geteuid
+            self.addCleanup(setattr, os, "geteuid", self._geteuid)
+
+    def test_a_regular_file_passes_without_geteuid_and_is_not_chmodded(self):
+        p = os.path.join(self._d.name, "events.jsonl")
+        with open(p, "w"):
+            pass
+        os.chmod(p, 0o644)
+        fd = os.open(p, os.O_RDONLY)
+        try:
+            km._assert_private_fd(fd, p)          # crashed with AttributeError before the fix
+        finally:
+            os.close(fd)
+        self.assertEqual(os.stat(p).st_mode & 0o777, 0o644, "no POSIX mode repair is attempted off POSIX")
+
+    def test_a_non_regular_file_is_still_refused(self):
+        fd = os.open(self._d.name, os.O_RDONLY)
+        try:
+            with self.assertRaises(km.InsecureFile):
+                km._assert_private_fd(fd, self._d.name)
+        finally:
+            os.close(fd)
+
+    def test_fsync_dir_reports_success(self):
+        self.assertTrue(km._fsync_dir(os.path.join(self._d.name, "no-such-dir")))
+
+    def test_no_writable_directory_warning_off_posix(self):
+        d = os.path.join(self._d.name, "open")
+        os.mkdir(d)
+        os.chmod(d, 0o777)
+        buf = _capture_stderr(self)
+        km._makedirs_private(os.path.join(d, "sub"))
+        self.assertNotIn("writable by other local users", buf.getvalue())
+
+    def test_the_events_file_sink_writes_and_syncs(self):
+        # End to end: before the fix a new events file made sync() return False on every poll (the
+        # directory fsync), so the cursor never advanced and mail was re-delivered forever.
+        sink = km.RotatingFileSink(os.path.join(self._d.name, "argus.jsonl"), 0, 3)
+        self.addCleanup(sink.close)
+        self.assertTrue(sink.write('{"event": "new", "content": "caf\\u00e9 \\u2713"}\n'))
+        self.assertTrue(sink.sync())
+
+
+class Utf8StdoutTest(unittest.TestCase):
+    """A cp1252 stdout (a Windows console, a Git Bash pipe) must neither crash `--help` nor an event whose
+    message body is outside cp1252. Real subprocesses, because the defect is the interpreter's own encoding."""
+
+    HERE = os.path.dirname(os.path.abspath(__file__))
+
+    def _run(self, code):
+        env = dict(os.environ, PYTHONIOENCODING="cp1252")
+        env.pop("PYTHONUTF8", None)
+        return subprocess.run([sys.executable, "-c", code], cwd=self.HERE, env=env, capture_output=True, timeout=60)
+
+    def test_help_does_not_crash_on_cp1252(self):
+        r = self._run("import kijito_inbox_monitor as km, sys\ntry:\n    km.main(['--help'])\nexcept SystemExit as e:\n    sys.exit(e.code)")
+        self.assertEqual(r.returncode, 0, r.stderr.decode("utf-8", "replace")[-300:])
+
+    def test_an_event_outside_cp1252_is_delivered_as_utf8(self):
+        r = self._run("import kijito_inbox_monitor as km\nkm._utf8_stdout()\n"
+                      "em = km.Emitter('stdout-jsonl', None, 220, False)\n"
+                      "assert em.lifecycle('armed', persona='\\u6f22\\U0001F600') is True")
+        self.assertEqual(r.returncode, 0, r.stderr.decode("utf-8", "replace")[-300:])
+        self.assertIn("\u6f22\U0001F600", r.stdout.decode("utf-8"))

@@ -28,7 +28,9 @@ no pip installs) that polls the Kijito inbox and emits one event per new message
 running, as NDJSON on stdout and/or exec-a-command-per-event. It is the client-side liveness watcher: it
 keeps a running agent's inbox live by waking it between tool calls. It is not a server, and not a
 notification service. POSIX target (Linux/macOS); Windows runs interval-only (no SIGUSR1 seam, no flock,
-per §10/§7.3).
+per §10/§7.3). On Windows the private-file guard checks only "regular file" (there is no POSIX owner or
+mode; access is the profile's inherited ACL), a directory fsync is skipped (Windows cannot open a directory
+to fsync it; NTFS journals the metadata), and stdout is written as UTF-8 whatever the console code page.
 
 ## 2. The problem
 

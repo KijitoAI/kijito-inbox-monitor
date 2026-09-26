@@ -33,7 +33,7 @@ try:
 except ImportError:  # pragma: no cover - Windows
     fcntl = None
 
-__version__ = "0.5.7"
+__version__ = "0.5.8"
 SOURCE = "kijito-inbox"
 # A named User-Agent is REQUIRED: api.kijito.ai is fronted by a WAF that 403s the default Python-urllib UA.
 USER_AGENT = "kijito-inbox-monitor/%s" % __version__
@@ -1261,6 +1261,12 @@ def _assert_private_fd(fd, path):
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode):
         raise InsecureFile("%s is not a regular file" % path)
+    if not IS_POSIX:
+        # WINDOWS HAS NO POSIX OWNER OR MODE BITS TO CHECK (praetor, Windows 11 native, 2026-09-26: os.geteuid
+        # does not exist there, so this line crashed the producer at startup). Access there is an ACL, and a
+        # file created under the user's profile inherits a user-only ACL; st_mode reports a synthetic
+        # 0666/0444 that says nothing about who can read it. The regular-file check above still holds.
+        return
     if st.st_uid != os.geteuid():
         raise InsecureFile("%s is owned by uid %d, not by us (uid %d)" % (path, st.st_uid, os.geteuid()))
     cur = st.st_mode & 0o777
@@ -1364,6 +1370,10 @@ def _makedirs_private(path):
     # directory is never validated, and an existing one is exactly where a hostile path would already be.
     # A sticky directory (/tmp, mode 1777) is excluded: the sticky bit is precisely what makes a shared
     # writable directory safe, and warning about it would train the reader to ignore this line.
+    # POSIX only: Windows reports every directory as 0777 (access is an ACL), so the warning would fire on
+    # every level of every path and say nothing true.
+    if not IS_POSIX:
+        return
     seen = path
     while True:
         try:
@@ -1386,7 +1396,13 @@ def _fsync_dir(path):
     os.replace is atomic for a concurrent READER, but atomicity is not durability: after a power loss
     the new file's contents can be on disk while the directory entry still names the old inode - i.e. a
     silently OLDER cursor. Syncing the file alone (which is all we did) does not cover the rename.
+
+    Windows cannot open a directory for fsync at all, so this always failed there and the events sink held
+    its cursor forever on a new file. NTFS journals directory metadata itself, so there is nothing further
+    to do: report success.
     """
+    if not IS_POSIX:
+        return True
     try:
         fd = os.open(path, os.O_RDONLY)
     except OSError:
@@ -3703,7 +3719,7 @@ def build_parser():
     p.add_argument("--wait", type=int, default=50,
                    help="Long-poll hold (s) requested from /api/notify/pending so new mail wakes the watcher "
                         "near-instantly at ~the same request rate (default 50; the server clamps to its own max). "
-                        "0 disables long-poll → plain interval polling at --poll-seconds. If the server doesn't "
+                        "0 disables long-poll -> plain interval polling at --poll-seconds. If the server doesn't "
                         "support long-poll, the client auto-falls back to interval polling (no redeploy needed). "
                         "Clean shutdown during a held poll can take up to --wait seconds (a supervisor's SIGKILL "
                         "mid-hold is safe - state is persisted every cycle).")
@@ -3840,7 +3856,25 @@ def validate_args(args):
                               "not multi-persona/all-personas - each persona has its own cursor")
 
 
+def _utf8_stdout():
+    """Write stdout as UTF-8 whatever the locale says (praetor, Windows 11 native, 2026-09-26).
+
+    A Windows console or a Git Bash pipe reports cp1252, so `--help` (a non-ASCII character) and, far worse,
+    any EVENT carrying a message body outside cp1252 (an emoji, CJK) raised UnicodeEncodeError - a
+    ValueError, which the stdout sink's OSError guard does not catch, so it killed the producer mid-delivery.
+    JSON Lines is UTF-8 by definition, so that is the right encoding for every consumer. No-op where stdout
+    is already UTF-8 or cannot be reconfigured.
+    """
+    enc = (getattr(sys.stdout, "encoding", None) or "").lower().replace("-", "").replace("_", "")
+    if enc != "utf8" and hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (ValueError, OSError):
+            pass
+
+
 def main(argv=None):
+    _utf8_stdout()
     args = build_parser().parse_args(argv)
     # A pure read of an existing report: no token, no network, no state file, no watch loop. Placed
     # before validate_args so a heartbeat can call it without satisfying the watcher's own config.
