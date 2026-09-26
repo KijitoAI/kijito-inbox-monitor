@@ -11,10 +11,12 @@ Authentication is required: set $KIJITOMON_TOKEN (or --token-file) to your Kijit
 """
 import argparse
 import datetime
+import email.utils
 import errno
 import hashlib
 import http.client
 import json
+import math
 import os
 import select
 import signal
@@ -33,7 +35,7 @@ try:
 except ImportError:  # pragma: no cover - Windows
     fcntl = None
 
-__version__ = "0.5.8"
+__version__ = "0.5.9"
 SOURCE = "kijito-inbox"
 # A named User-Agent is REQUIRED: api.kijito.ai is fronted by a WAF that 403s the default Python-urllib UA.
 USER_AGENT = "kijito-inbox-monitor/%s" % __version__
@@ -45,6 +47,7 @@ EXEC_TIMEOUT = 10
 HTTP_TIMEOUT = 5  # per-request timeout default (normal fetches)
 LONGPOLL_SLACK = 10  # client socket timeout = server hold (--wait) + this, so a half-open hold is always detected
 LONGPOLL_BACKOFF_CAP = 30  # cap (s) on exponential backoff between failed long-poll attempts
+RETRY_AFTER_CAP = 120  # cap (s) on a server-stated Retry-After; a larger hint is clamped, never obeyed blindly
 PIN_TRACKING_CAP = 5000    # max delivered ids remembered above a pinned watermark (bounds the state file)
 WALK_BACK_MAX_PAGES = 50   # page budget for an authoritative backward walk over an omitted span
 BROKEN_SINK_RETRY_S = 30   # cooldown before re-trying a persona sink we refused; the refusal's RELEASE
@@ -494,6 +497,59 @@ def fetch_unread_counts(opener, count_url, headers):
     return (True, counts)
 
 
+def next_longpoll_backoff(previous, hint):
+    """Seconds to wait before retrying a FAILED long-poll: exponential from 1 s, capped at
+    LONGPOLL_BACKOFF_CAP, and never shorter than the server's own Retry-After hint (already clamped)."""
+    backoff = min((previous * 2) or 1, LONGPOLL_BACKOFF_CAP)
+    if hint is not None:
+        backoff = max(backoff, hint)
+    return backoff
+
+
+# The retry hint of the LAST fetch_unread_counts_longpoll call: seconds (int) the server asked us to wait, or
+# None. A side channel rather than a fourth return value so the function's contract (and every caller and
+# test double of it) is unchanged; the main loop resets it before each call and reads it on failure.
+_RETRY_HINT = {"seconds": None}
+
+
+def _retry_after_seconds(headers, body=None):
+    """The server's own retry hint on a FAILED response, in whole seconds, or None when it gave none.
+
+    Two carriers, header first: `Retry-After` (delta-seconds, or an HTTP-date) and a JSON body field
+    `retry_after_seconds` (the edge's restart page carries both). A hint only ever LENGTHENS the wait
+    before the next retry - it is pacing, never a reason to alert - and it is clamped to
+    [0, RETRY_AFTER_CAP] so a hostile or mistaken value cannot park the producer.
+    """
+    secs = None
+    raw = None
+    try:
+        raw = headers.get("Retry-After") if headers is not None else None
+    except Exception:
+        raw = None
+    if isinstance(raw, str) and raw.strip():
+        raw = raw.strip()
+        if raw.isdigit():
+            secs = int(raw)
+        else:
+            try:
+                when = email.utils.parsedate_to_datetime(raw)
+                now = datetime.datetime.now(datetime.timezone.utc)
+                secs = int(math.ceil((when - now).total_seconds()))
+            except (TypeError, ValueError, IndexError, OverflowError):
+                secs = None
+    if secs is None and body:
+        try:
+            data = json.loads(body)
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            data = None
+        v = data.get("retry_after_seconds") if isinstance(data, dict) else None
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v):
+            secs = int(math.ceil(v))
+    if secs is None:
+        return None
+    return max(0, min(secs, RETRY_AFTER_CAP))
+
+
 def fetch_unread_counts_longpoll(opener, headers, wait, cursor):
     """Long-poll variant of the fast-path. GET /api/notify/pending?wait=<sec>[&cursor=<opaque>].
 
@@ -512,11 +568,22 @@ def fetch_unread_counts_longpoll(opener, headers, wait, cursor):
         q["cursor"] = cursor
     url = NOTIFY_PENDING_URL + "?" + urllib.parse.urlencode(q)
     req = urllib.request.Request(url, headers=headers, method="GET")
+    _RETRY_HINT["seconds"] = None
     try:
         with opener.open(req, timeout=wait + LONGPOLL_SLACK) as resp:
             if not (200 <= resp.status < 300):
+                _RETRY_HINT["seconds"] = _retry_after_seconds(getattr(resp, "headers", None))
                 return (False, {}, cursor)
             data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        # A 502/503 during a server restart. Read the edge's own "retry in N s" so the next attempt is
+        # paced by it; a bounded read, because this body is an error page, not data.
+        try:
+            body = e.read(4096)
+        except Exception:
+            body = None
+        _RETRY_HINT["seconds"] = _retry_after_seconds(e.headers, body)
+        return (False, {}, cursor)
     except Exception:
         return (False, {}, cursor)  # keep the old cursor → next attempt resumes losslessly
     counts = _parse_unread_rows(data)
@@ -1182,6 +1249,7 @@ class Emitter:
                 "created": "KIJITOMON_CREATED", "cursor": "KIJITOMON_CURSOR",
                 "persona": "KIJITOMON_PERSONA",
                 "reason": "KIJITOMON_REASON", "consecutive_failures": "KIJITOMON_FAILURES",
+                 "seconds": "KIJITOMON_SECONDS", "floor_seconds": "KIJITOMON_FLOOR_SECONDS",
                 "seeded": "KIJITOMON_SEEDED", "current_max": "KIJITOMON_CURRENT_MAX",
                 "capped_to": "KIJITOMON_CAPPED_TO", "dropped": "KIJITOMON_DROPPED",
                 "stranded_inboxes": "KIJITOMON_STRANDED",
@@ -1619,6 +1687,29 @@ class StateFile:
             sys.stderr.write("kijito-inbox-monitor: WARNING state-file 'pin_release_at' is not an integer (%r); "
                              "refusing to interpret it: %s\n" % (release_at, self.path))
             release_at, strict_ok = None, False
+        # §7.1 wall-clock stamp of the first failure of a DOWN run. Absent in older files. Read strictly:
+        # a bool is not a timestamp (the same `1`/`true` confusion as the pin flags above).
+        down_since = d.get("down_since", _MISSING)
+        if down_since is _MISSING or down_since is None:
+            down_since = None
+        else:
+            # json.loads accepts `-Infinity`/`NaN`, turns 1e400 into inf, and hands back a Python int for a
+            # 400-digit literal - on which math.isfinite ITSELF raises OverflowError. Any of those escaping
+            # load() is a traceback at startup or at the alert edge; under a supervisor that is a crash loop
+            # fed by the file it re-reads on every restart. So: normalise through float() with the overflow
+            # caught, then require finite and positive. A stamp is a finite positive epoch or it is nothing.
+            fv = None
+            if isinstance(down_since, (int, float)) and not isinstance(down_since, bool):
+                try:
+                    fv = float(down_since)
+                except OverflowError:
+                    fv = None
+            if fv is not None and math.isfinite(fv) and fv > 0:
+                down_since = fv
+            else:
+                sys.stderr.write("kijito-inbox-monitor: WARNING state-file 'down_since' is not a finite positive "
+                                 "number (%r); refusing to interpret it: %s\n" % (down_since, self.path))
+                down_since, strict_ok = None, False
         raw = d.get("emitted_above")
         if raw is None:
             emitted, intact = set(), True          # no pin was in force; the ordinary case
@@ -1671,7 +1762,8 @@ class StateFile:
         return {"cursor": cursor, "state": state, "failures": failures, "emitted_above": emitted,
                 "gap_alerted": alerted, "pin_evidence_intact": intact,
                 "pin_forced": pin_forced, "pin_release_at": release_at,
-                "state_corrupt": state_corrupt, "unread_hidden": hidden, "unread": unread}
+                "state_corrupt": state_corrupt, "unread_hidden": hidden, "unread": unread,
+                "down_since": down_since}
 
     def unlock(self):
         """Release the single-writer flock and close the sidecar fd.
@@ -1688,7 +1780,7 @@ class StateFile:
 
     def save(self, cursor, state, failures, emitted_above=None, gap_alerted=None,
              pin_forced=False, pin_evidence_intact=True, state_corrupt=False, pin_release_at=None,
-             unread_hidden=False, unread=None):
+             unread_hidden=False, unread=None, down_since=None):
         """Persist the cursor. Returns True IFF the write is DURABLE (Loom re-audit 8, HIGH 3).
 
         The directory fsync used to be called and its answer thrown away, so a failure returned success
@@ -1729,6 +1821,10 @@ class StateFile:
         # Omitted when this poll had no count, so its absence means "unknown", never "zero".
         if unread is not None:
             d["unread"] = unread
+        # §7.1 the wall-clock stamp of the first failure of the current DOWN run, so a supervisor restart
+        # mid-outage resumes the measured span instead of restarting the floor from zero.
+        if down_since is not None:
+            d["down_since"] = down_since
         dirn = os.path.dirname(os.path.abspath(self.path)) or "."
         # BOTH OF THESE ARE INSIDE THE GUARD, and they did not used to be (drill, 2026-08-05).
         # This function builds a careful "written but not provably durable" path - _fsync_dir fails ->
@@ -1824,6 +1920,20 @@ class WakeSeam:
             select.select([self.r], [], [], timeout)
         except (InterruptedError, OSError):
             pass
+
+
+def alert_floor_seconds(args):
+    """§7.1 the MEASURED span a failing run must reach before the dead-man `alert` fires.
+
+    `--alert-floor-seconds` when given; otherwise `(--alert-after - 1) * --poll-seconds`, which is exactly
+    how long `--alert-after` consecutive failed polls take at the configured interval - so plain interval
+    polling still alerts on the N-th failure, while long-poll mode (which retries after 1/2/4 s on a
+    failure) can no longer reach the edge in ~3 s. Before this, the count-only edge fired on every
+    routine server restart, 11 s windows included.
+    """
+    if args.alert_floor_seconds is not None:
+        return args.alert_floor_seconds
+    return (args.alert_after - 1) * args.poll_seconds
 
 
 def _monotonic():
@@ -2024,6 +2134,7 @@ class WatchTarget:
         self.cursor = None
         self.fsm_state = "UP"
         self.failures = 0
+        self.down_since = None   # (monotonic, wall) of the FIRST failure of the current run; None while healthy
         self.armed = False
         self.fast_path = False
         self.last_unread = None
@@ -2082,6 +2193,15 @@ class WatchTarget:
                 elif loaded is not None:
                     self.cursor = loaded["cursor"]
                     self.fsm_state, self.failures = loaded["state"], loaded["failures"]
+                    # §7.1 the measured floor survives a restart mid-outage: the persisted wall-clock stamp of
+                    # the first failure supplies the span already elapsed. Absent (a file written by an older
+                    # version) the run is measured from now - the conservative direction (later alert, never
+                    # a spurious one).
+                    self.down_since = None
+                    if self.failures:
+                        wall = loaded.get("down_since")
+                        elapsed = max(0.0, time.time() - wall) if wall is not None else 0.0
+                        self.down_since = (_monotonic() - elapsed, wall if wall is not None else time.time())
                     self.emitted_above = loaded["emitted_above"]
                     self.gap_alerted = loaded["gap_alerted"]
                     self.pin_evidence_intact = loaded["pin_evidence_intact"]
@@ -2469,6 +2589,7 @@ class WatchTarget:
                 self.fsm_state = "UP"
                 self._alarm("recovered", "source recovered", cursor=self.cursor)
             self.failures = 0
+            self.down_since = None
         else:
             self.skips = 0
             poll = fetch(self.opener, self.url, self.headers)
@@ -2484,6 +2605,7 @@ class WatchTarget:
                     self.fsm_state = "UP"
                     recovered = True
                 self.failures = 0
+                self.down_since = None
 
                 items = poll.items
                 # §5.4 Record who AUTHORED what, from the window we already have. Done before any cursor
@@ -2847,21 +2969,30 @@ class WatchTarget:
                                         pinned=True, evidence_lost=True)
 
             else:
+                if self.failures == 0 or self.down_since is None:
+                    # First failure of this run: stamp it. Everything the floor measures starts here.
+                    self.down_since = (_monotonic(), time.time())
                 self.failures += 1
-                if self.failures == args.alert_after and self.fsm_state == "UP":
+                span = _monotonic() - self.down_since[0]
+                floor = alert_floor_seconds(args)
+                if self.failures >= args.alert_after and span >= floor and self.fsm_state == "UP":
                     # THE DEAD-MAN'S SWITCH. The FSM transition MUST commit (it drives the whole
-                    # liveness model, and the firing condition is an EQUALITY on `failures`, so a
-                    # reverted transition would never re-fire - the edge is crossed exactly once).
-                    # So the state commits and the ANNOUNCEMENT gets the guaranteed second channel
-                    # (re-audit 11, F1/A1). Before this, a broken sink meant the source could go down
-                    # and NOTHING was ever emitted or logged - the one event README sells as the
-                    # dead-man's switch, silently absent.
+                    # liveness model; the `fsm_state == "UP"` guard is what makes the edge cross exactly
+                    # once, so a reverted transition would never re-fire). So the state commits and the
+                    # ANNOUNCEMENT gets the guaranteed second channel (re-audit 11, F1/A1). Before this,
+                    # a broken sink meant the source could go down and NOTHING was ever emitted or
+                    # logged - the one event README sells as the dead-man's switch, silently absent.
+                    # §7.1 the edge needs BOTH the count and the MEASURED span (`>=`, not `==`: in
+                    # long-poll mode the count is reached in ~3 s and the floor is what waits). `seconds`
+                    # is now that measured span - it used to be the nominal failures * poll_seconds and
+                    # read 90 against outages of 11 s.
                     self.fsm_state = "DOWN"
                     down_reason = poll.reason or "unreachable"
                     self._alarm("alert", "source is DOWN: %s" % down_reason,
                                 reason=down_reason,
                                 consecutive_failures=self.failures,
-                                seconds=self.failures * args.poll_seconds)
+                                seconds=int(round(span)),
+                                floor_seconds=int(floor))
 
         if self.state_file is not None:
             durable = self.state_file.save(self.cursor, self.fsm_state, self.failures,
@@ -2871,7 +3002,8 @@ class WatchTarget:
                                  state_corrupt=self.state_corrupt,
                                  pin_release_at=self.pin_release_at,
                                  unread_hidden=self.unread_hidden,
-                                 unread=self.observed_unread)
+                                 unread=self.observed_unread,
+                                 down_since=(self.down_since[1] if self.down_since else None))
             # ★ CONSUME THE ANSWER (Loom re-audit 9, MEDIUM). Round 8 taught me to RETURN a durability
             # status; this is the same defect one layer out - I produced an answer and then discarded it
             # at the call site, which is the exact thing the previous round was about. A cursor whose
@@ -3639,6 +3771,7 @@ def run(args):
         count_target = next((t for t in targets if t.unread_persona), None)
         if count_target is not None and not args.no_fast_path:
             if args.wait > 0:
+                _RETRY_HINT["seconds"] = None
                 counts_available, unread_counts, new_cursor = fetch_unread_counts_longpoll(
                     count_target.opener, headers, args.wait, cursor)
                 if counts_available:
@@ -3650,7 +3783,7 @@ def run(args):
                 else:
                     # drop / blip / outage: back off, resume the SAME cursor next time (lossless), and this tick
                     # falls through to per-target full inbox polls (the by-message-id correctness backstop).
-                    lp_backoff = min((lp_backoff * 2) or 1, LONGPOLL_BACKOFF_CAP)
+                    lp_backoff = next_longpoll_backoff(lp_backoff, _RETRY_HINT["seconds"])
             else:
                 counts_available, unread_counts = fetch_unread_counts(
                     count_target.opener, count_target.count_url, headers)
@@ -3724,6 +3857,11 @@ def build_parser():
                         "Clean shutdown during a held poll can take up to --wait seconds (a supervisor's SIGKILL "
                         "mid-hold is safe - state is persisted every cycle).")
     p.add_argument("--alert-after", type=int, default=3, help="Consecutive failures before an alert (min 1).")
+    p.add_argument("--alert-floor-seconds", type=int, default=None,
+                   help="Measured seconds the source must have been failing before an `alert` fires, in addition "
+                        "to --alert-after failures (min 0). Default: (--alert-after - 1) * --poll-seconds - what "
+                        "N consecutive failed polls take at the configured interval - so long-poll's fast retries "
+                        "cannot alert on an 11 s restart. 0 restores the count-only edge.")
     p.add_argument("--emit", choices=("stdout-jsonl", "exec-per-event"), default="stdout-jsonl")
     p.add_argument("--exec", help="Command to run per event (required iff --emit exec-per-event).")
     p.add_argument("--suppress-author", action="append",
@@ -3803,6 +3941,8 @@ def build_parser():
 def validate_args(args):
     if args.alert_after < 1:
         raise FatalConfig("--alert-after must be >= 1")
+    if args.alert_floor_seconds is not None and args.alert_floor_seconds < 0:
+        raise FatalConfig("--alert-floor-seconds must be >= 0")
     if args.resync_every < 1:
         raise FatalConfig("--resync-every must be >= 1")
     if args.rediscover_every < 1:
