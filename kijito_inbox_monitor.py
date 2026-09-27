@@ -1789,8 +1789,12 @@ class StateFile:
         that cannot tell you it failed to persist will keep not telling you, and a disk failing this way
         is exactly the condition nobody notices.
         """
-        if not IS_POSIX:
-            return True  # best-effort; skip on Windows
+        # ⛔ NO WINDOWS EARLY-RETURN HERE. This method used to open with `if not IS_POSIX: return True`, so on
+        # Windows the cursor was never written while every caller was told it had been. Each supervisor
+        # restart then found no state file, BASELINED to the newest id, and any mail that arrived while the
+        # producer was down never raised a `new` - the permanent, silent skip load() exists to prevent
+        # (praetor, real Windows 11, 2026-09-27). Everything below is portable: mkstemp, fsync and os.replace
+        # work on Windows, and _fsync_dir answers True there.
         d = {"identity": self.identity, "cursor": cursor, "state": state, "consecutive_failures": failures}
         # Persisted so a RESTART cannot re-emit what we already delivered above a pinned watermark.
         # Without this, failing closed would trade silent loss for a duplicate storm on every restart.
@@ -2571,9 +2575,15 @@ class WatchTarget:
         if self.armed and self.fast_path and not args.no_fast_path and self.unread_persona:
             if counts_available:
                 unread = unread_counts.get(self.unread_persona, 0)
-                increased = unread > self.last_unread if self.last_unread is not None else True
+                # ANY CHANGE, NOT ONLY AN INCREASE (crucible, 2026-09-27). If the agent reads its N held
+                # messages and one new message lands within the same tick, the count goes N -> 1: a
+                # DECREASE that hides an arrival, so keying on `>` left that mail unannounced until the
+                # --resync-every floor (~8 min at the defaults). A pure read-down now costs one extra inbox
+                # fetch. Still blind, and still bounded by the floor: reads and arrivals that cancel
+                # exactly in one tick (N -> N) - only a server-stated newest id could close that.
+                changed = unread != self.last_unread if self.last_unread is not None else True
                 self.last_unread = unread
-                if not increased and self.skips < args.resync_every:
+                if not changed and self.skips < args.resync_every:
                     skip_full = True
                     self.skips += 1
             # unavailable (transient) → fall through to the full inbox-list poll (the baseline)

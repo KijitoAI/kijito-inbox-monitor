@@ -351,6 +351,15 @@ M=[
  ("M375e: the retry hint is not clamped (a hostile Retry-After parks the producer)",
   "    return max(0, min(secs, RETRY_AFTER_CAP))",
   "    return max(0, secs)"),
+ # praetor, real Windows 11 (2026-09-27): save() skipped the write off POSIX, so every restart baselined
+ # and mail sent while the producer was down was never announced.
+ # crucible (2026-09-27): a read-down that hides an arrival (N -> 1) was skipped until the resync floor.
+ ("F1: the fast path fetches only on an INCREASE again",
+  "                changed = unread != self.last_unread if self.last_unread is not None else True",
+  "                changed = unread > self.last_unread if self.last_unread is not None else True"),
+ ("W1: the state file is silently not written on Windows again",
+  "        d = {\"identity\": self.identity, \"cursor\": cursor, \"state\": state, \"consecutive_failures\": failures}",
+  "        if not IS_POSIX:\n            return True\n        d = {\"identity\": self.identity, \"cursor\": cursor, \"state\": state, \"consecutive_failures\": failures}"),
  ("M375f: a stale retry hint survives into the next, unrelated failure",
   "    req = urllib.request.Request(url, headers=headers, method=\"GET\")\n    _RETRY_HINT[\"seconds\"] = None\n",
   "    req = urllib.request.Request(url, headers=headers, method=\"GET\")\n"),

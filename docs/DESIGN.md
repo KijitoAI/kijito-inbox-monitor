@@ -723,7 +723,10 @@ read-state-neutral (DONE-WHEN #5 holds after self-test).
   404s), read-only, never marks read. Response `{"result":[{"persona","unread","unread_urgent"},...]}`; `unread` is
   all read=false for that persona (a persona with 0 unread is absent, treat as 0). The watcher probes it once on
   arm; if available it consumes `unread` for its persona and does the full inbox-list fetch only when `unread`
-  increases, saving the full-list diff on quiet polls. It auto-falls-back to baseline if the endpoint is absent or
+  CHANGES (either direction), saving the full-list diff on quiet polls. An increase alone is not enough: reading
+  N held messages while one new one arrives in the same tick moves the count N -> 1, a decrease that hides an
+  arrival (seen live 2026-09-27; it waited for the floor). A read-down therefore costs one extra fetch. Reads and
+  arrivals that cancel exactly within one tick (N -> N) stay invisible to the count and are caught by the floor. It auto-falls-back to baseline if the endpoint is absent or
   non-2xx (a server without the field simply runs baseline).
 - **Safety floor (`--resync-every`, default 10):** the watcher never skips more than N consecutive polls; it
   forces a full inbox poll regardless. So a stale / wrong / unsupported count can at worst add latency, never blind
@@ -850,8 +853,8 @@ recipe.)
 ### 14.2 One signal fetch per tick, fanned out in-process
 The §9 fast-path generalizes cleanly to the whole account: one `GET /api/notify/pending` per tick returns the per-persona
 `{persona, unread, unread_urgent}` map; the watcher fans it out in-process to each persona's wake decision, and does not
-issue one request per watched persona. A persona's full inbox-list poll (§5) still fires only on arm, on its `unread`
-increase, on its `--resync-every` floor, or on fast-path fallback. The `--resync-every` no-blindness floor (§9)
+issue one request per watched persona. A persona's full inbox-list poll (§5) still fires only on arm, on a change in its `unread`
+(either direction), on its `--resync-every` floor, or on fast-path fallback. The `--resync-every` no-blindness floor (§9)
 applies per persona.
 
 ### 14.3 Owned, self-rotating EVENT sinks (the consume-your-own fix)

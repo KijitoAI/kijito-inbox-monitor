@@ -3,6 +3,20 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [Unreleased]
+
+### Fixed
+- **On Windows the cursor is now saved.** `StateFile.save()` returned success without writing anything
+  when not on POSIX, so every supervisor restart found no state file and baselined to the newest id:
+  mail that arrived while the producer was down was never announced (reported and verified on a real
+  Windows 11 seat). The write path was already portable (`mkstemp`, `fsync`, `os.replace`), so the
+  early return is simply removed. A restart now resumes from the saved cursor and emits the mail it
+  missed, exactly as on Linux and macOS.
+- **New mail that lands while you read your held mail is announced at once.** The unread-count fast path
+  fetched the inbox only when a persona's count went UP. Reading N held messages while one new message
+  arrived in the same tick moved the count from N to 1, a decrease, so the new message waited for the
+  `--resync-every` backstop (~8 minutes at the defaults). Any change in the count now triggers the fetch.
+
 ## [0.5.9] - 2026-09-26
 
 ### Fixed
