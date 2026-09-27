@@ -34,6 +34,10 @@ try:
     import fcntl  # POSIX only
 except ImportError:  # pragma: no cover - Windows
     fcntl = None
+try:
+    import msvcrt  # Windows only: the single-writer lock there (StateFile.lock)
+except ImportError:
+    msvcrt = None
 
 __version__ = "0.5.10"
 SOURCE = "kijito-inbox"
@@ -1535,7 +1539,21 @@ class StateFile:
 
     def lock(self):
         if not IS_POSIX or fcntl is None:
-            return  # Windows: no lock (documented; run a single instance)
+            # WINDOWS: the same single-writer guarantee through msvcrt, on the same .lock sidecar. This used
+            # to be a bare return ("run a single instance"), so two producers on one state file both ran,
+            # each emitting every message. msvcrt.locking locks a BYTE RANGE, so pin it: byte 0 of the
+            # sidecar, taken non-blocking. The OS releases it when the handle closes or the process dies.
+            if msvcrt is None:
+                return
+            _makedirs_private(os.path.dirname(os.path.abspath(self.path)) or ".")
+            self._lockf = _open_private(self.path + ".lock", "a+")
+            try:
+                self._lockf.seek(0)
+                msvcrt.locking(self._lockf.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                self.unlock()
+                raise FatalConfig("state-file in use (another watcher holds the lock): %s" % self.path)
+            return
         dirn = os.path.dirname(os.path.abspath(self.path)) or "."
         _makedirs_private(dirn)
         # Lock a DEDICATED .lock SIDECAR, never the state-file itself: save() replaces the state-file's inode
