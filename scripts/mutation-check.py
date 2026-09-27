@@ -113,8 +113,8 @@ M=[
   "    if cur != PRIVATE_FILE_MODE:",
   "    if False:"),
  ("L8-HIGH1: the lock sidecar goes back to the umask",
-  "        self._lockf = _open_private(self.path + \".lock\", \"a+\")",
-  "        self._lockf = open(self.path + \".lock\", \"a+\")"),
+  "        self._lockf = _open_private(self.path + \".lock\", \"a+\")\n        try:\n            fcntl.flock(",
+  "        self._lockf = open(self.path + \".lock\", \"a+\")\n        try:\n            fcntl.flock("),
  ("L8-HIGH2: a newly created event file does not sync its directory entry",
   "        if not existed:",
   "        if False:"),
@@ -296,8 +296,8 @@ M=[
   "        return self.emitter.lifecycle(event, **fields)",
   "        self.emitter.lifecycle(event, **fields)"),
  ("L11-F1: the FAST-PATH recovered edge stops reporting an undelivered event",
-  '                self._alarm("recovered", "source recovered", cursor=self.cursor)',
-  '                self.lifecycle("recovered", cursor=self.cursor)'),
+  '                self.fsm_state = "UP"\n                self._alarm("recovered", "source recovered", cursor=self.cursor)',
+  '                self.fsm_state = "UP"\n                self.lifecycle("recovered", cursor=self.cursor)'),
  ("L11-F1: the MAIN-PATH recovered edge stops reporting an undelivered event",
   '                    self._alarm("recovered", "source recovered", cursor=self.cursor)',
   '                    self.lifecycle("recovered", cursor=self.cursor)'),
@@ -405,6 +405,12 @@ surv=[]
 for label,pat,rep in M:
     if pat not in base:
         print("!! PATTERN NOT FOUND (vacuous):",label); surv.append(label); continue
+    if base.count(pat)>1:
+        # AN AMBIGUOUS PATTERN MUTATES WHICHEVER COPY COMES FIRST, NOT THE ONE ITS LABEL NAMES. The Windows
+        # lock (W2) added a second, identical sidecar open, so "the lock sidecar goes back to the umask"
+        # silently moved onto the Windows branch, which no POSIX test executes, and read as a survivor.
+        # The reverse is worse: a copy that some other test happens to catch reads as a kill. Anchor it.
+        print("!! PATTERN AMBIGUOUS (%d matches):" % base.count(pat),label); surv.append(label); continue
     mut=base.replace(pat,rep,1)
     try: compile(mut,"m","exec")
     except SyntaxError as e:
