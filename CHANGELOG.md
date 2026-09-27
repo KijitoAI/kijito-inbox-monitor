@@ -3,7 +3,7 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
-## [Unreleased]
+## [0.5.10] - 2026-09-27
 
 ### Fixed
 - **On Windows the cursor is now saved.** `StateFile.save()` returned success without writing anything
