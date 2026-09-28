@@ -455,6 +455,16 @@ def fetch_personas(opener, headers):
 # the closest thing the hive has to a declared expectation of attention, which makes it the one signal
 # that can distinguish "idle by design" from "nobody is coming" without asking the silent party.
 _URGENT_UNREAD = {}
+# persona -> the server's `newest_unread_id` (the max unread message id, or None when nothing is unread), as
+# stated by the LAST good /api/notify/pending response. Rebuilt on every good response, so a persona the
+# server made no statement about this tick is simply absent. Servers before M379 (Kijito 14ec0b27) never send
+# the field; the table then stays empty and the fast path keys on the count alone, as before.
+_NEWEST_UNREAD = {}
+_NO_STATEMENT = object()
+
+
+def _newest_unread(persona):
+    return _NEWEST_UNREAD.get(persona, _NO_STATEMENT)
 
 
 def _parse_unread_rows(data):
@@ -469,15 +479,24 @@ def _parse_unread_rows(data):
     if not isinstance(rows, list):
         return None
     counts = {}
+    newest = {}
     for row in rows:
         if isinstance(row, dict) and isinstance(row.get("persona"), str):
             u = row.get("unread")
             counts[row["persona"]] = u if isinstance(u, int) else 0
+            # Present and null = "nothing unread"; present and a non-negative int = the newest unread id.
+            # Absent, or any other value, is NO STATEMENT (never a fabricated None).
+            if "newest_unread_id" in row:
+                nid = row["newest_unread_id"]
+                if nid is None or (isinstance(nid, int) and not isinstance(nid, bool) and nid >= 0):
+                    newest[row["persona"]] = nid
             ug = row.get("unread_urgent")
             # Absent (an older server) means NO STATEMENT, not zero - the same tri-state discipline as
             # §5.2. Recording a 0 we were never told would assert "nothing is escalated" on no evidence.
             if isinstance(ug, int) and not isinstance(ug, bool) and ug >= 0:
                 _URGENT_UNREAD[row["persona"]] = ug
+    _NEWEST_UNREAD.clear()
+    _NEWEST_UNREAD.update(newest)
     return counts
 
 
@@ -2144,6 +2163,8 @@ def new_personas(existing, discovered):
 
 
 class WatchTarget:
+    last_newest = _NO_STATEMENT   # class default, so a target built without __init__ reads "no statement"
+
     def __init__(self, persona, url, opener, headers, args, emitter):
         self.persona = persona
         self.url = url
@@ -2160,6 +2181,7 @@ class WatchTarget:
         self.armed = False
         self.fast_path = False
         self.last_unread = None
+        self.last_newest = _NO_STATEMENT   # the server's newest_unread_id at the last trigger check (M379)
         # What THIS poll learned about the persona's unread count, for the state file (row M309). Kept apart
         # from `last_unread`, which is the fast-path's wake TRIGGER and only exists while the fast path is on:
         # reusing it would publish nothing under --no-fast-path, and a status line would read that as zero.
@@ -2597,10 +2619,17 @@ class WatchTarget:
                 # messages and one new message lands within the same tick, the count goes N -> 1: a
                 # DECREASE that hides an arrival, so keying on `>` left that mail unannounced until the
                 # --resync-every floor (~8 min at the defaults). A pure read-down now costs one extra inbox
-                # fetch. Still blind, and still bounded by the floor: reads and arrivals that cancel
-                # exactly in one tick (N -> N) - only a server-stated newest id could close that.
-                changed = unread != self.last_unread if self.last_unread is not None else True
+                # fetch.
+                # AND THE NEWEST UNREAD ID, WHERE THE SERVER STATES IT (M379, Kijito 14ec0b27). Reads and
+                # arrivals that cancel exactly in one tick (N -> N) leave the count unchanged, so a count alone
+                # could only catch them at the floor; the newest unread id moves whenever a message arrives.
+                # An older server never sends it: both sides then read "no statement" and this is the count
+                # check it always was.
+                newest = _newest_unread(self.unread_persona)
+                changed = ((unread, newest) != (self.last_unread, self.last_newest)
+                           if self.last_unread is not None else True)
                 self.last_unread = unread
+                self.last_newest = newest
                 if not changed and self.skips < args.resync_every:
                     skip_full = True
                     self.skips += 1
@@ -3047,6 +3076,7 @@ class WatchTarget:
         if self.armed and not self.fast_path and not args.no_fast_path and self.unread_persona and counts_available:
             self.fast_path = True
             self.last_unread = unread_counts.get(self.unread_persona, 0)
+            self.last_newest = _newest_unread(self.unread_persona)
 
         if args.heartbeat and (_monotonic() - self.last_heartbeat) >= args.heartbeat:
             self.lifecycle("heartbeat", cursor=self.cursor)

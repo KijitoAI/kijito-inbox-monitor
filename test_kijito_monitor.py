@@ -4936,6 +4936,74 @@ class MeasuredAlertFloorTest(unittest.TestCase):
         finally:
             km.fetch = orig
 
+    def _poll_with_rows(self, t, rows, fetched):
+        counts = km._parse_unread_rows({"result": rows})
+        t.poll_once(counts_available=True, unread_counts=counts)
+
+    def test_M379_reads_and_an_arrival_that_cancel_in_one_tick_still_fetch(self):
+        # N -> N: the agent reads one held message and one new message lands in the same tick. The count
+        # does not move, so only the server's newest_unread_id (M379) can see the arrival.
+        em = self.Recorder()
+        t = self._target(em)
+        t.args.no_fast_path = False
+        fetched = []
+        def fetch(opener, url, headers):
+            fetched.append(url)
+            return BoundedWindowEndToEndTest()._fetch([{"id": 101}], 0)(opener, url, headers)
+        orig, km.fetch = km.fetch, fetch
+        try:
+            km._parse_unread_rows({"result": [{"persona": "argus", "unread": 1, "newest_unread_id": 100}]})
+            t.fast_path, t.last_unread, t.last_newest = True, 1, km._newest_unread("argus")
+            self._poll_with_rows(t, [{"persona": "argus", "unread": 1, "newest_unread_id": 101}], fetched)
+            self.assertEqual(len(fetched), 1, "same count, new newest id: an arrival - it must fetch")
+            self.assertEqual(em.new_ids, [101])
+            self._poll_with_rows(t, [{"persona": "argus", "unread": 1, "newest_unread_id": 101}], fetched)
+            self.assertEqual(len(fetched), 1, "an unchanged (count, newest id) pair still takes the cheap path")
+        finally:
+            km.fetch = orig
+            km._NEWEST_UNREAD.clear()
+
+    def test_M379_an_older_server_without_the_field_keeps_the_count_check(self):
+        em = self.Recorder()
+        t = self._target(em)
+        t.args.no_fast_path = False
+        fetched = []
+        def fetch(opener, url, headers):
+            fetched.append(url)
+            return BoundedWindowEndToEndTest()._fetch([{"id": 101}], 0)(opener, url, headers)
+        orig, km.fetch = km.fetch, fetch
+        try:
+            t.fast_path, t.last_unread = True, 1
+            self._poll_with_rows(t, [{"persona": "argus", "unread": 1}], fetched)
+            self.assertEqual(len(fetched), 0, "no newest id and an unchanged count: skip, as before M379")
+            self._poll_with_rows(t, [{"persona": "argus", "unread": 2}], fetched)
+            self.assertEqual(len(fetched), 1, "the count check still works on its own")
+        finally:
+            km.fetch = orig
+            km._NEWEST_UNREAD.clear()
+
+    def test_M379_newest_unread_id_is_tri_state_and_rebuilt_every_response(self):
+        try:
+            km._parse_unread_rows({"result": [
+                {"persona": "a", "unread": 2, "newest_unread_id": 7},
+                {"persona": "b", "unread": 0, "newest_unread_id": None},
+                {"persona": "c", "unread": 1},
+                {"persona": "d", "unread": 1, "newest_unread_id": True},
+                {"persona": "e", "unread": 1, "newest_unread_id": -3},
+                {"persona": "f", "unread": 1, "newest_unread_id": "9"},
+            ]})
+            self.assertEqual(km._newest_unread("a"), 7)
+            self.assertIsNone(km._newest_unread("b"), "present and null is a statement: nothing unread")
+            for p in "cdef":
+                self.assertIs(km._newest_unread(p), km._NO_STATEMENT, "absent or malformed is NO statement: " + p)
+            km._parse_unread_rows({"result": [{"persona": "b", "unread": 1, "newest_unread_id": 8}]})
+            self.assertIs(km._newest_unread("a"), km._NO_STATEMENT, "a stale id must not survive a newer response")
+            self.assertEqual(km._newest_unread("b"), 8)
+            km._parse_unread_rows({"oops": 1})
+            self.assertEqual(km._newest_unread("b"), 8, "a response with a bad shape changes nothing")
+        finally:
+            km._NEWEST_UNREAD.clear()
+
     def test_bug19_a_20s_restart_recovering_on_the_count_fast_path_is_silent_too(self):
         # The same restart, but the first healthy tick is the /api/notify/pending fast path (no unread
         # increase, so the full inbox poll is skipped) - the path a long-polling producer usually
