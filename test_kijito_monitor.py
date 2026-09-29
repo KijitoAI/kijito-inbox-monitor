@@ -6680,6 +6680,64 @@ class WindowsNativeTest(unittest.TestCase):
         self.assertTrue(sink.sync())
 
 
+class WindowsSingleWriterLockTest(unittest.TestCase):
+    """On Windows StateFile.lock() used to be a bare return ("run a single instance"), so two producers on
+    one state file both ran and each emitted every message (praetor, 2026-09-27). It now takes an msvcrt
+    byte-range lock on the same .lock sidecar. msvcrt does not exist here, so a fake stands in: it holds
+    at most one lock per sidecar INODE and releases it when the holding fd is closed."""
+
+    class FakeMsvcrt:
+        LK_NBLCK = 2
+
+        def __init__(self):
+            self.held = {}  # inode -> fd
+
+        def locking(self, fd, mode, nbytes):
+            assert mode == self.LK_NBLCK and nbytes == 1, (mode, nbytes)
+            ino = os.fstat(fd).st_ino
+            holder = self.held.get(ino)
+            if holder is not None and holder != fd:
+                try:
+                    os.fstat(holder)          # still open -> still held
+                    raise OSError(36, "Resource deadlock avoided")
+                except OSError as e:
+                    if e.errno == 36:
+                        raise
+            self.held[ino] = fd
+
+    def setUp(self):
+        self._d = tempfile.TemporaryDirectory()
+        self.addCleanup(self._d.cleanup)
+        self._posix, km.IS_POSIX = km.IS_POSIX, False
+        self.addCleanup(setattr, km, "IS_POSIX", self._posix)
+        self._msvcrt, km.msvcrt = km.msvcrt, self.FakeMsvcrt()
+        self.addCleanup(setattr, km, "msvcrt", self._msvcrt)
+
+    def test_a_second_watcher_on_the_same_state_file_is_refused(self):
+        path = os.path.join(self._d.name, "hive.argus.json")
+        a = km.StateFile(path, "idx")
+        a.lock()
+        self.addCleanup(a.unlock)
+        self.assertTrue(os.path.exists(path + ".lock"), "the lock lives on the .lock sidecar")
+        b = km.StateFile(path, "idx")
+        with self.assertRaises(km.FatalConfig):
+            b.lock()
+        self.assertIsNone(b._lockf, "a refused lock must not leak its sidecar fd")
+
+    def test_the_lock_is_released_when_the_holder_lets_go(self):
+        path = os.path.join(self._d.name, "hive.argus.json")
+        a = km.StateFile(path, "idx")
+        a.lock()
+        a.unlock()
+        b = km.StateFile(path, "idx")
+        b.lock()                              # must not raise
+        self.addCleanup(b.unlock)
+
+    def test_without_msvcrt_it_degrades_to_no_lock_rather_than_crashing(self):
+        km.msvcrt = None
+        km.StateFile(os.path.join(self._d.name, "hive.x.json"), "idx").lock()
+
+
 class Utf8StdoutTest(unittest.TestCase):
     """A cp1252 stdout (a Windows console, a Git Bash pipe) must neither crash `--help` nor an event whose
     message body is outside cp1252. Real subprocesses, because the defect is the interpreter's own encoding."""

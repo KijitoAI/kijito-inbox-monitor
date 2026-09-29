@@ -113,8 +113,8 @@ M=[
   "    if cur != PRIVATE_FILE_MODE:",
   "    if False:"),
  ("L8-HIGH1: the lock sidecar goes back to the umask",
-  "        self._lockf = _open_private(self.path + \".lock\", \"a+\")",
-  "        self._lockf = open(self.path + \".lock\", \"a+\")"),
+  "        self._lockf = _open_private(self.path + \".lock\", \"a+\")\n        try:\n            fcntl.flock(",
+  "        self._lockf = open(self.path + \".lock\", \"a+\")\n        try:\n            fcntl.flock("),
  ("L8-HIGH2: a newly created event file does not sync its directory entry",
   "        if not existed:",
   "        if False:"),
@@ -296,8 +296,8 @@ M=[
   "        return self.emitter.lifecycle(event, **fields)",
   "        self.emitter.lifecycle(event, **fields)"),
  ("L11-F1: the FAST-PATH recovered edge stops reporting an undelivered event",
-  '                self._alarm("recovered", "source recovered", cursor=self.cursor)',
-  '                self.lifecycle("recovered", cursor=self.cursor)'),
+  '                self.fsm_state = "UP"\n                self._alarm("recovered", "source recovered", cursor=self.cursor)',
+  '                self.fsm_state = "UP"\n                self.lifecycle("recovered", cursor=self.cursor)'),
  ("L11-F1: the MAIN-PATH recovered edge stops reporting an undelivered event",
   '                    self._alarm("recovered", "source recovered", cursor=self.cursor)',
   '                    self.lifecycle("recovered", cursor=self.cursor)'),
@@ -351,15 +351,19 @@ M=[
  ("M375e: the retry hint is not clamped (a hostile Retry-After parks the producer)",
   "    return max(0, min(secs, RETRY_AFTER_CAP))",
   "    return max(0, secs)"),
- # praetor, real Windows 11 (2026-09-27): save() skipped the write off POSIX, so every restart baselined
- # and mail sent while the producer was down was never announced.
  # crucible (2026-09-27): a read-down that hides an arrival (N -> 1) was skipped until the resync floor.
  ("F1: the fast path fetches only on an INCREASE again",
   "                changed = unread != self.last_unread if self.last_unread is not None else True",
   "                changed = unread > self.last_unread if self.last_unread is not None else True"),
+ # praetor, real Windows 11 (2026-09-27): save() skipped the write off POSIX, so every restart baselined
+ # and mail sent while the producer was down was never announced.
  ("W1: the state file is silently not written on Windows again",
   "        d = {\"identity\": self.identity, \"cursor\": cursor, \"state\": state, \"consecutive_failures\": failures}",
   "        if not IS_POSIX:\n            return True\n        d = {\"identity\": self.identity, \"cursor\": cursor, \"state\": state, \"consecutive_failures\": failures}"),
+ # praetor (2026-09-27): on Windows lock() was a bare return, so two producers on one state file both ran.
+ ("W2: Windows takes no single-writer lock again",
+  "            if msvcrt is None:\n                return\n            _makedirs_private(",
+  "            if True:\n                return\n            _makedirs_private("),
  ("M375f: a stale retry hint survives into the next, unrelated failure",
   "    req = urllib.request.Request(url, headers=headers, method=\"GET\")\n    _RETRY_HINT[\"seconds\"] = None\n",
   "    req = urllib.request.Request(url, headers=headers, method=\"GET\")\n"),
@@ -401,6 +405,12 @@ surv=[]
 for label,pat,rep in M:
     if pat not in base:
         print("!! PATTERN NOT FOUND (vacuous):",label); surv.append(label); continue
+    if base.count(pat)>1:
+        # AN AMBIGUOUS PATTERN MUTATES WHICHEVER COPY COMES FIRST, NOT THE ONE ITS LABEL NAMES. The Windows
+        # lock (W2) added a second, identical sidecar open, so "the lock sidecar goes back to the umask"
+        # silently moved onto the Windows branch, which no POSIX test executes, and read as a survivor.
+        # The reverse is worse: a copy that some other test happens to catch reads as a kill. Anchor it.
+        print("!! PATTERN AMBIGUOUS (%d matches):" % base.count(pat),label); surv.append(label); continue
     mut=base.replace(pat,rep,1)
     try: compile(mut,"m","exec")
     except SyntaxError as e:

@@ -1,6 +1,9 @@
 # Kijito Inbox Monitor: Design & Implementation Spec
 
-**Updated:** 2026-09-26 (rev 10: §7.1 the dead-man edge needs a MEASURED span, not only a failure count -
+**Updated:** 2026-09-27 (rev 11: §7.3 the single-writer lock also holds on Windows - `msvcrt.locking` on byte 0
+of the same `.lock` sidecar, non-blocking; a second watcher on one state file exits "state-file in use", as on POSIX.
+Verified on a real Windows 11 seat.)
+Rev 10 (2026-09-26: §7.1 the dead-man edge needs a MEASURED span, not only a failure count -
 `--alert-floor-seconds`, default `(alert_after - 1) * poll_seconds`; `seconds` on the `alert` is now that
 measurement and `floor_seconds` names the floor; a failed poll's `Retry-After` paces the next retry. Before
 this, the count-only edge fired ~3-7 s into any short server restart, and `seconds` read a nominal 90.)
@@ -31,8 +34,8 @@ A standalone, single zero-dependency Python-stdlib script (urllib, json, signal,
 no pip installs) that polls the Kijito inbox and emits one event per new message into whatever harness is
 running, as NDJSON on stdout and/or exec-a-command-per-event. It is the client-side liveness watcher: it
 keeps a running agent's inbox live by waking it between tool calls. It is not a server, and not a
-notification service. POSIX target (Linux/macOS); Windows runs interval-only (no SIGUSR1 seam, no flock,
-per §10/§7.3). On Windows the private-file guard checks only "regular file" (there is no POSIX owner or
+notification service. POSIX target (Linux/macOS); Windows runs interval-only (no SIGUSR1 seam, per §10) and takes the
+single-writer lock through `msvcrt` instead of `flock` (§7.3). On Windows the private-file guard checks only "regular file" (there is no POSIX owner or
 mode; access is the profile's inherited ACL), a directory fsync is skipped (Windows cannot open a directory
 to fsync it; NTFS journals the metadata), and stdout is written as UTF-8 whatever the console code page.
 
@@ -645,7 +648,11 @@ read-state-neutral (DONE-WHEN #5 holds after self-test).
 - **Single-writer lock:** on startup, acquire an exclusive `fcntl.flock` on the state-file (LOCK_EX|LOCK_NB); if it's
   held, exit non-zero ("state-file in use"), which prevents two watchers tearing the cursor backwards. Hold the lock fd
   open for the whole process lifetime. flock is advisory and auto-released by the OS on process exit
-  (normal/SIGTERM/SIGKILL/crash), so there is no stale lockfile to clean (unlike a pidfile).
+  (normal/SIGTERM/SIGKILL/crash), so there is no stale lockfile to clean (unlike a pidfile). The lock is taken on a
+  dedicated `<state-file>.lock` sidecar, never the state-file itself (every save replaces the state-file's inode).
+  On Windows (no `fcntl`) the same guarantee comes from `msvcrt.locking(fd, LK_NBLCK, 1)` on byte 0 of that sidecar:
+  a held lock is the same "state-file in use" exit, and the OS releases it when the handle closes or the process
+  dies (rev 11; before it, Windows skipped the lock and two producers on one state file both announced every message).
 - **Write:** after each poll, write atomically: `mkstemp` in the same dir, then write, `fsync`, `os.replace`;
   best-effort remove of stale temps.
 - **Resume validity:** valid iff it parses as the schema (integer-or-null `cursor`, `state ∈ {UP,DOWN}`, integer

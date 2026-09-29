@@ -3,6 +3,17 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [0.5.11] - 2026-09-27
+
+### Fixed
+- **On Windows a second watcher on the same state file now refuses to start.** The single-writer lock was
+  POSIX-only (`flock`), so on Windows two producers pointed at one state file both ran and each announced
+  every message, and their saves could move the cursor backwards. The lock is now taken through
+  `msvcrt.locking` on byte 0 of the same `.lock` sidecar: the second instance exits with
+  `state-file in use (another watcher holds the lock)`, exactly as on Linux and macOS, and the OS releases
+  the lock when the first process exits or is killed. Verified on a real Windows 11 seat (two instances,
+  one state file: the second refused; after the first was killed, a restart resumed from its saved cursor).
+
 ## [0.5.10] - 2026-09-27
 
 ### Fixed
