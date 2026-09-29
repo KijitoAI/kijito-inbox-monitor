@@ -353,8 +353,8 @@ M=[
   "    return max(0, secs)"),
  # crucible (2026-09-27): a read-down that hides an arrival (N -> 1) was skipped until the resync floor.
  ("F1: the fast path fetches only on an INCREASE again",
-  "                changed = unread != self.last_unread if self.last_unread is not None else True",
-  "                changed = unread > self.last_unread if self.last_unread is not None else True"),
+  "                changed = ((unread, newest) != (self.last_unread, self.last_newest)",
+  "                changed = ((unread > self.last_unread or newest != self.last_newest)"),
  # praetor, real Windows 11 (2026-09-27): save() skipped the write off POSIX, so every restart baselined
  # and mail sent while the producer was down was never announced.
  ("W1: the state file is silently not written on Windows again",
@@ -364,6 +364,16 @@ M=[
  ("W2: Windows takes no single-writer lock again",
   "            if msvcrt is None:\n                return\n            _makedirs_private(",
   "            if True:\n                return\n            _makedirs_private("),
+ # river M379 (Kijito 14ec0b27): the server states each persona's newest unread id; N -> N reads+arrivals.
+ ("N1: the fast path ignores the server's newest unread id again (N -> N stays blind)",
+  "                changed = ((unread, newest) != (self.last_unread, self.last_newest)",
+  "                changed = ((unread, newest) != (self.last_unread, newest)"),
+ ("N2: a stale newest unread id survives a newer response",
+  "    _NEWEST_UNREAD.clear()\n    _NEWEST_UNREAD.update(newest)",
+  "    _NEWEST_UNREAD.update(newest)"),
+ ("N3: a boolean is taken for a newest unread id",
+  "                if nid is None or (isinstance(nid, int) and not isinstance(nid, bool) and nid >= 0):",
+  "                if nid is None or (isinstance(nid, int) and nid >= 0):"),
  ("M375f: a stale retry hint survives into the next, unrelated failure",
   "    req = urllib.request.Request(url, headers=headers, method=\"GET\")\n    _RETRY_HINT[\"seconds\"] = None\n",
   "    req = urllib.request.Request(url, headers=headers, method=\"GET\")\n"),

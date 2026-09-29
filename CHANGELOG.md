@@ -3,6 +3,16 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [0.5.12] - 2026-09-28
+
+### Fixed
+- **New mail is announced at once even when a read cancels it out in the same tick.** If the agent read one
+  held message while one new message arrived within a single poll, the unread count did not move (N -> N), so
+  the fast path skipped the inbox fetch and the new message waited for the `--resync-every` floor (~8 minutes at
+  the defaults). The server now states each persona's newest unread message id on `/api/notify/pending`
+  (`newest_unread_id`, Kijito 14ec0b27), and the fast path fetches when either the count or that id changes.
+  Against an older server that does not send the field, behaviour is unchanged.
+
 ## [0.5.11] - 2026-09-27
 
 ### Fixed

@@ -1,6 +1,9 @@
 # Kijito Inbox Monitor: Design & Implementation Spec
 
-**Updated:** 2026-09-27 (rev 11: §7.3 the single-writer lock also holds on Windows - `msvcrt.locking` on byte 0
+**Updated:** 2026-09-28 (rev 12: §9 the fast path also keys on the server's `newest_unread_id` (Kijito M379), so
+reads and arrivals that cancel within one tick (N -> N) are seen at once; a server without the field keeps the count
+check.)
+Rev 11 (2026-09-27: §7.3 the single-writer lock also holds on Windows - `msvcrt.locking` on byte 0
 of the same `.lock` sidecar, non-blocking; a second watcher on one state file exits "state-file in use", as on POSIX.
 Verified on a real Windows 11 seat.)
 Rev 10 (2026-09-26: §7.1 the dead-man edge needs a MEASURED span, not only a failure count -
@@ -727,13 +730,17 @@ read-state-neutral (DONE-WHEN #5 holds after self-test).
 - **Baseline:** the inbox-list poll (§5) is always the floor and the source of truth. The max-id cursor decides
   what to emit, so the fast-path can never cause a missed or duplicate emit.
 - **Fast-path (cheap O(1) pre-check):** `GET /api/notify/pending` (SLASH path; the hyphen `/api/notify-pending`
-  404s), read-only, never marks read. Response `{"result":[{"persona","unread","unread_urgent"},...]}`; `unread` is
+  404s), read-only, never marks read. Response `{"result":[{"persona","unread","unread_urgent","newest_unread_id"},...]}`; `unread` is
   all read=false for that persona (a persona with 0 unread is absent, treat as 0). The watcher probes it once on
   arm; if available it consumes `unread` for its persona and does the full inbox-list fetch only when `unread`
   CHANGES (either direction), saving the full-list diff on quiet polls. An increase alone is not enough: reading
   N held messages while one new one arrives in the same tick moves the count N -> 1, a decrease that hides an
   arrival (seen live 2026-09-27; it waited for the floor). A read-down therefore costs one extra fetch. Reads and
-  arrivals that cancel exactly within one tick (N -> N) stay invisible to the count and are caught by the floor. It auto-falls-back to baseline if the endpoint is absent or
+  arrivals that cancel exactly within one tick (N -> N) leave the count unchanged, so the trigger is the PAIR
+  (`unread`, `newest_unread_id`): the server's max unread message id moves whenever a message arrives (rev 12; Kijito
+  M379, 14ec0b27). Present and null means nothing is unread; absent or malformed is NO STATEMENT, and the table is
+  rebuilt from every good response so a stale id never survives. A server before M379 never sends the field, and the
+  trigger is then the count alone, with N -> N caught by the floor. It auto-falls-back to baseline if the endpoint is absent or
   non-2xx (a server without the field simply runs baseline).
 - **Safety floor (`--resync-every`, default 10):** the watcher never skips more than N consecutive polls; it
   forces a full inbox poll regardless. So a stale / wrong / unsupported count can at worst add latency, never blind
