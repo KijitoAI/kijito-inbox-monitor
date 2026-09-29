@@ -4914,6 +4914,28 @@ class MeasuredAlertFloorTest(unittest.TestCase):
         self.assertEqual((t.fsm_state, t.failures, t.down_since), ("UP", 0, None))
         self.assertEqual(em.new_ids, [101])
 
+    def test_a_read_down_that_hides_an_arrival_still_fetches_the_inbox(self):
+        # crucible, 2026-09-27: 2 held, the agent reads both and 1 new message lands in the same tick.
+        # The count goes 2 -> 1 - a DECREASE - and the fast path used to skip the fetch until the
+        # --resync-every floor. Any change must fetch; an unchanged count may still skip.
+        em = self.Recorder()
+        t = self._target(em)
+        t.args.no_fast_path = False
+        t.fast_path, t.last_unread = True, 2
+        fetched = []
+        def fetch(opener, url, headers):
+            fetched.append(url)
+            return BoundedWindowEndToEndTest()._fetch([{"id": 101}], 0)(opener, url, headers)
+        orig, km.fetch = km.fetch, fetch
+        try:
+            t.poll_once(counts_available=True, unread_counts={"argus": 1})
+            self.assertEqual(len(fetched), 1, "a decrease can hide an arrival; it must fetch")
+            self.assertEqual(em.new_ids, [101])
+            t.poll_once(counts_available=True, unread_counts={"argus": 1})
+            self.assertEqual(len(fetched), 1, "an unchanged count still takes the cheap path")
+        finally:
+            km.fetch = orig
+
     def test_bug19_a_20s_restart_recovering_on_the_count_fast_path_is_silent_too(self):
         # The same restart, but the first healthy tick is the /api/notify/pending fast path (no unread
         # increase, so the full inbox poll is skipped) - the path a long-polling producer usually
@@ -6637,6 +6659,17 @@ class WindowsNativeTest(unittest.TestCase):
         buf = _capture_stderr(self)
         km._makedirs_private(os.path.join(d, "sub"))
         self.assertNotIn("writable by other local users", buf.getvalue())
+
+    def test_the_state_file_is_written_and_read_back_off_posix(self):
+        # praetor, real Windows 11 (2026-09-27): save() returned True WITHOUT writing, so every restart
+        # baselined and mail sent while the producer was down never woke anyone. The cursor must survive.
+        path = os.path.join(self._d.name, "hive.argus.json")
+        sf = km.StateFile(path, "idx")
+        self.assertTrue(sf.save(10691, "UP", 0))
+        self.assertTrue(os.path.exists(path), "save() claimed success without writing the state file")
+        st = km.StateFile(path, "idx").load()
+        self.assertIsNot(st, km.CORRUPT_STATE)
+        self.assertEqual((st["cursor"], st["state"], st["failures"]), (10691, "UP", 0))
 
     def test_the_events_file_sink_writes_and_syncs(self):
         # End to end: before the fix a new events file made sync() return False on every poll (the
