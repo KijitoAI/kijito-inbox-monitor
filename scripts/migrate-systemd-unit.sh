@@ -7,7 +7,7 @@
 #            --unit-dir DIR (default ~/.config/systemd/user)
 #
 # WHAT CHANGES. Older units spelled the persona into paths with systemd's `%i` - the ESCAPED instance name -
-# so the unit, not the producer, decided file names, and a persona like 'Loom' or 'name (purpose)' got a
+# so the unit, not the producer, decided file names, and a persona like 'Maple' or 'name (purpose)' got a
 # different file than the producer (and the launchd plist) would give it. The rewritten unit passes
 # `--persona %I` and turns every `--state-file/--events-file/--token-file ...%i...` into the matching
 # `-template ...{persona}...` flag, so the producer names every file with the rule `--safe-persona` prints.

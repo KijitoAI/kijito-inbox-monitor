@@ -1,3 +1,4 @@
+import contextlib
 import datetime
 import email.message
 import email.utils
@@ -6869,3 +6870,65 @@ class NoOperatorNameShipped(unittest.TestCase):
             with open(os.path.join(t, "pyproject.toml"), "w", encoding="utf-8") as fh:
                 fh.write(next(iter(self.ALLOWED))[1] + "\n")
             self.assertEqual(len(self._hits(t)), 1)
+
+
+class NoFleetNameInUserFacingFiles(unittest.TestCase):
+    """The files a user or their agent runs and reads name no maintainer persona, host or message id
+    (kijito-tools M467, 2026-10-05).
+
+    A stranger's agent reads the program, its --help and the README. Review provenance such as a
+    reviewer persona's name or a hive message id points at an account the reader cannot see, and a
+    persona name in an example looks like a name the reader should use. Examples use neutral names
+    (alice, bob, carol, Maple) and provenance is kept as "re-audit N". The maintainer history (the
+    CHANGELOG, docs/DESIGN.md, this test file, the release scripts) is not covered. "Codex" is a product
+    name and stays allowed. The name pattern is assembled from parts so this test does not match its
+    own source."""
+
+    FILES = ("kijito_inbox_monitor.py", "README.md", "arm-hive-monitor.sh",
+             "scripts/migrate-systemd-unit.sh", "kijito-inbox-monitor@.service.template",
+             "com.kijito.inbox-monitor.plist.template", "package.json", "pyproject.toml")
+    NAMES = re.compile(r"\b(" + "riv" + "er|lady" + "bug|cad" + "ence|ass" + "ay|arg" + "us|vel" + "lum|cruc"
+                       + "ible|prae" + "tor|ster" + "ling|her" + "ald|ma" + "son|lo" + "om|maes" + "tro|omni"
+                       + "view|lead" + "gen|bea" + "con|qu" + "ill|kor" + "angar|tamal" + r"itron)\b", re.I)
+    IDS = re.compile(r"\[\[?[0-9]{4,6}\]\]?|\b(hive|msg|message|memory|mail|ruling|note)[ #]+[0-9]{3,6}(?![-0-9])"
+                     r"|(?<!\w)\([0-9]{5}\)", re.I)
+
+    def _hits(self, root, files):
+        hits = []
+        for rel in files:
+            path = os.path.join(root, rel)
+            if not os.path.exists(path):
+                continue
+            with open(path, encoding="utf-8") as fh:
+                for n, line in enumerate(fh.read().splitlines(), 1):
+                    if self.NAMES.search(line) or self.IDS.search(line):
+                        hits.append("%s:%d: %s" % (rel, n, line.strip()[:120]))
+        return hits
+
+    def test_user_facing_files_name_no_maintainer_persona(self):
+        root = os.path.dirname(os.path.abspath(__file__))
+        self.assertTrue(os.path.exists(os.path.join(root, self.FILES[0])))
+        self.assertEqual(self._hits(root, self.FILES), [])
+
+    def test_help_example_uses_neutral_names(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            km.build_parser().parse_args(["--help"])
+        self.assertIn("alice,bob,carol", out.getvalue())
+        self.assertFalse(self.NAMES.search(out.getvalue()))
+
+    def test_controls(self):
+        planted = ["#   (Lo" + "om re-audit 7, HIGH 1)", 'help="e.g. codex,ri' + 'ver,lady' + 'bug."',
+                   "# measured on TAMAL" + "ITRON", "# (ri" + "ver 10985, M312 cold rerun)",
+                   "# an orphan count, [3" + "5702]", "# per hive 78" + "19", "# cold rerun (109" + "85) caught it"]
+        allowed = ["# Codex users run this too", "# walk along the riverbank", "readline(65536)",
+                   "last observed message 2026-07-24T23:24:43Z", "error code -32600", "# re-audit 7, HIGH 1"]
+        with tempfile.TemporaryDirectory() as t:
+            for line in planted:
+                with open(os.path.join(t, "x.py"), "w", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+                self.assertEqual(len(self._hits(t, ["x.py"])), 1, line)
+            for line in allowed:
+                with open(os.path.join(t, "x.py"), "w", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+                self.assertEqual(self._hits(t, ["x.py"]), [], line)
