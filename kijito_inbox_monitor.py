@@ -39,7 +39,7 @@ try:
 except ImportError:
     msvcrt = None
 
-__version__ = "0.5.13"
+__version__ = "0.5.14"
 SOURCE = "kijito-inbox"
 # A named User-Agent is REQUIRED: api.kijito.ai is fronted by a WAF that 403s the default Python-urllib UA.
 USER_AGENT = "kijito-inbox-monitor/%s" % __version__
@@ -144,7 +144,7 @@ def build_opener(pinned_ip):
 def _is_int(v):
     """A REAL integer. `bool` is a subclass of int in Python, so True would otherwise satisfy every
     isinstance(x, int) check in this file and then behave as 1 - a malformed row id, a malformed
-    size_dropped and a malformed persisted cursor all slipped through that way (Loom re-audit 6)."""
+    size_dropped and a malformed persisted cursor all slipped through that way (re-audit 6)."""
     return isinstance(v, int) and not isinstance(v, bool)
 
 
@@ -243,8 +243,8 @@ def fetch_from_payload(data, status=200):
     # (Kijito web_api.py, commented "present exactly when mail was withheld"). So a window withheld rows IF
     # AND ONLY IF it hands back a continuation, and either half contradicting the other is a contract
     # violation, not a quirk to interpret:
-    #   withheld AND terminal      -> "I hid rows" + "there is nothing older"  (Loom re-audit 6, HIGH 3)
-    #   withheld NOTHING AND more  -> "I hid nothing" + "there is more"        (Loom re-audit 7, HIGH 4)
+    #   withheld AND terminal      -> "I hid rows" + "there is nothing older"  (re-audit 6, HIGH 3)
+    #   withheld NOTHING AND more  -> "I hid nothing" + "there is more"        (re-audit 7, HIGH 4)
     # The second is not merely the theoretical twin of the first; it follows from how the window is BUILT.
     # A page returns every older row that FIT, so if it withheld nothing there is nothing older left for a
     # continuation to point at. Believing the "I hid nothing" half advances the cursor over whatever the
@@ -317,7 +317,7 @@ _PERSONA_MEMORY_COUNTS = {}
 # Read count per persona (mail_total - unread), refreshed on every directory fetch. This is the REAL
 # "is anyone consuming this inbox" signal, replacing the memory-count proxy for in-directory inboxes:
 # ownership (ever authored one memory) is MONOTONIC and permanently immunises an inbox, so a typo-variant
-# that ever received one memory (e.g. 'rvier', a variant of 'river') became invisible even while it held
+# that ever received one memory (e.g. 'aclie', a variant of 'alice') became invisible even while it held
 # unread mail nobody reads. read==0 says the inbox has never been consumed - exact, no threshold.
 # None means the server did not report both fields, so the check degrades to the memory-count signal
 # rather than reading an unknown as zero.
@@ -353,9 +353,9 @@ def _row_memory_count(row):
 
     Prefers the top-level `memory_count`. Deliberately does NOT fall back to summing `projects[].count`:
     project counts exclude GLOBAL-scoped memories, so a persona whose memories are all global sums to
-    zero and looks unowned. Measured live: maestro sums to 0 across projects but owns 61 memories; the
-    same gap exists for codex, ladybug, leadgen, omniview, quill, sterling and vellum. Summing the wrong
-    field would have made the alarm cry wolf about half the fleet.
+    zero and looks unowned. Measured live: one persona summed to 0 across projects but owned 61 memories; the
+    same gap existed for seven more personas on that account. Summing the wrong
+    field would have made the alarm cry wolf about half the account.
     """
     n = row.get("memory_count")
     return n if isinstance(n, int) and n >= 0 else None
@@ -680,20 +680,20 @@ class RotatingFileSink:
         _makedirs_private(dirn)
         existed = os.path.lexists(self.path)   # lexists: a dangling SYMLINK counts as present, and must
         self._fh = _open_private(self.path, "a", encoding="utf-8")
-        # EVERY persisted artifact, not just the one we opened (Loom re-audit 9, H2): rotated archives
+        # EVERY persisted artifact, not just the one we opened (re-audit 9, H2): rotated archives
         # written by an older version keep their 0644 forever otherwise, because they are never reopened.
-        # THE RANGE COMES FROM THE DIRECTORY, NOT FROM `keep` (Loom re-audit 10, M4). A bound derived from
+        # THE RANGE COMES FROM THE DIRECTORY, NOT FROM `keep` (re-audit 10, M4). A bound derived from
         # CURRENT retention cannot reach an artifact left by a LARGER FORMER retention - shrinking keep
         # from 10 to 5 stranded .7 at 0644 permanently - and an increment-until-absent scan would stop at
         # the first hole a hand-deleted archive leaves. Listing is the only bound config cannot outlive.
-        # ★ THE VERDICT IS DELIBERATELY IGNORED HERE (loom's class, half A - "who consumes this?"). It is
+        # ★ THE VERDICT IS DELIBERATELY IGNORED HERE (the defect class, half A - "who consumes this?"). It is
         # consumed by _repair_mode itself, which warns per file. Escalating would be wrong in both
         # directions: these are ARCHIVES, not the live sink, so refusing to open the events file because a
         # months-old archive is unreadable converts a stale-permission leak into a total delivery outage.
         for archive in self._archive_paths():
             _repair_mode(archive)
         if not existed:
-            # A NEW FILE NEEDS ITS DIRECTORY ENTRY SYNCED, NOT JUST ITS BYTES (Loom re-audit 8, HIGH 2).
+            # A NEW FILE NEEDS ITS DIRECTORY ENTRY SYNCED, NOT JUST ITS BYTES (re-audit 8, HIGH 2).
             # fsync on the fd makes the CONTENT durable; the NAME lives in the directory. Deferred to
             # sync() so it lands before the cursor that acknowledges these events is persisted.
             self._dir_pending = True
@@ -702,8 +702,8 @@ class RotatingFileSink:
         """Every rotated archive of this sink that EXISTS RIGHT NOW, found by listing the directory.
 
         Deliberately not `range(1, keep + 2)`: that bound is CURRENT config, and the artifacts most likely
-        to be left at a permissive mode are exactly the ones a FORMER, larger retention wrote (Loom
-        re-audit 10, M4). Matches `<basename>.<digits>` only, so the `.lock` sidecar is never touched.
+        to be left at a permissive mode are exactly the ones a FORMER, larger retention wrote
+        (re-audit 10, M4). Matches `<basename>.<digits>` only, so the `.lock` sidecar is never touched.
         """
         d = os.path.dirname(os.path.abspath(self.path)) or "."
         base = os.path.basename(self.path)
@@ -715,7 +715,7 @@ class RotatingFileSink:
                       if n.startswith(base + ".") and n[len(base) + 1:].isdigit())
 
     def _reopen_or_break(self):
-        """Reopen after a rotation. A failure here must NOT escape the poll loop (Loom re-audit 9,
+        """Reopen after a rotation. A failure here must NOT escape the poll loop (re-audit 9,
         MEDIUM): an exception out of write() unwinds through poll_once and, under a KeepAlive supervisor,
         is a crash loop. It becomes a broken sink instead, which write() reports as a failed delivery, so
         the cursor holds and the mail is re-delivered when the sink recovers."""
@@ -756,7 +756,7 @@ class RotatingFileSink:
     def sync(self):
         """Force written events onto stable storage. Returns True IFF they are durable.
 
-        THE DURABILITY BARRIER (Loom re-audit 7, MEDIUM). flush() only moves bytes from Python's buffer
+        THE DURABILITY BARRIER (re-audit 7, MEDIUM). flush() only moves bytes from Python's buffer
         into the kernel's; a power loss between the flush and the writeback loses them. The state file
         IS fsynced, so without this the CURSOR can outlive the EVENT it acknowledges - the watcher comes
         back believing it delivered mail that no consumer ever saw, and never fetches it again. Ordering,
@@ -818,7 +818,7 @@ class RotatingFileSink:
             sys.stderr.write("kijito-inbox-monitor: WARNING log rotation failed (non-fatal): %s\n" % e)
         finally:
             # Every rename above rewrote directory ENTRIES; none of them is durable until the directory
-            # itself is synced (Loom re-audit 8, HIGH 2).
+            # itself is synced (re-audit 8, HIGH 2).
             self._dir_pending = True
             self._reopen_or_break()  # reopen by NAME - a tail -F consumer follows us onto the fresh file
 
@@ -865,7 +865,7 @@ def _wake_nonce(event_id):
     and neither family's meaning changes. "Recompute-asserted" also becomes literally true: any
     auditor recomputes this from the event_id in the same row.
 
-    ★ THE RULING'S STRONGEST GROUND (river): random DESTROYS information at the producer -- "this is
+    ★ THE RULING'S STRONGEST GROUND: random DESTROYS information at the producer -- "this is
     the same work re-delivered" becomes unrecoverable downstream because the identity that would
     have said so was never minted. Derived merely DEFERS a decision to the consumer, where a missing
     outcome column can supply it. Between two schemes that each have a false-page mode, take the one
@@ -1010,7 +1010,7 @@ def _emission_stamps():
 # `"event": ?"(new|alert|recovered)"`. So every diagnostic this module added to kill a silent failure
 # was ITSELF silent: state_corrupt, baseline_skipped, seed_ahead, replay_capped and persona_added
 # matched nobody's filter, and a running `grep` never re-reads its argv, so they stayed invisible even
-# after the docs were fixed. cadence's statement of it: "a diagnostic added to kill a silent failure is
+# after the docs were fixed. One statement of it: "a diagnostic added to kill a silent failure is
 # itself silent unless the consumer's filter learned its name."
 #
 # THE FIX IS A CLASS THE CONSUMER MATCHES STRUCTURALLY, so a new kind is covered the day it is added
@@ -1089,7 +1089,7 @@ class Emitter:
         self._max_bytes = max_bytes
         self._keep = keep
         self._sinks_by_persona = {}
-        # key -> monotonic deadline before which we will not retry. NOT a set (Loom re-audit 10, H2):
+        # key -> monotonic deadline before which we will not retry. NOT a set (re-audit 10, H2):
         # membership alone has no release condition, so removing a hostile symlink never recovered without
         # a restart. WHAT CLEARS THIS: the deadline expiring and the reopen SUCCEEDING (see _sink_for).
         self._broken_sinks = {}
@@ -1114,7 +1114,7 @@ class Emitter:
         key = persona or "_all"  # events with no persona (e.g. a bare --url target) land in one _all file
         s = self._sinks_by_persona.get(key)
         if s is None:
-            # A REFUSAL IS A COOLDOWN, NOT A VERDICT (Loom re-audit 10, H2). Caching the refusal with no
+            # A REFUSAL IS A COOLDOWN, NOT A VERDICT (re-audit 10, H2). Caching the refusal with no
             # release meant a persona whose path was briefly hostile stayed undeliverable for the life of
             # the process: the operator removed the symlink, the fault was gone, and mail kept being held
             # with nothing left to fix. A permanent fail-closed is the same bug as a fail-open, facing the
@@ -1206,7 +1206,7 @@ class Emitter:
     def emit(self, event):
         """Deliver one event. Returns True IFF delivery was ACKNOWLEDGED.
 
-        DELIVERY IS ACKNOWLEDGED, NOT ASSUMED (Loom re-audit 7, HIGH 1). The return value is what lets
+        DELIVERY IS ACKNOWLEDGED, NOT ASSUMED (re-audit 7, HIGH 1). The return value is what lets
         the watcher hold its cursor below a message it could not hand over. Before this, emit() swallowed
         every failure and the cursor advanced regardless, so a consumer whose --exec exited non-zero -
         the wake hook that is the entire point of exec mode - never saw that message again, and the
@@ -1252,7 +1252,7 @@ class Emitter:
             env["KIJITOMON_SOURCE"] = str(event.get("source", ""))
             env["KIJITOMON_TS"] = str(event.get("ts", ""))
             env["KIJITOMON_EVENT_ID"] = str(event.get("event_id", ""))
-            # TRANSMITTED, NEVER RE-DERIVED (river's ruling, 2026-08-05, on a gap a drill measured).
+            # TRANSMITTED, NEVER RE-DERIVED (design ruling, 2026-08-05, on a gap a drill measured).
             # The nonce was stamped in emit() and reached the ndjson wire, but never the exec env - so the
             # ONE channel our docs point consumers at first could not see the identity that says "this is
             # the same work re-delivered". It is derivable from KIJITOMON_EVENT_ID, and that is exactly the
@@ -1341,11 +1341,11 @@ class InsecureFile(OSError):
 
 
 def _assert_private_fd(fd, path):
-    """Fail CLOSED unless this fd is a REGULAR file, owned by US, at exactly 0600 (Loom re-audit 9, H1/H2).
+    """Fail CLOSED unless this fd is a REGULAR file, owned by US, at exactly 0600 (re-audit 9, H1/H2).
 
     My round-8 repair was best-effort - it warned on failure and wrote anyway - on the reasoning that "a
     file we do not own must not crash the watcher". That reasoning is exactly backwards for a file we are
-    about to append PRIVATE MAIL to: loom's repro left a pre-existing 0666 file at 0666 and delivered mail
+    about to append PRIVATE MAIL to: the auditor's repro left a pre-existing 0666 file at 0666 and delivered mail
     into it. Refusing to write is the only safe answer, and the caller turns that into a FAILED DELIVERY,
     so the cursor holds and nothing is lost.
     """
@@ -1353,7 +1353,7 @@ def _assert_private_fd(fd, path):
     if not stat.S_ISREG(st.st_mode):
         raise InsecureFile("%s is not a regular file" % path)
     if not IS_POSIX:
-        # WINDOWS HAS NO POSIX OWNER OR MODE BITS TO CHECK (praetor, Windows 11 native, 2026-09-26: os.geteuid
+        # WINDOWS HAS NO POSIX OWNER OR MODE BITS TO CHECK (measured on Windows 11 native, 2026-09-26: os.geteuid
         # does not exist there, so this line crashed the producer at startup). Access there is an ACL, and a
         # file created under the user's profile inherits a user-only ACL; st_mode reports a synthetic
         # 0666/0444 that says nothing about who can read it. The regular-file check above still holds.
@@ -1412,7 +1412,7 @@ def _repair_mode(path):
     """Tighten an EXISTING artifact to 0600 in place. Returns True if it is now safe.
 
     Repairing only the file we happen to open leaves every OTHER persisted artifact exactly as it was -
-    loom found pre-existing rotated archives still at 0644 after the round-8 fix (re-audit 9, H2). Opened
+    the auditor found pre-existing rotated archives still at 0644 after the round-8 fix (re-audit 9, H2). Opened
     O_NOFOLLOW and validated on the fd, for the same reason as _open_private.
     """
     try:
@@ -1437,7 +1437,7 @@ def _makedirs_private(path):
     """Create EVERY missing level 0700, and warn about an existing level anyone else can write.
 
     os.makedirs(mode=...) applies the mode to the LEAF only; intermediate directories get the umask
-    default, so a nested path left its parents 0755 (Loom re-audit 9, MEDIUM). An EXISTING directory is
+    default, so a nested path left its parents 0755 (re-audit 9, MEDIUM). An EXISTING directory is
     still not re-permissioned - silently changing a path the operator already owns is not ours to do - but
     a group/world-WRITABLE one is reported, because that is the condition under which someone else can
     swap a file for a symlink underneath us. (_open_private then refuses it, which is the real defence;
@@ -1457,7 +1457,7 @@ def _makedirs_private(path):
             os.mkdir(d, PRIVATE_DIR_MODE)
         except FileExistsError:
             pass
-    # Check the WHOLE ancestor chain, not only the levels we created - loom's point was that an EXISTING
+    # Check the WHOLE ancestor chain, not only the levels we created - the auditor's point was that an EXISTING
     # directory is never validated, and an existing one is exactly where a hostile path would already be.
     # A sticky directory (/tmp, mode 1777) is excluded: the sticky bit is precisely what makes a shared
     # writable directory safe, and warning about it would train the reader to ignore this line.
@@ -1510,17 +1510,17 @@ def _fsync_dir(path):
 def identity_migratable(stored, current):
     """True iff a persisted identity differs from the current one ONLY BY THE CASE OF A QUERY VALUE.
 
-    THE CASE-ONLY MIGRATION (Loom re-audit 7, HIGH 3). The state PATH casefolds the persona
+    THE CASE-ONLY MIGRATION (re-audit 7, HIGH 3). The state PATH casefolds the persona
     (_state_safe_persona - the local filesystem is case-insensitive, so it must), while the IDENTITY
     embeds the persona with its original case, straight from the directory. So one file, written when
-    the directory spelled the persona `Loom`, is reloaded by a run that discovered `loom` - the identity
+    the directory spelled the persona `Maple`, is reloaded by a run that discovered `maple` - the identity
     compares UNEQUAL, load() reports ABSENT, and absent BASELINES to the newest visible id, skipping
     everything since the lost cursor. A cursor destroyed by a spelling change is exactly the silent skip
     the state file exists to prevent.
 
     ★ THIS IS A THIRD LAYER, NOT A HARMONISATION OF THE OTHER TWO (see CaseAsymmetryInvariantTest, and
-    do not "simplify" it into them). The SERVER's inbox namespace stays case-SENSITIVE - `Loom` and
-    `loom` remain distinct inboxes and a variant holding mail is still alarmed on as stranded. What this
+    do not "simplify" it into them). The SERVER's inbox namespace stays case-SENSITIVE - `Maple` and
+    `maple` remain distinct inboxes and a variant holding mail is still alarmed on as stranded. What this
     says is narrower and follows from the path layer: because the path already collapses the variants,
     ONE state file can only ever describe ONE of them, so a casefold-equal identity in THAT file is the
     same watched source spelled differently - a migration to accept and rewrite, not a different source
@@ -1580,7 +1580,7 @@ class StateFile:
         # lock the new inode freely. The sidecar is never replaced, so the flock persists for the process
         # lifetime. flock is advisory + auto-released by the OS on exit (no stale lockfile to clean).
         if not _repair_mode(self.path):  # the state file itself, if an older version left it permissive
-            # CONSUME THE VERDICT (Loom re-audit 10, H1). This was a bare statement, so a state file we
+            # CONSUME THE VERDICT (re-audit 10, H1). This was a bare statement, so a state file we
             # could not prove private was then trusted anyway. It is the highest-value file here to
             # subvert: whoever controls the CURSOR controls which mail counts as already delivered, and a
             # cursor moved FORWARD is silent, permanent mail loss - the single failure this tool exists to
@@ -1604,7 +1604,7 @@ class StateFile:
         Raises FatalConfig on a present-but-unreadable path, and returns the CORRUPT sentinel on a file
         that EXISTS but cannot be trusted.
 
-        ABSENT AND CORRUPT ARE NOT THE SAME ANSWER (Loom re-audit 5, HIGH 2). Both used to return None, so
+        ABSENT AND CORRUPT ARE NOT THE SAME ANSWER (re-audit 5, HIGH 2). Both used to return None, so
         a garbled state file was indistinguishable from a first launch - and a first launch BASELINES to
         the newest visible id, silently skipping every message between the lost cursor and now. That is a
         permanent, invisible loss produced by the one event most likely to accompany a crash. A file that
@@ -1617,7 +1617,7 @@ class StateFile:
             sys.stderr.write("kijito-inbox-monitor: WARNING state-file %s could not be proven private; "
                              "refusing to trust its cursor and failing closed\n" % self.path)
             return CORRUPT_STATE
-        # LET THE O_NOFOLLOW OPEN BE THE EXISTENCE TEST (Loom re-audit 10, H1). The WRITE path was given
+        # LET THE O_NOFOLLOW OPEN BE THE EXISTENCE TEST (re-audit 10, H1). The WRITE path was given
         # O_NOFOLLOW in re-audit 9 and the READ path was left behind, so a symlink planted at the state
         # path was followed and its target read as our own state. os.path.exists() follows symlinks too,
         # so it was answering for the TARGET rather than the link - and being a second path lookup it
@@ -1646,7 +1646,7 @@ class StateFile:
             except OSError as e:
                 raise FatalConfig("state-file unreadable: %s" % e)
         if not raw.strip():
-            # PRESENT BUT EMPTY IS NOT ABSENT (Loom re-audit 6, HIGH 4). A zero-byte file is still
+            # PRESENT BUT EMPTY IS NOT ABSENT (re-audit 6, HIGH 4). A zero-byte file is still
             # evidence that a cursor existed here; treating it as a first launch baselines over
             # everything since. Same fail-open shape as an unparseable file, same answer.
             sys.stderr.write("kijito-inbox-monitor: WARNING state-file is present but EMPTY; refusing to "
@@ -1681,7 +1681,7 @@ class StateFile:
                                  "resuming its cursor; re-baselining to avoid a silently-blind watcher.\n"
                                  % (ident, self.identity))
                 return None
-        # EVERY PERSISTED FIELD IS READ STRICTLY, AND ANYTHING UNRECOGNISED FAILS CLOSED (Loom re-audit 7,
+        # EVERY PERSISTED FIELD IS READ STRICTLY, AND ANYTHING UNRECOGNISED FAILS CLOSED (re-audit 7,
         # HIGH 2). The pin's own flags were read with `d.get(k) is True`, so a JSON `1` - the shape a
         # hand-edit, a jq one-liner or another language's serialiser produces - normalised to False and
         # SILENTLY UNPINNED the watermark, letting the replay cap cross the very span the pin was
@@ -1768,7 +1768,7 @@ class StateFile:
         # file was written. Treat it the same way - hold the pin rather than assume it resolved.
         if alerted is not None and not emitted and intact and raw is None:
             intact = False
-        # THE PIN'S OWN STATE IS PERSISTED (Loom re-audit 6, HIGH 1). It used to be inferred from
+        # THE PIN'S OWN STATE IS PERSISTED (re-audit 6, HIGH 1). It used to be inferred from
         # `emitted_above`, which is empty in exactly the case that matters - a corrupt-state pin, where
         # nothing has been tracked yet. So a restart lost the pin, the replay cap was free again, and the
         # very span the pin was protecting got crossed on the first poll. A pin that does not survive a
@@ -1807,7 +1807,7 @@ class StateFile:
 
         The OS drops an flock when the process exits, so this is hygiene rather than correctness - but an
         fd held for a target that is torn down is a genuine leak in a long-lived process, and it is what
-        surfaced as the suite's two ResourceWarnings (Loom re-audit 7, item 7).
+        surfaced as the suite's two ResourceWarnings (re-audit 7, item 7).
         """
         if self._lockf is not None:
             try:
@@ -1818,7 +1818,7 @@ class StateFile:
     def save(self, cursor, state, failures, emitted_above=None, gap_alerted=None,
              pin_forced=False, pin_evidence_intact=True, state_corrupt=False, pin_release_at=None,
              unread_hidden=False, unread=None, down_since=None):
-        """Persist the cursor. Returns True IFF the write is DURABLE (Loom re-audit 8, HIGH 3).
+        """Persist the cursor. Returns True IFF the write is DURABLE (re-audit 8, HIGH 3).
 
         The directory fsync used to be called and its answer thrown away, so a failure returned success
         with no diagnostic: the cursor was written and its durability merely assumed. The failure
@@ -1830,7 +1830,7 @@ class StateFile:
         # Windows the cursor was never written while every caller was told it had been. Each supervisor
         # restart then found no state file, BASELINED to the newest id, and any mail that arrived while the
         # producer was down never raised a `new` - the permanent, silent skip load() exists to prevent
-        # (praetor, real Windows 11, 2026-09-27). Everything below is portable: mkstemp, fsync and os.replace
+        # (measured on real Windows 11, 2026-09-27). Everything below is portable: mkstemp, fsync and os.replace
         # work on Windows, and _fsync_dir answers True there.
         d = {"identity": self.identity, "cursor": cursor, "state": state, "consecutive_failures": failures}
         # Persisted so a RESTART cannot re-emit what we already delivered above a pinned watermark.
@@ -2033,7 +2033,7 @@ def _persona_path(template, persona):
     Every per-persona path a supervisor needs - events, state, token - goes through here, so the unit file
     (systemd `%i`, a plist, a shell script) never spells a filename itself. `%i` is systemd's ESCAPED
     instance name and passes a persona's raw case through, so a unit that interpolated it disagreed with
-    the producer for any name that is not already a safe component ('Loom', 'name (purpose)', 'Ωmega').
+    the producer for any name that is not already a safe component ('Maple', 'name (purpose)', 'Ωmega').
     """
     return template.replace("{persona}", _state_safe_persona(persona))
 
@@ -2106,7 +2106,7 @@ def _warn_persona_once(persona, text):
 def _clear_persona_warning(persona):
     """WHAT CLEARS THIS: the condition the warning described actually recovering.
 
-    Without a release, suppress-once is itself an instance of loom's class - a state set and never
+    Without a release, suppress-once is itself an instance of the defect class - a state set and never
     cleared - and it fails in the dangerous direction: a persona whose sink broke, recovered, then broke
     AGAIN would be silently suppressed forever, so the second outage arrives with no diagnostic at all.
     Called from the recovery path, never on a timer: the warning is suppressed exactly as long as the
@@ -2117,7 +2117,7 @@ def _clear_persona_warning(persona):
 
 def requested_personas(args, opener, headers):
     # ⚠️ CASE-INSENSITIVE DEDUPE, THE SAME RULE AS new_personas() (re-audit 11, F3). This used to be an
-    # EXACT `p not in personas`, so `--persona Loom --persona loom` survived as two entries - but
+    # EXACT `p not in personas`, so `--persona Maple --persona maple` survived as two entries - but
     # _state_safe_persona() CASEFOLDS the state path, so both resolve to ONE state file. The second
     # flock then raises FatalConfig("state-file in use") out of the UNCAUGHT list comprehension in
     # run(), and the producer refuses to start FOR EVERY PERSONA. That breaks the containment rule this
@@ -2265,7 +2265,7 @@ class WatchTarget:
         sys.stderr.write("self-test[%s]: source %s (%s)\n" % (
             label, "REACHABLE+healthy" if reach_ok else "UNHEALTHY", poll.reason or "ok"
         ))
-        # CONSUME THE EMITTER'S ANSWER (Loom re-audit 10, M3). This was `emit_ok = True` with the call as a
+        # CONSUME THE EMITTER'S ANSWER (re-audit 10, M3). This was `emit_ok = True` with the call as a
         # bare statement, flipping only on an EXCEPTION - but emit() reports a failed delivery by RETURNING
         # False, which is its documented, non-exceptional path (a refused sink, a failed write, a non-zero
         # --exec). So a self-test against a sink that had just refused the write printed emit=OK. The one
@@ -2283,7 +2283,7 @@ class WatchTarget:
         return reach_ok and emit_ok
 
     def lifecycle(self, event, **fields):
-        """Emit a lifecycle event. RETURNS whether it was delivered (Loom/river re-audit 11, F1).
+        """Emit a lifecycle event. RETURNS whether it was delivered (re-audit 11, F1).
 
         This used to drop `Emitter.lifecycle`'s bool on the floor, which made every caller structurally
         unable to know whether the thing it had just recorded as announced was in fact announced.
@@ -2325,7 +2325,7 @@ class WatchTarget:
         Normally the watermark itself: a window reaching back to at-or-below the cursor visibly spans
         everything we have not confirmed. A CORRUPTION pin is the exception - it parks the watermark one
         below the window it re-emits, so that window's own floor is always cursor+1 and the ordinary test
-        can never be met by it (Loom re-audit 7, HIGH 5: the pin never cleared, the cursor never moved,
+        can never be met by it (re-audit 7, HIGH 5: the pin never cleared, the cursor never moved,
         and the window was re-delivered on every poll for the life of the process AND across restarts).
         Taking the MAX keeps the ordinary rule exactly as strict as it was - a recorded floor can only
         ever be the span we re-emitted, never something below the watermark.
@@ -2467,13 +2467,13 @@ class WatchTarget:
             # SILENCE IS NOT AN ANSWER HERE EITHER. A window whose `next_before_id` is ABSENT or
             # MALFORMED has told us nothing about whether it withheld rows, so its "I omitted nothing"
             # cannot be taken as an assertion - the two fields are one statement and half of it is
-            # unreadable. The WALK has refused to read that silence as exhaustion since Loom re-audit 5
+            # unreadable. The WALK has refused to read that silence as exhaustion since re-audit 5
             # (HIGH 1); the gap check never got the same rule, so a server that garbled the field while
             # declaring no omission advanced the watermark over anything it was hiding, silently and
             # with no alert. Same defect, one layer over. (Found by re-reading round 7 adversarially.)
             declared, exact = max(declared, 1), False
         if not poll.consistent:
-            # A SELF-CONTRADICTORY WINDOW IS AN OMISSION WE CANNOT COUNT (Loom re-audit 7, HIGH 4). This
+            # A SELF-CONTRADICTORY WINDOW IS AN OMISSION WE CANNOT COUNT (re-audit 7, HIGH 4). This
             # check used to read `poll.omitted` alone and never looked at the continuation at all, so a
             # window declaring "I withheld nothing" while handing back a cursor for older mail was taken
             # at its word - and the watermark stepped over whatever the continuation was pointing at.
@@ -2536,7 +2536,7 @@ class WatchTarget:
             recovered rows against a number the server may never have stated.
         That is what makes an INEXACT omission count closable at all.
 
-        Contract (river, api main @249e2b3): pass the OLDEST id you were returned as `before_id` and
+        Contract (api main @249e2b3): pass the OLDEST id you were returned as `before_id` and
         repeat until the page is empty or `next_before_id` is null. OMIT the parameter for the newest
         page - 0 is a REAL cursor, not "no cursor". A malformed cursor is a hard 400, so a bug here
         fails loudly instead of silently re-serving the newest page.
@@ -2545,7 +2545,7 @@ class WatchTarget:
         short by the page budget returns False, and the caller must keep the watermark pinned: a
         partial walk proves nothing, and claiming otherwise is the very failure this replaced.
 
-        THE CHAIN IS VALIDATED STRICTLY, NOT ASSUMED (Loom re-audit 5, HIGH 1). Coverage-by-exhaustion
+        THE CHAIN IS VALIDATED STRICTLY, NOT ASSUMED (re-audit 5, HIGH 1). Coverage-by-exhaustion
         is only as good as the chain being a real chain, so every link is checked before it is trusted:
           · the continuation must BE AN ANSWER. A missing or malformed `next_before_id` is not an
             end-of-chain, it is silence, and reading silence as "nothing older" hands back coverage the
@@ -2572,14 +2572,14 @@ class WatchTarget:
             # be trusted to have handed back the rows it appears to contain, so it may not close a span
             # even when it seems to reach the watermark.
             if not poll.consistent:
-                # SELF-CONTRADICTORY PAGE, IN EITHER DIRECTION. Withheld-rows + "nothing older" (Loom
-                # re-audit 6, HIGH 3) and withheld-nothing + "there is more" (Loom re-audit 7, HIGH 4)
+                # SELF-CONTRADICTORY PAGE, IN EITHER DIRECTION. Withheld-rows + "nothing older"
+                # (re-audit 6, HIGH 3) and withheld-nothing + "there is more" (re-audit 7, HIGH 4)
                 # are the same defect facing opposite ways: the two halves of the page's declaration
                 # disagree, so believing EITHER half steps over what the other one just asserted.
                 return (rows, False)
             if not batch:
                 if poll.next_before_id is not None:
-                    # EMPTY PAGE CLAIMING THERE IS MORE (Loom re-audit 6, HIGH 2). It returned nothing
+                    # EMPTY PAGE CLAIMING THERE IS MORE (re-audit 6, HIGH 2). It returned nothing
                     # while pointing further back, so the range it covered is unobserved - and because
                     # the oldest-row check has no row to check, following the pointer walks straight
                     # over that range and still reports the span covered.
@@ -2615,7 +2615,7 @@ class WatchTarget:
         if self.armed and self.fast_path and not args.no_fast_path and self.unread_persona:
             if counts_available:
                 unread = unread_counts.get(self.unread_persona, 0)
-                # ANY CHANGE, NOT ONLY AN INCREASE (crucible, 2026-09-27). If the agent reads its N held
+                # ANY CHANGE, NOT ONLY AN INCREASE (measured 2026-09-27). If the agent reads its N held
                 # messages and one new message lands within the same tick, the count goes N -> 1: a
                 # DECREASE that hides an arrival, so keying on `>` left that mail unannounced until the
                 # --resync-every floor (~8 min at the defaults). A pure read-down now costs one extra inbox
@@ -2638,7 +2638,7 @@ class WatchTarget:
         if skip_full:
             # count endpoint reachable + no unread increase = a HEALTHY poll with no new items
             if self.fsm_state == "DOWN":
-                # THE RECOVERY EDGE IS THE SAME DEFECT FACING THE OTHER WAY (argus, re-audit 11 - a
+                # THE RECOVERY EDGE IS THE SAME DEFECT FACING THE OTHER WAY (re-audit 11 - a
                 # site the review did not name). Committing "UP" and discarding the emit means a
                 # consumer that saw the DOWN alert never learns the source came back: it is left
                 # holding an alarm it can NEVER clear, because this edge is crossed exactly once.
@@ -2683,7 +2683,7 @@ class WatchTarget:
                         # here every visible message is one we may already owe someone.
                         self.cursor = min((m["id"] for m in items), default=0) - 1
                         new_items = sorted(items, key=lambda m: m["id"])
-                        # THE PIN NOW CARRIES ITS OWN RELEASE FLOOR (Loom re-audit 7, HIGH 5) - see
+                        # THE PIN NOW CARRIES ITS OWN RELEASE FLOOR (re-audit 7, HIGH 5) - see
                         # _pin_release_floor(). Set here, and again below if this first window was empty.
                         diag = ("state_corrupt", {"armed_at": self.cursor,
                                                   "reason": "state file present but unusable; re-emitting the "
@@ -2703,7 +2703,7 @@ class WatchTarget:
                         # since the vanished cursor is owed to someone. The branch above distinguishes
                         # exists-but-corrupt, because a file that is present is EVIDENCE a cursor existed.
                         # Absence leaves no such evidence, so the baseline stands - but it no longer
-                        # happens QUIETLY. (Found by assay's state-wipe drill, 2026-08-05: a wiped state
+                        # happens QUIETLY. (Found by a state-wipe drill, 2026-08-05: a wiped state
                         # file skipped an unread message with no bounce and no record. Clause 5's rule is
                         # "fail open HONESTLY, never silently" - the honesty is the part that was missing.)
                         #
@@ -2765,7 +2765,7 @@ class WatchTarget:
                                        key=lambda m: m["id"])
 
                 # THE CORRUPTION PIN'S RELEASE FLOOR, in ONE place so the arming poll and a later one
-                # cannot disagree (Loom re-audit 7, HIGH 5). A corrupt arm parks the watermark at
+                # cannot disagree (re-audit 7, HIGH 5). A corrupt arm parks the watermark at
                 # min(visible)-1 so it can re-emit the whole window; that makes the ordinary release test
                 # - a complete window reaching back to at-or-below the watermark - unsatisfiable by
                 # construction, because the reach IS min(visible) and min(visible) > min(visible)-1. So
@@ -2829,7 +2829,7 @@ class WatchTarget:
                     if closed and not self.pin_evidence_intact:
                         # An authoritative read re-establishes ground truth, so the span is knowable again.
                         self.pin_evidence_intact = True
-                    # RELEASE THE FORCED PIN (Loom re-audit 5, MEDIUM) - but not here, and not yet. A
+                    # RELEASE THE FORCED PIN (re-audit 5, MEDIUM) - but not here, and not yet. A
                     # forced pin was held because tracking was lost, and a COMPLETED walk is the
                     # authoritative evidence that replaces it; leaving it set froze the watermark
                     # permanently. The DECISION is made here, where the evidence is; the ACT is deferred
@@ -2859,7 +2859,7 @@ class WatchTarget:
                                        reconciled=len(gap_recovered), pinned=True):
                             self.gap_alerted = cursor_at
 
-                # DELIVERY IS ACKNOWLEDGED, NOT ASSUMED (Loom re-audit 7, HIGH 1). The cursor IS the
+                # DELIVERY IS ACKNOWLEDGED, NOT ASSUMED (re-audit 7, HIGH 1). The cursor IS the
                 # acknowledgement - once it advances past an id, that message is never fetched again - so
                 # it may only advance over messages the emitter actually DELIVERED. An --exec that exits
                 # non-zero, times out, or cannot be spawned used to advance it anyway: the wake hook that
@@ -2878,7 +2878,7 @@ class WatchTarget:
                     else:
                         blocked_at = m["id"]
                         self._delivery_failed(m["id"])
-                # THE DURABILITY BARRIER (Loom re-audit 7, MEDIUM): the event must be on stable storage
+                # THE DURABILITY BARRIER (re-audit 7, MEDIUM): the event must be on stable storage
                 # BEFORE the cursor that acknowledges it. If the sink cannot be synced, NOTHING emitted
                 # this poll counts as delivered - the acknowledgement is retracted wholesale rather than
                 # left half-true.
@@ -2938,7 +2938,7 @@ class WatchTarget:
                 # hidden is None -> the server made no statement; hold the current state and claim nothing
 
                 # ★ A PIN IS NOT DISCHARGED ON A POLL THAT COULD NOT DELIVER (found by adversarially
-                # re-reading my own round-7 work, the way loom would). Both proofs answer "did the SERVER
+                # re-reading my own round-7 work, the way an auditor would). Both proofs answer "did the SERVER
                 # withhold anything" - neither says a word about whether WE handed the window over. On a
                 # corrupt-state arm the watermark sits at min(visible)-1, so releasing while delivery was
                 # blocked threw away the release floor AND the state_corrupt flag while the cursor was
@@ -2986,7 +2986,7 @@ class WatchTarget:
                             self.pin_evidence_intact = True
 
                 # EVERY DELIVERED ID THE WATERMARK DOES NOT COVER IS REMEMBERED, whatever left it
-                # uncovered (Loom re-audit 7, HIGH 5). This used to live inside the `pinned` branch
+                # uncovered (re-audit 7, HIGH 5). This used to live inside the `pinned` branch
                 # alone, so the OTHER ways of not advancing - a forced pin with no gap in sight, a
                 # delivery that failed further up the batch - delivered mail and then forgot they had.
                 # The corruption pin hit exactly that: it could not advance and it recorded nothing, so
@@ -3061,7 +3061,7 @@ class WatchTarget:
                                  unread_hidden=self.unread_hidden,
                                  unread=self.observed_unread,
                                  down_since=(self.down_since[1] if self.down_since else None))
-            # ★ CONSUME THE ANSWER (Loom re-audit 9, MEDIUM). Round 8 taught me to RETURN a durability
+            # ★ CONSUME THE ANSWER (re-audit 9, MEDIUM). Round 8 taught me to RETURN a durability
             # status; this is the same defect one layer out - I produced an answer and then discarded it
             # at the call site, which is the exact thing the previous round was about. A cursor whose
             # persistence is unproven means a crash may replay mail, and the harm is the SILENCE.
@@ -3190,7 +3190,7 @@ def note_authorship(items):
     third party can manufacture or erase it by reading something. That is the whole reason this signal is
     worth collecting - a liveness check built on a bit any observer can flip is not a check.
 
-    Keyed EXACTLY, never casefolded: the server's persona namespace is case-SENSITIVE, so `Loom` and `loom`
+    Keyed EXACTLY, never casefolded: the server's persona namespace is case-SENSITIVE, so `Maple` and `maple`
     are different identities and must not merge (the identity half of the case asymmetry, §5.3).
 
     Only the newest window is needed. Backward-walk rows are always OLDER than the window floor they were
@@ -3369,7 +3369,7 @@ def write_activity_file(path, now_iso=None):
 def has_consumer_evidence(persona):
     """POSITIVE evidence that a real agent stands behind this persona name (§5.6).
 
-    Deliberately the SAME shape as the stranded-mail ownership predicate and river's broadcast eligibility
+    Deliberately the SAME shape as the stranded-mail ownership predicate and the server's broadcast eligibility
     rule, because the three answer one question - "is anyone actually there?" - and two predicates for one
     question drift apart and then disagree about the same inbox.
 
@@ -3454,7 +3454,7 @@ def _urgent_writeonly_detail(persona, n):
     A write_only inbox is undrained BY DESIGN - drained via ANOTHER surface (for the owner's inbox, largely the
     digest) - so a sender's URGENT flag on it does not mean the member is unresponsive HERE, and firing
     the loud "nobody is answering escalated mail" alarm on it is the same false-positive class write_only
-    exists to kill (assay ruling 5612). But the COUNT must stay visible so the surface that actually
+    exists to kill (a design ruling). But the COUNT must stay visible so the surface that actually
     drains the box can still act on it - QUIET, never INVISIBLE. Mirrors _dormant_detail.
     """
     return ("%s (%d urgent unread; held by write_only member - drained via another surface, "
@@ -3473,7 +3473,7 @@ def report_urgent_unanswered(directory, targets, emitter):
     is undrained BY DESIGN (drained via another surface), so a sender's URGENT flag does not make THEM
     unresponsive here - it is the same false-positive class write_only exists to kill, in the sibling
     alarm. The count stays NAMED on the quiet channel so the draining surface (the digest) can still read
-    it - quiet, not invisible (assay ruling 5612).
+    it - quiet, not invisible (a design ruling).
     """
     directory = directory or ()
     current = urgent_unanswered(directory)
@@ -3642,7 +3642,7 @@ def dormant_inboxes(directory, counts):
     """In-directory inboxes never consumed (read==0) but NOT declared `retired` - the QUIET tier.
 
     Separated from stranded_inboxes() on purpose: these are real members who simply do not read a
-    broadcast inbox (measured live: omniview/sterling/vellum/maestro hold hundreds of memories with
+    broadcast inbox (measured live: four personas on one account held hundreds of memories with
     read==0). Alarming on them loudly would flood the very alert consumers rely on, so they are surfaced
     quietly (a stderr NOTICE, and an informational `dormant_inboxes` field on any loud alert) and never
     fire an alert on their own.
@@ -3855,7 +3855,7 @@ def run(args):
             target.poll_once(counts_available, unread_counts)
         # AFTER the polls, so this tick's authorship is already recorded - evaluating before them would
         # judge a member silent using a view that predates the very message proving they are not.
-        # ITS OWN FLAG, NOT THE STRANDED ONE (ladybug review of c6e1699): these are different severities
+        # ITS OWN FLAG, NOT THE STRANDED ONE (review of c6e1699): these are different severities
         # with different audiences, and the stranded flag's own documented advice is "set this if you keep
         # deliberate test inboxes" - following that must not silently disable the higher-severity alarm
         # about real members. Coupling them made the safe-sounding instruction the dangerous one.
@@ -3889,7 +3889,7 @@ def build_parser():
     p.add_argument("--persona", action="append",
                    help="Kijito persona whose inbox to watch. Repeat for multi-persona mode.")
     p.add_argument("--personas", action="append",
-                   help="Comma-separated personas to watch, e.g. codex,river,ladybug.")
+                   help="Comma-separated personas to watch, e.g. alice,bob,carol.")
     p.add_argument("--all-personas", action="store_true",
                    help="Watch every persona in your Kijito account (default).")
     p.add_argument("--no-stranded-alerts", action="store_true",
@@ -3961,7 +3961,7 @@ def build_parser():
                         "needs to name a persona's events/state file (the SessionStart hook, "
                         "producer-health.sh, docs) must ask HERE rather than re-implement it. Three "
                         "re-implementations had already drifted (beta feedback #14/#16, row M290): the "
-                        "rule CASEFOLDS and accepts any UNICODE alphanumeric, so 'Loom' and 'Omega' are "
+                        "rule CASEFOLDS and accepts any UNICODE alphanumeric, so 'Maple' and 'Omega' are "
                         "exactly the names a hand-written [^A-Za-z0-9._-] filter gets wrong -- and it gets "
                         "them wrong INVISIBLY on a case-insensitive filesystem. A pure string function: no "
                         "token, no network, no state file.")
@@ -4055,7 +4055,7 @@ def validate_args(args):
 
 
 def _utf8_stdout():
-    """Write stdout as UTF-8 whatever the locale says (praetor, Windows 11 native, 2026-09-26).
+    """Write stdout as UTF-8 whatever the locale says (measured on Windows 11 native, 2026-09-26).
 
     A Windows console or a Git Bash pipe reports cp1252, so `--help` (a non-ASCII character) and, far worse,
     any EVENT carrying a message body outside cp1252 (an emoji, CJK) raised UnicodeEncodeError - a

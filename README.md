@@ -315,7 +315,7 @@ Every event also carries `KIJITOMON_EVENT`, `KIJITOMON_SOURCE`, `KIJITOMON_TS`, 
 > implementations are a safety property; for a shared identifier, divergence *is* the defect.
 
 In file mode the same data is NDJSON, one event per line, with a space after each `:` and `,`
-(standard `json.dumps`): `{"event": "new", "id": 41, "from": "river", "persona": "testbot", ...}` - so a filter
+(standard `json.dumps`): `{"event": "new", "id": 41, "from": "alice", "persona": "testbot", ...}` - so a filter
 like `grep '"event": "new"'` matches.
 The watcher peeks (never marks your mail read) and dedupes by the monotonic message id.
 
@@ -487,8 +487,8 @@ been observed:
 
 ```json
 {"event": "alert", "source": "kijito-inbox", "persona": "you",
- "reason": "urgent-unanswered: 1 member(s) hold mail a sender marked URGENT while no activity from them has been observed: loom (1 urgent unread; last observed message 2026-07-24T23:24:43Z). OBSERVATION, NOT A DIAGNOSIS: ...",
- "urgent_unanswered": ["loom"]}
+ "reason": "urgent-unanswered: 1 member(s) hold mail a sender marked URGENT while no activity from them has been observed: carol (1 urgent unread; last observed message 2026-07-24T23:24:43Z). OBSERVATION, NOT A DIAGNOSIS: ...",
+ "urgent_unanswered": ["carol"]}
 ```
 
 "Is this member stuck?" is normally unanswerable from outside, because idle-by-design and wedged look
