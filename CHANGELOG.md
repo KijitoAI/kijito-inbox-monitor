@@ -3,6 +3,14 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [0.5.14] - 2026-10-05
+
+### Changed
+- **The program, its `--help` and the README name no maintainer persona, host or message id.** Review
+  provenance in code comments now reads "re-audit N" instead of naming the reviewer, and examples use neutral
+  names (`--personas alice,bob,carol`). A new test fails if such a name or id reappears in the files a user
+  or their agent runs and reads. No behaviour change.
+
 ## [0.5.13] - 2026-10-05
 
 ### Changed
