@@ -39,7 +39,7 @@ try:
 except ImportError:
     msvcrt = None
 
-__version__ = "0.5.12"
+__version__ = "0.5.13"
 SOURCE = "kijito-inbox"
 # A named User-Agent is REQUIRED: api.kijito.ai is fronted by a WAF that 403s the default Python-urllib UA.
 USER_AGENT = "kijito-inbox-monitor/%s" % __version__
@@ -332,7 +332,7 @@ _PERSONA_RETIRED = {}
 
 # Declared `write_only` flag per persona from /api/personas. TRUE = an inbox that is undrained BY DESIGN:
 # a real member whose mail is consumed through another surface (a human reading sessions/digests, never
-# the box itself - `jason` is the live case), so read==0 is expected forever and must NEVER alarm. This
+# the box itself - the account owner's own inbox is the live case), so read==0 is expected forever and must NEVER alarm. This
 # is a FACT the API declares, not a policy: the classifier derives the alarm tier from it (write_only =>
 # quiet), so if alarm policy ever changes the fact stays true. It is INDEPENDENT of `retired` - a
 # write_only inbox is live, the opposite of clearable debris. None/absent => treated as not-write-only,
@@ -3451,7 +3451,7 @@ def urgent_unanswered(directory):
 def _urgent_writeonly_detail(persona, n):
     """Name a write_only member holding urgent unread, for the QUIET (non-waking) channel.
 
-    A write_only inbox is undrained BY DESIGN - drained via ANOTHER surface (for `jason`, largely the
+    A write_only inbox is undrained BY DESIGN - drained via ANOTHER surface (for the owner's inbox, largely the
     digest) - so a sender's URGENT flag on it does not mean the member is unresponsive HERE, and firing
     the loud "nobody is answering escalated mail" alarm on it is the same false-positive class write_only
     exists to kill (assay ruling 5612). But the COUNT must stay visible so the surface that actually
@@ -3607,7 +3607,7 @@ def _partition_stranded(directory, counts):
     write_only is checked BEFORE read, because an undrained-by-design inbox is quiet regardless of its
     read count - its read==0 (or unknown read) is the EXPECTED steady state, not evidence of a fault.
     That is the fix for a live member whose box the proxy would otherwise flag LOUD: the human's own
-    inbox `jason`, in the directory with unknown read and zero memories, was riding the loud alarm every
+    inbox, in the directory with unknown read and zero memories, was riding the loud alarm every
     tick until write_only declared it undrained-by-design. FACT declared by the API, policy derived here.
     """
     known = {p for p in directory if p}

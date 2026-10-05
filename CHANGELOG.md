@@ -3,6 +3,13 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [0.5.13] - 2026-10-05
+
+### Changed
+- **The package names no operator.** Code comments describe the account owner's inbox by role, and the test
+  fixtures use a neutral persona name. A new test fails if an operator's name reappears anywhere in the package;
+  the copyright and author metadata are the only lines it allows. No behaviour change.
+
 ## [0.5.12] - 2026-09-28
 
 ### Fixed
