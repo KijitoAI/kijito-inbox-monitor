@@ -908,29 +908,29 @@ class UrgentUnansweredAlarmTest(unittest.TestCase):
 
     def test_write_only_member_is_quiet_but_named_when_alone(self):
         # No loud alert may fire, but the count must be NAMED on stderr so the draining surface can see it.
-        km._URGENT_UNREAD.update({"jason": 2})
-        km._PERSONA_WRITE_ONLY.update({"jason": True})
+        km._URGENT_UNREAD.update({"principal": 2})
+        km._PERSONA_WRITE_ONLY.update({"principal": True})
         self._observe([{"id": 100, "from": "river", "created": "t"}])
-        fresh, alerts, err = self._run_cap(directory=("argus", "jason"))
+        fresh, alerts, err = self._run_cap(directory=("argus", "principal"))
         self.assertEqual(fresh, [])                                  # not loud
         self.assertEqual(alerts, [])                                 # no alert event at all
-        self.assertIn("jason", err)                                  # but NAMED on the quiet channel
+        self.assertIn("principal", err)                                  # but NAMED on the quiet channel
         self.assertIn("write_only", err)
         self.assertIn("drained via another surface", err)
-        self.assertIn("jason", km._REPORTED_URGENT_WO)               # once-per-process suppression armed
+        self.assertIn("principal", km._REPORTED_URGENT_WO)               # once-per-process suppression armed
 
     def test_write_only_rides_along_as_field_when_a_loud_member_coincides(self):
-        # loom (real member, not write_only) fires loud; jason (write_only) does NOT enter the loud list
+        # loom (real member, not write_only) fires loud; principal (write_only) does NOT enter the loud list
         # but rides along as an INFORMATIONAL field, mirroring `dormant_inboxes`.
-        km._URGENT_UNREAD.update({"jason": 2, "loom": 1})
-        km._PERSONA_WRITE_ONLY.update({"jason": True})
+        km._URGENT_UNREAD.update({"principal": 2, "loom": 1})
+        km._PERSONA_WRITE_ONLY.update({"principal": True})
         self._observe([{"id": 100, "from": "river", "created": "t"}])
-        fresh, alerts, err = self._run_cap(directory=("argus", "jason", "loom"))
+        fresh, alerts, err = self._run_cap(directory=("argus", "principal", "loom"))
         self.assertEqual(fresh, ["loom"])                            # only the non-write_only member
         self.assertEqual(alerts[0]["urgent_unanswered"], ["loom"])
-        self.assertEqual(alerts[0]["urgent_unanswered_write_only"], ["jason"])
-        self.assertNotIn("jason", alerts[0]["urgent_unanswered"])
-        self.assertIn("jason", err)                                  # also on the quiet channel
+        self.assertEqual(alerts[0]["urgent_unanswered_write_only"], ["principal"])
+        self.assertNotIn("principal", alerts[0]["urgent_unanswered"])
+        self.assertIn("principal", err)                                  # also on the quiet channel
 
     # ── row M332: DEBRIS (the reserved broadcast-name row, or a retired row) never fires the loud alarm ──
     # "Nobody is answering escalated mail" presumes a member who could answer. A reserved row (the legacy
@@ -995,16 +995,16 @@ class UrgentUnansweredAlarmTest(unittest.TestCase):
     def test_write_only_quiet_notice_is_once_then_re_arms(self):
         # Same self-clearing discipline as the loud tier: fires once, suppressed while it holds, re-armed
         # once the member leaves and re-enters the tier.
-        km._URGENT_UNREAD.update({"jason": 2})
-        km._PERSONA_WRITE_ONLY.update({"jason": True})
+        km._URGENT_UNREAD.update({"principal": 2})
+        km._PERSONA_WRITE_ONLY.update({"principal": True})
         self._observe([{"id": 100, "from": "river", "created": "t"}])
-        d = ("argus", "jason")
-        self.assertIn("jason", self._run_cap(directory=d)[2])        # first: named
-        self.assertNotIn("jason", self._run_cap(directory=d)[2])     # second: suppressed
-        km._URGENT_UNREAD["jason"] = 0                               # drained -> leaves the tier
+        d = ("argus", "principal")
+        self.assertIn("principal", self._run_cap(directory=d)[2])        # first: named
+        self.assertNotIn("principal", self._run_cap(directory=d)[2])     # second: suppressed
+        km._URGENT_UNREAD["principal"] = 0                               # drained -> leaves the tier
         self.assertEqual(self._run_cap(directory=d)[2], "")
-        km._URGENT_UNREAD["jason"] = 2                               # recurrence -> named again
-        self.assertIn("jason", self._run_cap(directory=d)[2])
+        km._URGENT_UNREAD["principal"] = 2                               # recurrence -> named again
+        self.assertIn("principal", self._run_cap(directory=d)[2])
 
 
 class DeliverableWatchersTest(unittest.TestCase):
@@ -2412,16 +2412,16 @@ class M167ReadCountPartitionTest(unittest.TestCase):
         self.assertIsNone(km._row_write_only({"write_only": "yes"}))  # a string is not a declaration
 
     def test_jason_write_only_is_QUIET_even_with_unknown_read_and_zero_memory(self):
-        # THE DEFECT cadence found (5232): jason is in the directory, owns no memories, and the server
+        # THE DEFECT cadence found (5232): principal is in the directory, owns no memories, and the server
         # reports no read data -> the memory-count PROXY flagged him LOUD every tick. write_only declares
         # the box undrained by design, so he must be DORMANT/quiet regardless of the proxy.
-        km._PERSONA_MEMORY_COUNTS.update({"jason": 0, "argus": 40})   # 0 memories -> proxy would say LOUD
-        km._PERSONA_READ_COUNTS.update({"argus": 5})                  # NO jason entry -> read UNKNOWN (live shape)
-        km._PERSONA_WRITE_ONLY.update({"jason": True, "argus": False})
-        directory = ["jason", "argus"]
-        self.assertEqual(km.stranded_inboxes(directory, {"jason": 30}), [])         # NOT loud
-        self.assertEqual(km.dormant_inboxes(directory, {"jason": 30}), ["jason"])   # quiet
-        fresh, events, err = self._report(directory, {"jason": 30}, watchers=("argus",))
+        km._PERSONA_MEMORY_COUNTS.update({"principal": 0, "argus": 40})   # 0 memories -> proxy would say LOUD
+        km._PERSONA_READ_COUNTS.update({"argus": 5})                  # NO principal entry -> read UNKNOWN (live shape)
+        km._PERSONA_WRITE_ONLY.update({"principal": True, "argus": False})
+        directory = ["principal", "argus"]
+        self.assertEqual(km.stranded_inboxes(directory, {"principal": 30}), [])         # NOT loud
+        self.assertEqual(km.dormant_inboxes(directory, {"principal": 30}), ["principal"])   # quiet
+        fresh, events, err = self._report(directory, {"principal": 30}, watchers=("argus",))
         self.assertEqual(fresh, [])
         self.assertEqual(events, [])                        # no loud alert event
         self.assertIn("write_only", err)                   # named on the quiet stderr channel
@@ -2429,14 +2429,14 @@ class M167ReadCountPartitionTest(unittest.TestCase):
 
     def test_absent_write_only_leaves_the_proxy_behaviour_unchanged(self):
         # GRACEFUL DEGRADATION: with no write_only declaration (the state until river's API PR lands),
-        # jason still classifies exactly as before -> LOUD via the proxy. Proves shipping the producer
+        # principal still classifies exactly as before -> LOUD via the proxy. Proves shipping the producer
         # ahead of the API populates is a no-op, mirroring how `retired` shipped.
-        km._PERSONA_MEMORY_COUNTS.update({"jason": 0, "argus": 40})
-        km._PERSONA_READ_COUNTS.update({"argus": 5})       # jason read UNKNOWN
-        # deliberately NO _PERSONA_WRITE_ONLY entry for jason
-        directory = ["jason", "argus"]
-        self.assertEqual(km.stranded_inboxes(directory, {"jason": 30}), ["jason"])  # unchanged: LOUD via proxy
-        self.assertEqual(km.dormant_inboxes(directory, {"jason": 30}), [])
+        km._PERSONA_MEMORY_COUNTS.update({"principal": 0, "argus": 40})
+        km._PERSONA_READ_COUNTS.update({"argus": 5})       # principal read UNKNOWN
+        # deliberately NO _PERSONA_WRITE_ONLY entry for principal
+        directory = ["principal", "argus"]
+        self.assertEqual(km.stranded_inboxes(directory, {"principal": 30}), ["principal"])  # unchanged: LOUD via proxy
+        self.assertEqual(km.dormant_inboxes(directory, {"principal": 30}), [])
 
     def test_write_only_is_quiet_even_when_read_is_zero(self):
         # write_only is checked BEFORE read, so a KNOWN read==0 write_only member is still quiet (its
@@ -2457,7 +2457,7 @@ class M167ReadCountPartitionTest(unittest.TestCase):
         self.assertEqual(km.dormant_inboxes(directory, {"ghosttypo": 3}), [])
 
     def test_write_only_precedes_retired_so_a_contradictory_row_stays_quiet(self):
-        # jason is write_only and NOT retired (live, not debris). A row declared BOTH is a contradiction
+        # principal is write_only and NOT retired (live, not debris). A row declared BOTH is a contradiction
         # the API should never emit, but write_only is checked first -> quiet. Document the precedence.
         km._PERSONA_MEMORY_COUNTS.update({"weird": 0, "argus": 1})
         km._PERSONA_READ_COUNTS.update({"weird": 0, "argus": 2})
@@ -6827,3 +6827,45 @@ class Utf8StdoutTest(unittest.TestCase):
                       "assert em.lifecycle('armed', persona='\\u6f22\\U0001F600') is True")
         self.assertEqual(r.returncode, 0, r.stderr.decode("utf-8", "replace")[-300:])
         self.assertIn("\u6f22\U0001F600", r.stdout.decode("utf-8"))
+
+
+class NoOperatorNameShipped(unittest.TestCase):
+    """The published package names no operator (kijito-tools M459, 2026-10-05).
+
+    Agents read this code and its tests. A named person inside a downloaded package reads like an
+    instruction from someone the reader never met, so the code, docs and fixtures use roles ("the
+    account owner") and neutral fixture names instead. The copyright holder and the package author
+    metadata are legal attribution and stay; they are allowed below by exact line, never by file.
+    The pattern is assembled from parts so this test does not match its own source."""
+
+    NAME = re.compile(r"\b(" + "ja" + "son|craw" + r"ford)\b", re.I)
+    ALLOWED = {("pyproject.toml", 'authors = [{ name = "Arcada Labs", email = "' + "ja" + 'son@arcadalabs.com" }]')}
+    SKIP_DIRS = {".git", "__pycache__", "build", "dist", "node_modules", ".venv"}
+
+    def _hits(self, root):
+        hits = []
+        for d, dirs, files in os.walk(root):
+            dirs[:] = [x for x in dirs if x not in self.SKIP_DIRS and not x.endswith(".egg-info")]
+            for f in files:
+                path = os.path.join(d, f)
+                rel = os.path.relpath(path, root)
+                try:
+                    with open(path, encoding="utf-8") as fh:
+                        lines = fh.read().splitlines()
+                except (UnicodeDecodeError, OSError):
+                    continue
+                for n, line in enumerate(lines, 1):
+                    if self.NAME.search(line) and (rel, line.strip()) not in self.ALLOWED:
+                        hits.append("%s:%d: %s" % (rel, n, line.strip()[:120]))
+        return hits
+
+    def test_repo_names_no_operator(self):
+        self.assertEqual(self._hits(os.path.dirname(os.path.abspath(__file__))), [])
+
+    def test_control_catches_a_reintroduced_name(self):
+        with tempfile.TemporaryDirectory() as t:
+            with open(os.path.join(t, "x.py"), "w", encoding="utf-8") as fh:
+                fh.write("# per " + "Ja" + "son's ruling\n")
+            with open(os.path.join(t, "pyproject.toml"), "w", encoding="utf-8") as fh:
+                fh.write(next(iter(self.ALLOWED))[1] + "\n")
+            self.assertEqual(len(self._hits(t)), 1)
