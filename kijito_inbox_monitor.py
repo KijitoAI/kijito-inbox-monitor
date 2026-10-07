@@ -6,6 +6,9 @@ one event per new message into whatever harness is running - NDJSON on stdout an
 event. It keeps a *running* agent's inbox live by waking it BETWEEN tool calls (the LLM-UX inbox-liveness fix). It
 is NOT a server.
 
+The API is https://api.kijito.ai unless --api-base or $KIJITO_BASE names another (a local stack or a
+self-hosted server; plain http only for this machine).
+
 Authentication is required: set $KIJITOMON_TOKEN (or --token-file) to your Kijito API token. POSIX target
 (Linux/macOS); on Windows it runs interval-only (no SIGUSR1 seam, no flock). See docs/DESIGN.md for the design.
 """
@@ -15,6 +18,7 @@ import email.utils
 import errno
 import hashlib
 import http.client
+import ipaddress
 import json
 import math
 import os
@@ -39,11 +43,16 @@ try:
 except ImportError:
     msvcrt = None
 
-__version__ = "0.5.14"
+__version__ = "0.5.15"
 SOURCE = "kijito-inbox"
 # A named User-Agent is REQUIRED: api.kijito.ai is fronted by a WAF that 403s the default Python-urllib UA.
 USER_AGENT = "kijito-inbox-monitor/%s" % __version__
-KIJITO_BASE = "https://api.kijito.ai"
+# The API base. Hosted Kijito by default; a local stack or a self-hosted server is named with --api-base or
+# $KIJITO_BASE (row M486 - the same variable the rest of the Kijito tooling reads). run() calls set_api_base()
+# before anything is fetched, so the four names below always describe the base this process watches.
+DEFAULT_API_BASE = "https://api.kijito.ai"
+API_BASE_ENV = "KIJITO_BASE"
+KIJITO_BASE = DEFAULT_API_BASE
 INBOX_URL = KIJITO_BASE + "/api/inbox"
 PERSONAS_URL = KIJITO_BASE + "/api/personas"
 NOTIFY_PENDING_URL = KIJITO_BASE + "/api/notify/pending"
@@ -67,6 +76,90 @@ class FatalConfig(Exception):
 
 
 # --------------------------------------------------------------------------------------------------------------------
+# API base (row M486): --api-base > $KIJITO_BASE > https://api.kijito.ai
+# --------------------------------------------------------------------------------------------------------------------
+# Plain http is accepted ONLY for these hosts. Every request carries the account's bearer token, and over http
+# to any other host that token crosses the network in the clear. The names are compared exactly (after the
+# usual hostname lowercasing): `127.0.0.1.example.com` or `localhost.` are remote hosts and are refused.
+_LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+# scheme://host[:port][/path] needs nothing else. Refusing every other character means no userinfo, query or
+# fragment, no whitespace, and nothing a supervisor file would interpret: `%` is a systemd specifier, `$` an
+# environment expansion, `&` and `<` are XML in a launchd plist. A base is written into those files as-is.
+_API_BASE_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~:/[]")
+
+
+def normalize_api_base(raw, source="--api-base"):
+    """Validate an API base and return it in canonical form (lowercase scheme and host, no trailing slash).
+
+    Raises FatalConfig, naming `source`, for anything that is not http(s)://host[:port][/path] or that would
+    send the token over plain http to a host other than this machine.
+    """
+    base = (raw or "").strip()
+    if not base:
+        raise FatalConfig("%s is empty - give the Kijito API base, e.g. %s" % (source, DEFAULT_API_BASE))
+    bad = sorted(set(c for c in base if c not in _API_BASE_CHARS))
+    if bad:
+        raise FatalConfig("%s %r contains %s - an API base is scheme://host[:port][/path], with no user, query "
+                          "or fragment" % (source, base, " ".join(repr(c) for c in bad)))
+    try:
+        parts = urllib.parse.urlsplit(base)
+        parts.port  # noqa: B018 - parsing the port is the check (a non-numeric or out-of-range port raises)
+    except ValueError as e:
+        raise FatalConfig("%s %r is not a valid URL: %s" % (source, base, e))
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise FatalConfig("%s %r must start with https:// (or http:// for a server on this machine)" % (source, base))
+    host = (parts.hostname or "").lower()
+    if not host:
+        raise FatalConfig("%s %r names no host" % (source, base))
+    # THE NETLOC MUST BE EXACTLY host[:port] (review N1). Python 3.9's urlsplit accepts `http://[::1]evil.com`,
+    # `http://[localhost]` or `http://[::1]x:80` and quietly extracts a hostname from them, while 3.11+ refuses
+    # them - so the same value meant different things on different interpreters. Rebuild the netloc from what
+    # was parsed and require it to be what was written: one meaning everywhere, or a refusal.
+    rebuilt = ("[%s]" % host if ":" in host else host) + ("" if parts.port is None else ":%d" % parts.port)
+    if parts.netloc.lower() != rebuilt or (":" in host and not _is_ip(host)):
+        raise FatalConfig("%s %r: the host part must be exactly host[:port] (an IPv6 address in brackets)"
+                          % (source, base))
+    if scheme == "http" and host not in _LOOPBACK_HOSTS:
+        raise FatalConfig("%s %r refused: plain http is allowed only for localhost, 127.0.0.1 or [::1], because "
+                          "every request carries your API token and http would send it unencrypted to %s - "
+                          "use https://" % (source, base, host))
+    return "%s://%s%s" % (scheme, parts.netloc.lower(), parts.path.rstrip("/"))
+
+
+def _is_ip(text):
+    try:
+        ipaddress.ip_address(text)
+        return True
+    except ValueError:
+        return False
+
+
+def resolve_api_base(flag_value, environ=None):
+    """The API base this process uses: --api-base, else a non-empty $KIJITO_BASE, else the hosted default.
+
+    Returns (base, source). An explicit flag is validated even when empty, so `--api-base ""` is an error
+    rather than a silent fall-through to the environment.
+    """
+    environ = os.environ if environ is None else environ
+    if flag_value is not None:
+        return normalize_api_base(flag_value, "--api-base"), "--api-base"
+    env_value = environ.get(API_BASE_ENV, "")
+    if env_value.strip():
+        return normalize_api_base(env_value, "$" + API_BASE_ENV), "$" + API_BASE_ENV
+    return DEFAULT_API_BASE, "default"
+
+
+def set_api_base(base):
+    """Point every endpoint this module fetches at `base` (already normalised)."""
+    global KIJITO_BASE, INBOX_URL, PERSONAS_URL, NOTIFY_PENDING_URL
+    KIJITO_BASE = base
+    INBOX_URL = base + "/api/inbox"
+    PERSONAS_URL = base + "/api/personas"
+    NOTIFY_PENDING_URL = base + "/api/notify/pending"
+
+
+# --------------------------------------------------------------------------------------------------------------------
 # §7.3 Canonical identity (computed BEFORE DNS resolution; trivial URL variations must not flip it)
 # --------------------------------------------------------------------------------------------------------------------
 def canonical_identity(url):
@@ -84,17 +177,35 @@ def canonical_identity(url):
 
 
 # --------------------------------------------------------------------------------------------------------------------
-# Connection hardening - resolve-once + pin the IP (no TOCTOU re-resolve), and never follow redirects.
-# The destination is the fixed Kijito API host, so there is no user-supplied URL to guard; pinning + no-redirect
-# remain as defense-in-depth against DNS games and redirect surprises.
+# Connection hardening - resolve-once + pin the addresses (no TOCTOU re-resolve), and never follow redirects.
+# The destination is the Kijito API base the operator configured (validated once by normalize_api_base, above);
+# pinning + no-redirect remain as defense-in-depth against DNS games and redirect surprises.
 # --------------------------------------------------------------------------------------------------------------------
 def resolve_and_pin(host, port):
-    """Resolve host and return the first IP to pin the connection to (no re-resolve at connect time = no TOCTOU)."""
+    """Resolve host ONCE and return the addresses to pin connections to, in resolver order (no re-resolve at
+    connect time = no TOCTOU).
+
+    Every address is kept, not just the first: `localhost` resolves to ::1 before 127.0.0.1 on macOS, and a
+    local server listening on 127.0.0.1 only would otherwise refuse every poll of --api-base
+    http://localhost:PORT (row M486). The connection tries them in order, as an ordinary client does.
+    """
     try:
         infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
     except socket.gaierror as e:
         raise FatalConfig("cannot resolve host %r: %s" % (host, e))
-    return infos[0][4][0]
+    return tuple(dict.fromkeys(info[4][0] for info in infos))
+
+
+def _connect_pinned(pinned, host, port, timeout):
+    """Open a TCP connection to the first reachable pinned address (or `host` when nothing is pinned)."""
+    addresses = (pinned,) if isinstance(pinned, str) else tuple(pinned or ()) or (host,)
+    err = None
+    for ip in addresses:
+        try:
+            return socket.create_connection((ip, port), timeout)
+        except OSError as e:
+            err = e
+    raise err
 
 
 class _PinnedHTTPConnection(http.client.HTTPConnection):
@@ -103,8 +214,7 @@ class _PinnedHTTPConnection(http.client.HTTPConnection):
         self._pinned_ip = pinned_ip
 
     def connect(self):
-        ip = self._pinned_ip or self.host
-        self.sock = socket.create_connection((ip, self.port), self.timeout)
+        self.sock = _connect_pinned(self._pinned_ip, self.host, self.port, self.timeout)
 
 
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
@@ -113,8 +223,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self._pinned_ip = pinned_ip
 
     def connect(self):
-        ip = self._pinned_ip or self.host
-        sock = socket.create_connection((ip, self.port), self.timeout)
+        sock = _connect_pinned(self._pinned_ip, self.host, self.port, self.timeout)
         ctx = self._context or ssl.create_default_context()
         # connect to the pinned IP but verify the cert against the real hostname (SNI preserved)
         self.sock = ctx.wrap_socket(sock, server_hostname=self.host)
@@ -135,7 +244,13 @@ def build_opener(pinned_ip):
         def https_open(self, req):
             return self.do_open(lambda h, **kw: _PinnedHTTPSConnection(h, pinned_ip=pinned_ip, **kw), req)
 
-    return urllib.request.build_opener(_NoRedirect, _PinnedHTTPHandler, _PinnedHTTPSHandler)
+    # ProxyHandler({}) - NO environment proxies (review F1). urllib's default ProxyHandler reads HTTP(S)_PROXY /
+    # ALL_PROXY and swaps the request's host:port for the proxy's, but the connection still goes to the address
+    # pinned from the API host - so with a proxy set, the token-bearing request went to <API address>:<proxy
+    # port>, i.e. whatever listens on that local port. A proxy can never have worked with the pin, so nothing
+    # depended on it; refusing it outright is the only consistent choice.
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect, _PinnedHTTPHandler,
+                                       _PinnedHTTPSHandler)
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -1270,7 +1385,7 @@ class Emitter:
             keymap = {
                 "id": "KIJITOMON_ID", "from": "KIJITOMON_FROM", "content": "KIJITOMON_CONTENT",
                 "created": "KIJITOMON_CREATED", "cursor": "KIJITOMON_CURSOR",
-                "persona": "KIJITOMON_PERSONA",
+                "persona": "KIJITOMON_PERSONA", "api_base": "KIJITOMON_API_BASE",
                 "reason": "KIJITOMON_REASON", "consecutive_failures": "KIJITOMON_FAILURES",
                  "seconds": "KIJITOMON_SECONDS", "floor_seconds": "KIJITOMON_FLOOR_SECONDS",
                 "seeded": "KIJITOMON_SEEDED", "current_max": "KIJITOMON_CURRENT_MAX",
@@ -2019,12 +2134,36 @@ def persona_url(persona):
     return "%s?persona=%s&mark_read=false" % (INBOX_URL, urllib.parse.quote(persona))
 
 
-def make_opener_for(url):
+def pin_for(url):
+    """The addresses a connection to `url` may use: resolved once, and for plain http ONLY loopback ones.
+
+    The http allowance (normalize_api_base) is granted to the NAMES localhost / 127.0.0.1 / ::1, but what is
+    connected to is whatever the resolver returned (review F2). A host with no hosts-file entry for localhost
+    can fall through to DNS and get a remote address, and the token would then cross the network in the clear.
+    So for http the resolution itself must be loopback; if nothing loopback remains, refuse to start.
+    """
     p = urllib.parse.urlsplit(url)
     host = p.hostname or ""
     port = p.port or (443 if p.scheme == "https" else 80)
     pinned = resolve_and_pin(host, port)
-    return build_opener(pinned)
+    if p.scheme == "http":
+        loopback = tuple(a for a in pinned if _is_loopback_address(a))
+        if not loopback:
+            raise FatalConfig("refusing plain http to %r: it resolved to %s, which is not this machine - the API "
+                              "token would cross the network unencrypted" % (host, ", ".join(pinned) or "nothing"))
+        pinned = loopback
+    return pinned
+
+
+def _is_loopback_address(addr):
+    try:
+        return ipaddress.ip_address(addr.split("%", 1)[0]).is_loopback
+    except ValueError:
+        return False
+
+
+def make_opener_for(url):
+    return build_opener(pin_for(url))
 
 
 def _persona_path(template, persona):
@@ -2782,7 +2921,7 @@ class WatchTarget:
                 if diag:
                     self.lifecycle(diag[0], **diag[1])
                 if do_arm:
-                    self.lifecycle("armed", cursor=self.cursor)
+                    self.lifecycle("armed", cursor=self.cursor, api_base=KIJITO_BASE)
                 # §5.1 A BOUNDED WINDOW MUST NOT SILENTLY SWALLOW MAIL.
                 # The server returns the NEWEST messages that fit, and declares what it left out. If it
                 # omitted anything AND the window does not reach back to our cursor, un-emitted mail can
@@ -3079,7 +3218,7 @@ class WatchTarget:
             self.last_newest = _newest_unread(self.unread_persona)
 
         if args.heartbeat and (_monotonic() - self.last_heartbeat) >= args.heartbeat:
-            self.lifecycle("heartbeat", cursor=self.cursor)
+            self.lifecycle("heartbeat", cursor=self.cursor, api_base=KIJITO_BASE)
             self.last_heartbeat = _monotonic()
 
         self.first_poll = False
@@ -3756,6 +3895,11 @@ def report_stranded_inboxes(directory, counts, targets, emitter):
 
 
 def run(args):
+    # FIRST, before the token or any request: every URL below is derived from the base set here.
+    base, base_source = resolve_api_base(getattr(args, "api_base", None))
+    set_api_base(base)
+    if base != DEFAULT_API_BASE:
+        sys.stderr.write("kijito-inbox-monitor: NOTICE watching the Kijito API at %s (from %s)\n" % (base, base_source))
     headers = build_headers(args)
     sink = None
     sink_template = None
@@ -3974,6 +4118,14 @@ def build_parser():
     p.add_argument("--waits", type=int, default=1,
                    help="With --check-activity: how many of your own heartbeats you have waited "
                         "(reported verbatim, so a reader can judge magnitude). Default 1.")
+    p.add_argument("--api-base", metavar="URL",
+                   help="The Kijito API to watch (default %s; $%s when this flag is absent). Use it for a "
+                        "local stack or a self-hosted server, e.g. http://127.0.0.1:7474. https is required "
+                        "except for localhost, 127.0.0.1 and [::1], because every request carries your token."
+                        % (DEFAULT_API_BASE, API_BASE_ENV))
+    p.add_argument("--print-api-base", action="store_true",
+                   help="Print the API base this producer would use (--api-base, else $%s, else the default) "
+                        "after validating it, then exit 0. No token, no network." % API_BASE_ENV)
     p.add_argument("--auth-header", help="Header NAME for the token (default Authorization: Bearer).")
     p.add_argument("--token-file", help="File holding the auth token (wins over $KIJITOMON_TOKEN).")
     p.add_argument("--token-file-template",
@@ -4083,6 +4235,14 @@ def main(argv=None):
             sys.stderr.write("kijito-inbox-monitor: FATAL --safe-persona needs a non-empty PERSONA\n")
             return 2
         sys.stdout.write(_state_safe_persona(args.safe_persona) + "\n")
+        return 0
+    if args.print_api_base:
+        try:
+            base, _ = resolve_api_base(args.api_base)
+        except FatalConfig as e:
+            sys.stderr.write("kijito-inbox-monitor: FATAL %s\n" % e)
+            return 2
+        sys.stdout.write(base + "\n")
         return 0
     if args.check_activity:
         if not args.activity_file:

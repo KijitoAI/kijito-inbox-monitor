@@ -3,6 +3,39 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [0.5.15] - 2026-10-07
+
+### Added
+- **The API base is configurable: `--api-base URL`, else `$KIJITO_BASE`, else `https://api.kijito.ai` (row
+  M486).** A local stack or a self-hosted server used to mean editing this package's source. `KIJITO_BASE` is
+  the name the rest of the Kijito tooling already reads. The base must be `https://host[:port][/path]`; plain
+  `http://` is accepted only for `localhost`, `127.0.0.1` and `[::1]`, because every request carries your API
+  token, and anything else is refused at startup before a request is made. A trailing slash is dropped. A
+  non-default base is announced once on stderr, and every `armed` and `heartbeat` event carries the base in
+  use as `api_base` (`$KIJITOMON_API_BASE` for `--exec`). Otherwise the default changes nothing (same URLs,
+  same state-file identity, same User-Agent).
+- For a plain-http base the resolved addresses must be loopback too: any other address is dropped, and if none
+  remains the producer refuses to start (the name `localhost` falling through to DNS cannot carry the token
+  off the machine).
+- The host part must be exactly `host[:port]` (IPv6 in brackets) on every supported Python. Python 3.9 accepts
+  values such as `http://[::1]evil.com` that 3.11+ rejects; both now refuse them, as well as a bare trailing
+  `:` with no port.
+- `--print-api-base` prints the base the producer would use, after validating it, and exits. No token, no
+  network.
+- `scripts/render-service.sh launchd|systemd [--api-base URL]` renders the launchd plist or the systemd unit
+  from the shipped template and writes the base into the service's command line, because a supervisor does
+  not see your shell's `$KIJITO_BASE`. For the default base its output is byte-for-byte the template as
+  rendered before, so re-rendering an existing install changes nothing.
+
+### Fixed
+- **Environment proxies are ignored.** `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` could never work with the pinned
+  connection: urllib swapped in the proxy's host and port while the socket still went to the API's pinned
+  address, so a token-bearing request could land on whatever listened on that local port. The opener now
+  installs no proxy handler at all.
+- **`localhost` reaches a server that listens on 127.0.0.1 only.** The producer resolves the host once and
+  pins the connection, but it pinned only the FIRST address, and on macOS `localhost` resolves to `::1` first.
+  It now keeps every address from that one resolution and tries them in order (still no re-resolve).
+
 ## [0.5.14] - 2026-10-05
 
 ### Changed

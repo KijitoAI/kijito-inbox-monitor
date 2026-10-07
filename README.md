@@ -1,7 +1,8 @@
 # kijito-inbox-monitor
 
 A small, zero-dependency watcher (Python standard library only) that wakes your agent the moment new mail
-arrives in your Kijito inbox. It polls your inbox at `api.kijito.ai` and emits one event per new message; you
+arrives in your Kijito inbox. It polls your inbox at `api.kijito.ai` (or [your own server](#local-or-self-hosted-api))
+and emits one event per new message; you
 connect those events to whatever wakes your agent loop. The point is to keep a running agent's inbox live by
 waking it between tool calls. It is not a server.
 
@@ -32,6 +33,33 @@ Generate one in your Kijito account settings.
 ```sh
 export KIJITOMON_TOKEN="<your-kijito-api-token>"
 ```
+
+## Local or self-hosted API
+
+The producer watches `https://api.kijito.ai` unless you name another Kijito API, with `--api-base URL` or the
+`KIJITO_BASE` environment variable (the flag wins):
+
+```sh
+export KIJITO_BASE=http://127.0.0.1:7474           # a local stack
+kijito-inbox-monitor --api-base https://kijito.example.com --persona alice    # a self-hosted server
+kijito-inbox-monitor --print-api-base               # which base would be used, then exit
+```
+
+`https://` is required, except for `localhost`, `127.0.0.1` and `[::1]`: every request carries your API token,
+and plain http to any other host would send it unencrypted, so the producer refuses to start. For plain http the
+name must also *resolve* to this machine: an address that is not loopback is dropped, and if none is left the
+producer refuses to start. Environment proxies (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`) are ignored.
+
+For a supervised producer, put the base in the service definition - `scripts/render-service.sh --api-base URL`
+does that (see [supervision](#running-the-producer-for-real-supervision)) - because then nothing else can move
+it. A service rendered WITHOUT `--api-base` still reads `$KIJITO_BASE` from the supervisor's environment, which
+is not your interactive shell but can be set from it: on macOS `launchctl setenv KIJITO_BASE ...` (every agent
+launched afterwards inherits it); on Linux `systemctl --user set-environment` / `import-environment`,
+`dbus-update-activation-environment --systemd --all` (many desktop sessions run this at login and import the
+whole login environment), and `~/.config/environment.d/*.conf`. `KIJITO_BASE` is shared with other Kijito
+tooling, so pointing that tooling at a local stack by any of those routes also moves an un-pinned producer.
+The base actually in use is on every `armed` and `heartbeat` event (`api_base`), and a non-default one is
+announced on stderr at startup.
 
 ## Install
 
@@ -224,6 +252,20 @@ operator's absolute home baked into seven paths, which is useless to anyone else
 read-only artifact rather than a working tree - otherwise publishing a package "deploys" nothing and a restart
 does not change that.
 
+`scripts/render-service.sh` does the same substitution and can also carry a non-default API base into the job:
+
+```sh
+scripts/render-service.sh launchd \
+  --program "$HOME/.local/share/kijito-inbox-monitor/versions/<sha>/kijito_inbox_monitor.py" \
+  [--api-base http://127.0.0.1:7474] > ~/Library/LaunchAgents/com.kijito.inbox-monitor.plist
+scripts/render-service.sh systemd [--api-base https://kijito.example.com] \
+  > ~/.config/systemd/user/kijito-inbox-monitor@.service
+```
+
+It reads `--api-base`, else `$KIJITO_BASE`, validates the value with the producer itself, and adds `--api-base URL`
+to the service's command line. With no base (or the default one) the output is exactly the template as rendered
+before, so an existing install does not change.
+
 On Linux the counterpart is `kijito-inbox-monitor@.service.template`, a **systemd user unit**. Unlike the plist
 it needs no per-persona editing: the `@` makes it a template unit in systemd's own sense, and `%i` expands to
 whatever follows the `@`, so one file serves every persona.
@@ -293,12 +335,12 @@ Each line of the events file (and each `exec-per-event` invocation) is one event
 
 | `event` | meaning | env vars on `--exec` |
 |---------|---------|----------------------|
-| `armed` | emitted once per persona on the first healthy poll (baseline set) | `KIJITOMON_CURSOR` |
+| `armed` | emitted once per persona on the first healthy poll (baseline set); `api_base` is the API being watched | `KIJITOMON_CURSOR`, `KIJITOMON_API_BASE` |
 | `new` | a new inbox message | `KIJITOMON_ID`, `KIJITOMON_FROM`, `KIJITOMON_CONTENT`, `KIJITOMON_CREATED`, `KIJITOMON_PERSONA` |
 | `alert` | the source has been failing for `--alert-after` polls **and** for a measured `--alert-floor-seconds` (dead-man; `seconds` is the measured span), **or** mail is stranded in an inbox nobody watches, **or** the server holds unread mail this window did not show (all below) | `KIJITOMON_REASON`, `KIJITOMON_FAILURES`, `KIJITOMON_SECONDS`, `KIJITOMON_FLOOR_SECONDS`, `KIJITOMON_STRANDED` |
 | `recovered` | the source came back after an `alert` | `KIJITOMON_CURSOR` |
 | `still_unread` | mail already announced as `new` is still **unread** `--still-unread-after` seconds (default 2 h) after it was sent. One event per poll names every such message; each message is reminded at most once per window and at most `--still-unread-max` (default 3) times; never for retired, reserved or write_only inboxes; nothing on the first poll after a restart. Read what you have handled with `mark_read=true` and it stops. | `KIJITOMON_IDS`, `KIJITOMON_OLDEST_AGE`, `KIJITOMON_REASON` |
-| `heartbeat` | optional liveness tick (`--heartbeat N`) | `KIJITOMON_CURSOR` |
+| `heartbeat` | optional liveness tick (`--heartbeat N`); `api_base` is the API being watched | `KIJITOMON_CURSOR`, `KIJITOMON_API_BASE` |
 
 Every event also carries `KIJITOMON_EVENT`, `KIJITOMON_SOURCE`, `KIJITOMON_TS`, `KIJITOMON_EVENT_ID`,
 `KIJITOMON_NONCE`, and (for persona targets) `KIJITOMON_PERSONA`.
@@ -561,6 +603,8 @@ four sat above it. Only the newest page's count answers the question "is there u
 | `--rediscover-every N` | In all-persona mode, re-scan for new personas every N seconds (default 600). |
 | `--no-stranded-alerts` | Don't alarm on mail sitting in an inbox that isn't a known persona (see [Stranded mail](#stranded-mail)). On by default, because such mail is undeliverable and nothing else reports it. Silences only this alarm. |
 | `--no-urgent-alerts` | Don't alarm on escalated (urgent) mail a known member isn't answering (see [Escalated mail nobody is answering](#escalated-mail-nobody-is-answering)). On by default. Separate from `--no-stranded-alerts` on purpose - a flag for unowned test inboxes must not silence an alarm about real members. |
+| `--api-base URL` | The Kijito API to watch (default `https://api.kijito.ai`; `$KIJITO_BASE` when the flag is absent). `https://` required except for `localhost`, `127.0.0.1` and `[::1]`. See [Local or self-hosted API](#local-or-self-hosted-api). |
+| `--print-api-base` | Print the API base the producer would use, after validating it, then exit. No token, no network. |
 | `--auth-header NAME` / `--token-file PATH` | Auth header name (default `Authorization: Bearer`) / token file. Token also via `$KIJITOMON_TOKEN`. A token is required. |
 | `--no-fast-path` | Disable the `/api/notify/pending` pre-check; always full-poll the inbox list. |
 | `--resync-every N` | Fast-path safety floor: force a full inbox poll after at most N cheap skips (default 10), so a stale unread count can never blind the watcher. |
