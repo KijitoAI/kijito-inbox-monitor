@@ -22,7 +22,7 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
   client configs of Claude Code, Codex and OpenCode, and key-shaped environment values), at most 32, and never
   a key or an `Authorization` header. A key file that is not 0600, or a symlink, stops the run.
 - `scripts/mutation-check.py` accepts the multi-part `(label, [(pattern, replacement), ...])` form its docstring
-  already described, and gains 44 `M488-*` mutants, one per defence.
+  already described, and gains 46 `M488-*` mutants, one per defence.
 
 ## [0.5.15] - 2026-10-07
 
