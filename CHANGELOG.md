@@ -3,6 +3,28 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [0.5.15] - 2026-10-07
+
+### Added
+- **The API base is configurable: `--api-base URL`, else `$KIJITO_BASE`, else `https://api.kijito.ai` (row
+  M486).** A local stack or a self-hosted server used to mean editing this package's source. `KIJITO_BASE` is
+  the name the rest of the Kijito tooling already reads. The base must be `https://host[:port][/path]`; plain
+  `http://` is accepted only for `localhost`, `127.0.0.1` and `[::1]`, because every request carries your API
+  token, and anything else is refused at startup before a request is made. A trailing slash is dropped. A
+  non-default base is announced once on stderr; the default changes nothing (same URLs, same state-file
+  identity, same User-Agent).
+- `--print-api-base` prints the base the producer would use, after validating it, and exits. No token, no
+  network.
+- `scripts/render-service.sh launchd|systemd [--api-base URL]` renders the launchd plist or the systemd unit
+  from the shipped template and writes the base into the service's command line, because a supervisor does
+  not see your shell's `$KIJITO_BASE`. For the default base its output is byte-for-byte the template as
+  rendered before, so re-rendering an existing install changes nothing.
+
+### Fixed
+- **`localhost` reaches a server that listens on 127.0.0.1 only.** The producer resolves the host once and
+  pins the connection, but it pinned only the FIRST address, and on macOS `localhost` resolves to `::1` first.
+  It now keeps every address from that one resolution and tries them in order (still no re-resolve).
+
 ## [0.5.14] - 2026-10-05
 
 ### Changed

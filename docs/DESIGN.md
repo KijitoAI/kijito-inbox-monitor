@@ -1,6 +1,9 @@
 # Kijito Inbox Monitor: Design & Implementation Spec
 
-**Updated:** 2026-09-28 (rev 12: §9 the fast path also keys on the server's `newest_unread_id` (Kijito M379), so
+**Updated:** 2026-10-07 (rev 13: §5/§8 the API base is configurable - `--api-base`, else `$KIJITO_BASE`, else
+`https://api.kijito.ai` - validated at startup, with plain http only to this machine; connections try every address
+from the one resolution, row M486.)
+Rev 12 (2026-09-28: §9 the fast path also keys on the server's `newest_unread_id` (Kijito M379), so
 reads and arrivals that cancel within one tick (N -> N) are seen at once; a server without the field keeps the count
 check.)
 Rev 11 (2026-09-27: §7.3 the single-writer lock also holds on Windows - `msvcrt.locking` on byte 0
@@ -73,7 +76,8 @@ v1 ships one adapter (`http-poll`, the Kijito reference). Future adapters are ex
 - **Endpoint:** `GET /api/inbox?persona=<P>&mark_read=false`
 - **Response:** `{"result": [ {"id":<int>,"from":"<persona>","content":"<plaintext>","created":"<iso-str>","read":<bool>}, ... ]}`
   (keys verbatim, in that order, per messaging.py:85-89). v1 hard-bakes this Kijito response shape (there is no
-  generic parse config; that's deferred, see §scope). The destination is the fixed Kijito API; only the persona varies.
+  generic parse config; that's deferred, see §scope). The destination is the Kijito API (hosted by default, or the base
+  named by `--api-base` / `$KIJITO_BASE`, §8); only the persona varies.
 - **`mark_read` defaults to `true`** (web_api.py:504; SET m.read=true at messaging.py:90-96). The URL must carry
   `&mark_read=false`. A watcher must peek, never consume: every fetch site (the poll loop and `--self-test`) uses
   the `mark_read=false` URL. (Triple-confirmed; the original seed was fixed for this.)
@@ -692,10 +696,20 @@ read-state-neutral (DONE-WHEN #5 holds after self-test).
 
 ## 8. Security (connection hardening + creds)
 
-- **No user-supplied URL to guard.** The destination is the fixed Kijito API host, so there is no SSRF surface from
-  config and no destination-class allow/deny machinery. Two hardenings remain as defense-in-depth: **(IP-pin)**
-  resolve the host once and pin the connection to that IP - no re-resolve at connect time, so no TOCTOU
-  (`_PinnedHTTPSConnection` connects to the pinned IP while verifying the cert against the real hostname via SNI);
+- **The API base is the operator's own configuration, not request input** (row M486). `--api-base`, else
+  `$KIJITO_BASE`, else `https://api.kijito.ai`, resolved once at startup (`resolve_api_base`). It is not the old
+  rev-6 `--url`: it names the Kijito API to talk to, not an arbitrary poll URL, and the endpoint paths are fixed.
+  The rule, in one place (`normalize_api_base`; `--print-api-base` and `scripts/render-service.sh` call it rather
+  than re-implementing it): `http(s)://host[:port][/path]` only - no user, query or fragment, and no character a
+  supervisor file would interpret (`%`, `$`, `&`, `<`, whitespace); a trailing slash is dropped; **plain http only
+  for `localhost`, `127.0.0.1`, `[::1]`**, because the bearer token rides on every request. A refused base exits
+  before any resolution or request. A different base is a different state-file identity (§7.3), so a cursor is
+  never resumed against another server.
+- Two hardenings remain as defense-in-depth: **(IP-pin)**
+  resolve the host once and pin the connection to the addresses that resolution returned, tried in order - no
+  re-resolve at connect time, so no TOCTOU (`_PinnedHTTPSConnection` connects to a pinned IP while verifying the
+  cert against the real hostname via SNI; every address is kept because `localhost` resolves to `::1` first on
+  macOS and a server bound to 127.0.0.1 would otherwise refuse every poll);
   **(no redirects)** redirects are never followed - a redirect is treated as an unhealthy poll, never chased.
   Per-request timeout default is 5s. Stdlib: no-redirect via `HTTPRedirectHandler.redirect_request → None`; IP-pin via
   a custom `HTTPConnection` through `do_open`; `urlopen(timeout=)`.
