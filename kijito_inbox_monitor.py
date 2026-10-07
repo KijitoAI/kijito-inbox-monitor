@@ -4190,16 +4190,16 @@ def _check_private_fd(fd, path):
     mail into and wrong for a key file we are only reading: a 0644 key has already been readable by other users,
     and quietly fixing it would hide that from the person who has to rotate it. Off POSIX only the regular-file
     check applies (Windows has no owner or mode bits; access there is the profile's ACL)."""
-    st = os.fstat(fd)
-    if not stat.S_ISREG(st.st_mode):
+    pst = os.fstat(fd)
+    if not stat.S_ISREG(pst.st_mode):
         raise InsecureFile("%s is not a regular file" % path)
     if not IS_POSIX:
-        return st
-    if st.st_uid != os.geteuid():
-        raise InsecureFile("%s is owned by uid %d, not by you (uid %d)" % (path, st.st_uid, os.geteuid()))
-    if st.st_mode & 0o777 != PRIVATE_FILE_MODE:
-        raise InsecureFile("%s has mode %o, not 0600 - run: chmod 600 %s" % (path, st.st_mode & 0o777, path))
-    return st
+        return pst
+    if pst.st_uid != os.geteuid():
+        raise InsecureFile("%s is owned by uid %d, not by you (uid %d)" % (path, pst.st_uid, os.geteuid()))
+    if pst.st_mode & 0o777 != PRIVATE_FILE_MODE:
+        raise InsecureFile("%s has mode %o, not 0600 - run: chmod 600 %s" % (path, pst.st_mode & 0o777, path))
+    return pst
 
 
 def _read_private(path, limit=PRIVATE_READ_MAX_BYTES):

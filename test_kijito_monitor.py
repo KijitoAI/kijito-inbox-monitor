@@ -8005,11 +8005,22 @@ class RedeemKeyScanTest(_RedeemCase):
         self.assertEqual(self.redeem("--kind", "watcher"), 2)
         self.assertIn("not a regular file", self.err)
         os.unlink(fifo)
-        self.put(".claude/.kijito_api_token.theirs", _fixture_key("y") + "\n")
-        uid = os.geteuid()
-        self._patch(km.os, "geteuid", lambda: uid + 1)
+        theirs = self.put(".claude/.kijito_api_token.theirs", _fixture_key("y") + "\n")
+        # Another user's file, faked for THAT inode only: faking the process uid instead stops the run at the
+        # api_base and temp-file checks first, and the test would then pass with this check removed.
+        ino, real_fstat = os.stat(theirs).st_ino, os.fstat
+
+        def fstat(fd):
+            st = real_fstat(fd)
+            if st.st_ino != ino:
+                return st
+            fields = list(st[:10])
+            fields[4] = st.st_uid + 1
+            return os.stat_result(fields)
+        self._patch(km.os, "fstat", fstat)
         self.assertEqual(self.redeem("--kind", "watcher"), 2)
-        self.assertIn("owned by uid", self.err)
+        self.assertIn("%s is owned by uid" % theirs, self.err)
+        self.assertIn("reason=insecure_key_file", self.out)
         self.assertNothingSent()
 
     def test_forty_keys_send_the_first_thirty_two_in_key_locations_order(self):
