@@ -4134,6 +4134,9 @@ _MESSAGES = {
                          "command from the reply unchanged; if it repeats, tell the user.",
     "PICKUP_FAILED": "the server could not recover the key and revoked it. Create a new key.",
     "PICKUP_RETRY_LATER": "nothing was collected. Rerun the same command before the code expires.",
+    "PICKUP_UNAVAILABLE": "this server does not hand out keys by pickup. Nothing was collected, but the key it "
+                          "minted is waiting unclaimed: revoke it (%s), then ask for the key with "
+                          "delivery=\"inline\" or create it on the web account page." % _REVOKE_HINT,
     "PICKUP_AMBIGUOUS": "the request was sent but no usable answer came back, so the key may have been collected. "
                         "Do not retry: revoke the key (%s) and create a new one." % _REVOKE_HINT,
 }
@@ -4270,6 +4273,11 @@ def _same_dir(a, b):
     return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
 
 
+def _resolved(path):
+    """`path` with its PARENT resolved (symlinks followed) and its last component kept as written."""
+    return os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
+
+
 def _redeem_home(environ):
     """The account's home directory, which every path under --redeem-key is relative to.
 
@@ -4336,10 +4344,10 @@ class _Redeem:
     pre (nothing sent: exit 6) -> sent (no parsed answer: exit 7) -> parsed (key in memory: exit 5, or 8 once the
     temp holds it) -> saved (the key is in place)."""
 
-    def __init__(self, args, environ, cwd, stdin):
+    def __init__(self, args, environ, stdin):
         self.args = args
         self.environ = environ
-        self.cwd = cwd
+        self.cwd = None             # looked up inside run(), under the catch-all
         self.stdin = stdin
         self.phase = "pre"
         self.tmp = None
@@ -4355,6 +4363,12 @@ class _Redeem:
 
     # ---- steps --------------------------------------------------------------------------------------------
     def run(self):
+        try:
+            self.cwd = _redeem_cwd()
+        except OSError as e:
+            _redeem_say("WARNING the working directory is unreadable (%s); its MCP configs are not checked"
+                        % type(e).__name__)
+            self.cwd = None
         self._check_args()
         self.home = _redeem_home(self.environ)
         base = self._allowed_base()
@@ -4452,19 +4466,23 @@ class _Redeem:
         """Exactly one target, checked before anything is sent, so no later failure can lose the key."""
         a = self.args
         home = self.home
-        watcher = os.path.join(home, WATCHER_KEY_FILE)
-        rest = os.path.join(home, REST_KEY_FILE)
+        # Every path is RESOLVED ONCE here, and only the resolved strings are checked and used afterwards: a
+        # second resolution later would let a directory link swapped in between move the key somewhere the
+        # checks never saw (review F1).
+        watcher = _resolved(os.path.join(home, WATCHER_KEY_FILE))
+        rest = _resolved(os.path.join(home, REST_KEY_FILE))
         if a.token_file:
             target = self._canonical_target(a.token_file, watcher, rest)
         else:
             target = watcher if a.kind == "watcher" else rest
-        if a.kind == "rest" and self._same_path(target, watcher):
+        if a.kind == "rest" and os.path.normcase(target) == os.path.normcase(watcher):
             raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "--kind rest never writes the read-only watcher "
                              "file %s (a wider key does not go there)" % watcher, reason="target")
         parent = os.path.dirname(target)
         _makedirs_private(parent)
-        target = os.path.join(os.path.realpath(parent), os.path.basename(target))
-        parent = os.path.dirname(target)
+        if os.path.normcase(os.path.realpath(parent)) != os.path.normcase(parent):
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "%s changed (a link was swapped in) while it was "
+                             "being checked. Nothing was sent; rerun." % parent, reason="target_moved", file=parent)
         if IS_POSIX:
             st = os.stat(parent)
             if (st.st_mode & 0o022) and not (st.st_mode & stat.S_ISVTX):
@@ -4489,7 +4507,7 @@ class _Redeem:
         if content:
             if not a.replace:
                 hint = ""
-                if a.kind == "watcher" and self._same_path(target, watcher):
+                if a.kind == "watcher" and os.path.normcase(target) == os.path.normcase(watcher):
                     hint = (" If it holds a different persona's key, pass --token-file "
                             "~/.config/kijito-inbox-monitor/token.<persona> instead - never --replace.")
                 raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED",
@@ -4511,24 +4529,25 @@ class _Redeem:
                 if p == prefix or p.startswith(prefix + "/") or p.startswith(prefix + os.sep):
                     p = home + p[len(prefix):]
                     break
-        p = os.path.join(self.cwd, p)
-        if self._same_path(p, watcher) or self._same_path(p, rest):
-            return p
-        name = os.path.basename(p)
-        if self.args.kind == "watcher" and _same_dir(os.path.dirname(p), os.path.dirname(watcher)) \
+        if not os.path.isabs(p):
+            if self.cwd is None:
+                raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "--token-file %s is relative and the working "
+                                 "directory is unreadable. Nothing was sent." % given, reason="target")
+            p = os.path.join(self.cwd, p)
+        cand = _resolved(p)
+        if os.path.normcase(cand) in (os.path.normcase(watcher), os.path.normcase(rest)):
+            return cand
+        name = os.path.basename(cand)
+        if self.args.kind == "watcher" and \
+                os.path.normcase(os.path.dirname(cand)) == os.path.normcase(os.path.dirname(watcher)) \
                 and name.startswith("token."):
             persona = name[len("token."):]
             if persona and _state_safe_persona(persona) == persona:
-                return p
+                return cand
         raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED",
                          "--token-file must be %s or %s (or, for --kind watcher, %s.<persona> with the name "
                          "--safe-persona prints); %s is none of these. Nothing was sent."
                          % (watcher, rest, watcher, given), reason="target")
-
-    @staticmethod
-    def _same_path(a, b):
-        return (os.path.normcase(os.path.basename(a)) == os.path.normcase(os.path.basename(b))
-                and _same_dir(os.path.dirname(a), os.path.dirname(b)))
 
     def _scan(self):
         """Every key already on this machine that we can find, as sha256 hex (the server's own lookup form).
@@ -4561,7 +4580,8 @@ class _Redeem:
                 if raw:
                     add(raw, path)
         configs = [(os.path.join(home, rel), False) for rel in MCP_CONFIGS_HOME]
-        configs += [(os.path.join(self.cwd, rel), True) for rel in MCP_CONFIGS_CWD]
+        if self.cwd is not None:
+            configs += [(os.path.join(self.cwd, rel), True) for rel in MCP_CONFIGS_CWD]
         seen_cfg = set()
         for path, is_project in configs:
             ident = os.path.normcase(os.path.realpath(path))
@@ -4683,8 +4703,12 @@ class _Redeem:
         if err_code in _PICKUP_RETRY_CODES:
             raise RedeemExit(REDEEM_EXIT_RETRY, "PICKUP_RETRY_LATER", _MESSAGES["PICKUP_RETRY_LATER"],
                              reason=err_code)
+        if err_code == "pickup_unavailable":
+            # Answered before any lookup, so nothing was consumed; but this server cannot hand out keys by
+            # pickup at all, so retrying cannot help, and the minted key would sit live and unclaimed.
+            raise RedeemExit(REDEEM_EXIT_AMBIGUOUS, "PICKUP_UNAVAILABLE", _MESSAGES["PICKUP_UNAVAILABLE"])
         raise RedeemExit(REDEEM_EXIT_AMBIGUOUS, "PICKUP_AMBIGUOUS", _MESSAGES["PICKUP_AMBIGUOUS"],
-                         reason=err_code or ("http_%d" % status))
+                         reason=_redeem_field(err_code) if err_code else "http_%d" % status)
 
     def _wrong_account_message(self, message):
         if not self.sources:
@@ -4739,7 +4763,6 @@ class _Redeem:
             raise
         except OSError as e:
             self._park("%s could not be installed (%s)" % (target, e.strerror or e))
-        self.tmp = None
 
     def _install_new(self, target):
         """Target absent at pre-flight: link (atomic, never clobbers), with an O_EXCL copy where the filesystem
@@ -4749,7 +4772,6 @@ class _Redeem:
                 os.rename(self.tmp, target)
             except OSError as e:
                 self._park("%s could not be created (%s)" % (target, e.strerror or type(e).__name__))
-            self.tmp = None
             return
         try:
             os.link(self.tmp, target)
@@ -4759,12 +4781,7 @@ class _Redeem:
             if e.errno not in _LINK_FALLBACK_ERRNOS:
                 self._park("%s could not be created (%s)" % (target, e.strerror or type(e).__name__))
             self._copy_new(target)
-        tmp, self.tmp = self.tmp, None
-        try:
-            os.unlink(tmp)
-        except OSError as e:
-            _redeem_say("WARNING the key is saved, but the temp copy %s could not be removed (%s) - delete it"
-                        % (tmp, e.strerror or type(e).__name__))
+        # The temp (now a second name for the key) is removed by cleanup(), which runs on every exit.
 
     def _copy_new(self, target):
         flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
@@ -4858,7 +4875,12 @@ class _Redeem:
             return RedeemExit(REDEEM_EXIT_AMBIGUOUS, "PICKUP_AMBIGUOUS", "%s after the request was sent. %s"
                               % (why, _MESSAGES["PICKUP_AMBIGUOUS"]), reason="interrupted")
         if self.phase == "parsed":
-            if self.tmp_holds_key and self.tmp:
+            # DECIDED FROM THE DISK, not from flags: the move into place and the bookkeeping after it are two
+            # steps, and an interrupt between them must neither report a saved key as lost nor park a temp
+            # that is already gone (review F2).
+            if self.tmp_holds_key and self._target_holds_key():
+                return None
+            if self.tmp_holds_key and self.tmp and os.path.lexists(self.tmp):
                 self.parked = True
                 return RedeemExit(REDEEM_EXIT_PARKED, "KEY_PARKED", "%s; the key was left in %s (owner-only). "
                                   "Tell the user; do not open it." % (why, self.tmp), file=self.tmp)
@@ -4866,6 +4888,12 @@ class _Redeem:
                               "kijito_api_key(action=\"revoke\", token_id=\"%s\") and create a new one."
                               % (why, self.key_id), id=self.key_id)
         return None   # saved: the key is in place
+
+    def _target_holds_key(self):
+        try:
+            return bool(self.target) and _read_private(self.target).strip() == bytes(self.secret or b"")
+        except OSError:
+            return False
 
     def cleanup(self):
         if self.tmp_fd is not None:
@@ -4951,13 +4979,38 @@ def _redeem_line(token, fields):
     sys.stdout.flush()
 
 
+class _RedeemTerminated(KeyboardInterrupt):
+    """SIGTERM/SIGHUP during --redeem-key: a harness timeout kill takes the SAME path as Ctrl-C, so the run still
+    prints its outcome and cleans up instead of dying with a half-collected key and no instruction (review F5)."""
+
+
+def _redeem_on_signal(signum, frame):
+    raise _RedeemTerminated()
+
+
+def _redeem_trap_signals():
+    """Route SIGTERM (and SIGHUP where it exists) to the interrupt path; returns what to restore. Only the main
+    thread may set handlers, so elsewhere this is a no-op."""
+    restore = []
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            restore.append((sig, signal.signal(sig, _redeem_on_signal)))
+        except (ValueError, OSError):
+            pass
+    return restore
+
+
 def redeem_key(args):
     """--redeem-key: collect a key minted with delivery="pickup" and save it. Returns the exit code.
 
     Routed from main() BEFORE validate_args/run, inside its own catch-all, so the watcher's KeyboardInterrupt -> 0
     and OSError -> 2 arms never apply: an interrupt means 6, 7, 5 or 8 depending on how far the run got."""
-    r = _Redeem(args, _redeem_environ(), _redeem_cwd(), _redeem_stdin())
+    r = _Redeem(args, _redeem_environ(), _redeem_stdin())
     outcome = None
+    restore = _redeem_trap_signals()
     try:
         return r.run()
     except RedeemExit as e:
@@ -4968,6 +5021,8 @@ def redeem_key(args):
         outcome, why = r.abort("unexpected %s" % type(e).__name__), "error_%s" % type(e).__name__
     finally:
         r.cleanup()
+        for sig, handler in restore:
+            signal.signal(sig, handler)
     if outcome is None:
         # The key was already in place when the run stopped: say where, and that it was not checked.
         _redeem_line("KEY_SAVED", [("file", r.target), ("verified", "no"), ("reason", why)])

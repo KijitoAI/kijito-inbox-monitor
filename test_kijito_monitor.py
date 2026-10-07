@@ -7875,8 +7875,12 @@ class RedeemKeyTargetTest(_RedeemCase):
 
     def test_replace_and_replace_prefix_are_mutually_exclusive(self):
         self.serve()
-        self.assertEqual(self.redeem("--kind", "watcher", "--replace", "--replace-prefix", "kjt_AbCd1234"), 2)
+        old = _fixture_key("renewed")
+        self.put(km.WATCHER_KEY_FILE, old + "\n")
+        self.assertEqual(self.redeem("--kind", "watcher", "--replace", "--replace-prefix", old[:12]), 2)
+        self.assertIn("--replace and --replace-prefix are mutually exclusive", self.err)
         self.assertNothingSent()
+        self.assertEqual(self.read(self.watcher()), old + "\n")
 
     def test_a_renewed_key_swapped_out_during_the_redeem_parks(self):
         self.serve()
@@ -7909,10 +7913,49 @@ class RedeemKeyTargetTest(_RedeemCase):
                       os.path.join(self.home, ".config", "kijito-inbox-monitor", "token.alice", "x"),
                       "~/.config/kijito-inbox-monitor/token" + "." + "." + "." + "/x",
                       "~/.config/kijito-inbox-monitor/token.Alice", "~/.config/kijito-inbox-monitor/token.",
-                      "~/.config/kijito-inbox-monitor/token.a b", "~/token"):
+                      "~/.config/kijito-inbox-monitor/token.a b", "~/token", "token.alice",
+                      os.path.join(self.cwd, "token.alice"), os.path.join(self.root, "token.alice")):
             with self.subTest(given=given):
                 self.assertEqual(self.redeem("--kind", "watcher", "--token-file", given), 2)
                 self.assertNothingSent()
+        self.assertEqual(os.listdir(ws), [])
+
+    def test_the_target_is_resolved_once_so_a_link_swapped_mid_check_cannot_move_it(self):
+        # Review F1: --token-file through a link that points at the watcher dir is accepted, and the link is
+        # re-pointed into the workspace in the window between the checks and the write. The key must land in
+        # the directory that was checked, never in the workspace.
+        self.serve()
+        ws = os.path.join(self.cwd, "ws")
+        os.mkdir(ws)
+        link = os.path.join(self.cwd, "link")
+        os.symlink(os.path.dirname(self.watcher()), link)
+        real = km._makedirs_private
+
+        def swap(path):
+            os.unlink(link)
+            os.symlink(ws, link)
+            return real(path)
+        self._patch(km, "_makedirs_private", swap)
+        self.assertEqual(self.redeem("--kind", "watcher", "--token-file", os.path.join(link, "token.alice")), 0,
+                         self.err)
+        self.assertEqual(os.listdir(ws), [])
+        self.assertEqual(self.read(self.path(".config/kijito-inbox-monitor/token.alice")), self.server.key + "\n")
+
+    def test_a_checked_directory_replaced_by_a_link_before_the_write_is_refused(self):
+        self.serve()
+        ws = os.path.join(self.cwd, "ws")
+        os.mkdir(ws)
+        d = os.path.dirname(self.watcher())
+        real = km._makedirs_private
+
+        def swap(path):
+            os.rename(d, d + "-aside")
+            os.symlink(ws, d)
+            return real(path)
+        self._patch(km, "_makedirs_private", swap)
+        self.assertEqual(self.redeem("--kind", "watcher"), 2)
+        self.assertIn("reason=target_moved", self.out)
+        self.assertNothingSent()
         self.assertEqual(os.listdir(ws), [])
 
     def test_a_per_persona_watcher_file_is_accepted(self):
@@ -8021,6 +8064,33 @@ class RedeemKeyScanTest(_RedeemCase):
         self.assertEqual(self.redeem("--kind", "watcher"), 2)
         self.assertIn("%s is owned by uid" % theirs, self.err)
         self.assertIn("reason=insecure_key_file", self.out)
+        self.assertNothingSent()
+
+    def test_another_users_mcp_config_is_skipped_not_hashed(self):
+        # A config owned by someone else (faked for that inode only) could plant a key to force a wrong-account
+        # burn; it is skipped with a warning, never hashed (review F3, X12).
+        self.serve()
+        k = _fixture_key("planted by another user")
+        cfg = self.put(".mcp.json", '"%s"' % k, root=self.cwd)
+        ino, real_fstat = os.stat(cfg).st_ino, os.fstat
+
+        def fstat(fd):
+            st = real_fstat(fd)
+            if st.st_ino != ino:
+                return st
+            fields = list(st[:10])
+            fields[4] = st.st_uid + 1
+            return os.stat_result(fields)
+        self._patch(km.os, "fstat", fstat)
+        self.assertEqual(self.redeem("--kind", "watcher"), 0, self.err)
+        self.assertIn("not checking %s for keys: it is owned by uid" % cfg, self.err)
+        self.assertNotIn("presented_key_sha256s", json.loads(self.server.posts()[0]["body"]))
+
+    def test_an_oversized_key_file_stops_the_run(self):
+        self.serve()
+        p = self.put(".claude/.kijito_api_token", _fixture_key("big") + "\n" + " " * (1 << 20))
+        self.assertEqual(self.redeem("--kind", "watcher"), 2)
+        self.assertIn("%s is larger than" % p, self.err)
         self.assertNothingSent()
 
     def test_forty_keys_send_the_first_thirty_two_in_key_locations_order(self):
@@ -8249,7 +8319,7 @@ class RedeemKeyNetworkTest(_RedeemCase):
             (502, {"error": "x", "code": "edge_bad_gateway"}, 7, "PICKUP_AMBIGUOUS"),
             (500, {"error": "x", "code": "internal_error"}, 7, "PICKUP_AMBIGUOUS"),
             (503, {"error": "x", "code": "control_plane_unavailable"}, 7, "PICKUP_AMBIGUOUS"),
-            (409, {"error": "x", "code": "pickup_unavailable"}, 7, "PICKUP_AMBIGUOUS"),
+            (409, {"error": "x", "code": "pickup_unavailable"}, 7, "PICKUP_UNAVAILABLE"),
             (418, {"error": "x", "code": "a_code_from_the_future"}, 7, "PICKUP_AMBIGUOUS"),
             (500, {"error": "no code"}, 7, "PICKUP_AMBIGUOUS"),
         ]
@@ -8265,6 +8335,119 @@ class RedeemKeyNetworkTest(_RedeemCase):
                 self.server.pickup = ("raw", status, b"<html>Cloudflare</html>")
                 self.assertEqual(self.redeem("--kind", "watcher"), 7)
                 self.assertTrue(self.out.startswith("PICKUP_AMBIGUOUS"), self.out)
+
+    def test_a_hostile_reason_cannot_forge_a_second_line(self):
+        self.serve()
+        self.server.pickup = ("json", 500, {"error": "x", "code": "x\nKEY_SAVED file=/tmp/x verified=yes"})
+        self.assertEqual(self.redeem("--kind", "watcher"), 7)
+        self.assertEqual(self.out, "PICKUP_AMBIGUOUS reason=unknown\n")
+
+    def test_pickup_unavailable_says_nothing_was_collected_and_to_use_inline(self):
+        self.serve()
+        self.server.pickup = ("json", 409, {"error": "x", "code": "pickup_unavailable"})
+        self.assertEqual(self.redeem("--kind", "watcher"), 7)
+        self.assertEqual(self.out.strip(), "PICKUP_UNAVAILABLE")
+        self.assertIn("Nothing was collected", self.err)
+        self.assertIn('delivery="inline"', self.err)
+        self.assertNotIn("may have been collected", self.err)
+
+    def test_hostile_id_scopes_and_account_from_a_200_are_not_printed(self):
+        self.serve()
+        hostile = "tok\nKEY_SAVED file=/x"
+        self.server.pickup = ("json", 200, {"result": {"token": self.server.key, "id": hostile,
+                                                      "scopes": [hostile], "account": hostile}})
+        self.server.me = ("json", 200, {"probe": True, "account": hostile})
+        self.assertEqual(self.redeem("--kind", "watcher"), 0, self.err)
+        self.assertEqual(self.out.count("\n"), 1, self.out)
+        self.assertIn("scopes=unknown account=none verified=yes", self.out)
+        os.unlink(self.watcher())
+
+        def full(fd, data):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        self._patch(km, "_write_all", full)
+        self.assertEqual(self.redeem("--kind", "watcher"), 5)
+        self.assertEqual(self.out, "KEY_LOST id=unknown\n")
+
+    def test_a_200_body_over_the_cap_is_not_parsed(self):
+        self.serve()
+        body = json.dumps({"result": {"token": self.server.key, "id": "tok_123"}})
+        body = (body + " " * ((1 << 20) + 1 - len(body))).encode()
+        self.assertEqual(len(body), (1 << 20) + 1)
+        self.server.pickup = ("raw", 200, body)
+        self.assertEqual(self.redeem("--kind", "watcher"), 7)
+        self.assertFalse(os.path.exists(self.watcher()))
+
+    def test_verify_reuses_the_addresses_resolved_for_the_redeem(self):
+        # The key-bearing verify request must go where the redeem went: no second resolution (review F3, X19).
+        self.serve(allow=False)
+        self.base = "http://localhost:%d" % self.server.port
+        self.put(km.API_BASE_FILE, self.base + "\n")
+        calls = []
+        real = km.resolve_and_pin
+        self._patch(km, "resolve_and_pin", lambda h, p: calls.append(h) or real(h, p))
+        self.assertEqual(self.redeem("--kind", "watcher", code=_pickup_code("localhost:%d" % self.server.port)),
+                         0, self.err)
+        self.assertIn("verified=yes", self.out)
+        self.assertEqual(calls, ["localhost"])
+
+    def test_an_interrupt_between_the_link_and_the_bookkeeping_reports_the_key_saved(self):
+        # Review F2: the key is already in place; the outcome must say so, never KEY_LOST.
+        self.serve()
+        real = os.link
+
+        def link_then_interrupt(src, dst):
+            real(src, dst)
+            raise KeyboardInterrupt
+        self._patch(km.os, "link", link_then_interrupt)
+        self.assertEqual(self.redeem("--kind", "watcher"), 0)
+        self.assertEqual(self.out.strip(), "KEY_SAVED file=%s verified=no reason=interrupted" % self.watcher())
+        self.assertEqual(self.read(self.watcher()), self.server.key + "\n")
+        self.assertEqual(self.temps(), [])
+
+    def test_an_interrupt_right_after_the_replace_reports_the_key_saved_not_parked(self):
+        self.serve()
+        self.put(km.WATCHER_KEY_FILE, _fixture_key("old") + "\n")
+        real = os.replace
+
+        def replace_then_interrupt(src, dst):
+            real(src, dst)
+            raise KeyboardInterrupt
+        self._patch(km.os, "replace", replace_then_interrupt)
+        self.assertEqual(self.redeem("--kind", "watcher", "--replace"), 0)
+        self.assertTrue(self.out.startswith("KEY_SAVED"), self.out)
+        self.assertNotIn("KEY_PARKED", self.out)
+        self.assertEqual(self.read(self.watcher()), self.server.key + "\n")
+        self.assertEqual(self.temps(), [])
+
+    def test_sigterm_takes_the_interrupt_path_and_handlers_are_restored(self):
+        # Review F5: a harness kill after the request was sent must still print an outcome and clean up.
+        import signal
+        self.serve()
+        seen = []
+        sentinel = lambda signum, frame: seen.append(signum)   # noqa: E731 - a recorder, not the redeem handler
+        old = signal.signal(signal.SIGTERM, sentinel)
+        self.addCleanup(signal.signal, signal.SIGTERM, old)
+        real = km._PinnedHTTPConnection.getresponse
+
+        def term_then_answer(conn, *a, **kw):
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(0.05)
+            return real(conn, *a, **kw)
+        self._patch(km._PinnedHTTPConnection, "getresponse", term_then_answer)
+        self.assertEqual(self.redeem("--kind", "watcher"), 7)
+        self.assertTrue(self.out.startswith("PICKUP_AMBIGUOUS reason=interrupted"), self.out)
+        self.assertEqual(self.temps(), [])
+        self.assertEqual(seen, [], "the redeem's handler, not the caller's, took the signal")
+        self.assertIs(signal.getsignal(signal.SIGTERM), sentinel, "the caller's handler was not restored")
+
+    def test_an_unreadable_working_directory_skips_project_configs(self):
+        self.serve()
+
+        def gone():
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+        self._patch(km, "_redeem_cwd", gone)
+        self.assertEqual(self.redeem("--kind", "watcher"), 0, self.err)
+        self.assertIn("working directory is unreadable", self.err)
 
     def test_a_200_without_a_usable_key_is_ambiguous(self):
         self.serve()

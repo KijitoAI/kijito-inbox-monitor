@@ -78,10 +78,10 @@ terminal it is asked for without echo, and `$KIJITO_PICKUP_CODE` is the fallback
 | 4 | the server refused: `PICKUP_EXPIRED`, `PICKUP_USED`, `PICKUP_NOT_FOUND`, `PICKUP_WRONG_ACCOUNT`, `PICKUP_WRONG_KIND`, `PICKUP_FAILED` |
 | 5 | `KEY_LOST id=...`: collected but not saved; revoke that key |
 | 6 | `PICKUP_RETRY_LATER`: nothing was consumed; rerun the same command before the code expires |
-| 7 | `PICKUP_AMBIGUOUS`: sent, but no usable answer; the key may be collected, so revoke it and mint a new one |
+| 7 | `PICKUP_AMBIGUOUS`: sent, but no usable answer; the key may be collected, so revoke it and mint a new one. `PICKUP_UNAVAILABLE`: the server does not offer pickup; nothing was collected, but revoke the minted key and ask for it with `delivery="inline"` |
 | 8 | `KEY_PARKED file=...`: saved, but at the temp path printed |
 
-There is no automatic retry.
+There is no automatic retry. An interrupt, SIGTERM or SIGHUP still prints one of these outcomes.
 
 ## Local or self-hosted API
 
