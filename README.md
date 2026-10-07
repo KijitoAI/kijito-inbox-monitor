@@ -46,10 +46,20 @@ kijito-inbox-monitor --print-api-base               # which base would be used, 
 ```
 
 `https://` is required, except for `localhost`, `127.0.0.1` and `[::1]`: every request carries your API token,
-and plain http to any other host would send it unencrypted, so the producer refuses to start. A supervisor
-(launchd, systemd) does not see the variables you exported in your shell, so for a supervised producer put the
-base in the service definition - `scripts/render-service.sh --api-base URL` does that (see
-[supervision](#running-the-producer-for-real-supervision)).
+and plain http to any other host would send it unencrypted, so the producer refuses to start. For plain http the
+name must also *resolve* to this machine: an address that is not loopback is dropped, and if none is left the
+producer refuses to start. Environment proxies (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`) are ignored.
+
+For a supervised producer, put the base in the service definition - `scripts/render-service.sh --api-base URL`
+does that (see [supervision](#running-the-producer-for-real-supervision)) - because then nothing else can move
+it. A service rendered WITHOUT `--api-base` still reads `$KIJITO_BASE` from the supervisor's environment, which
+is not your interactive shell but can be set from it: on macOS `launchctl setenv KIJITO_BASE ...` (every agent
+launched afterwards inherits it); on Linux `systemctl --user set-environment` / `import-environment`,
+`dbus-update-activation-environment --systemd --all` (many desktop sessions run this at login and import the
+whole login environment), and `~/.config/environment.d/*.conf`. `KIJITO_BASE` is shared with other Kijito
+tooling, so pointing that tooling at a local stack by any of those routes also moves an un-pinned producer.
+The base actually in use is on every `armed` and `heartbeat` event (`api_base`), and a non-default one is
+announced on stderr at startup.
 
 ## Install
 
@@ -325,12 +335,12 @@ Each line of the events file (and each `exec-per-event` invocation) is one event
 
 | `event` | meaning | env vars on `--exec` |
 |---------|---------|----------------------|
-| `armed` | emitted once per persona on the first healthy poll (baseline set) | `KIJITOMON_CURSOR` |
+| `armed` | emitted once per persona on the first healthy poll (baseline set); `api_base` is the API being watched | `KIJITOMON_CURSOR`, `KIJITOMON_API_BASE` |
 | `new` | a new inbox message | `KIJITOMON_ID`, `KIJITOMON_FROM`, `KIJITOMON_CONTENT`, `KIJITOMON_CREATED`, `KIJITOMON_PERSONA` |
 | `alert` | the source has been failing for `--alert-after` polls **and** for a measured `--alert-floor-seconds` (dead-man; `seconds` is the measured span), **or** mail is stranded in an inbox nobody watches, **or** the server holds unread mail this window did not show (all below) | `KIJITOMON_REASON`, `KIJITOMON_FAILURES`, `KIJITOMON_SECONDS`, `KIJITOMON_FLOOR_SECONDS`, `KIJITOMON_STRANDED` |
 | `recovered` | the source came back after an `alert` | `KIJITOMON_CURSOR` |
 | `still_unread` | mail already announced as `new` is still **unread** `--still-unread-after` seconds (default 2 h) after it was sent. One event per poll names every such message; each message is reminded at most once per window and at most `--still-unread-max` (default 3) times; never for retired, reserved or write_only inboxes; nothing on the first poll after a restart. Read what you have handled with `mark_read=true` and it stops. | `KIJITOMON_IDS`, `KIJITOMON_OLDEST_AGE`, `KIJITOMON_REASON` |
-| `heartbeat` | optional liveness tick (`--heartbeat N`) | `KIJITOMON_CURSOR` |
+| `heartbeat` | optional liveness tick (`--heartbeat N`); `api_base` is the API being watched | `KIJITOMON_CURSOR`, `KIJITOMON_API_BASE` |
 
 Every event also carries `KIJITOMON_EVENT`, `KIJITOMON_SOURCE`, `KIJITOMON_TS`, `KIJITOMON_EVENT_ID`,
 `KIJITOMON_NONCE`, and (for persona targets) `KIJITOMON_PERSONA`.

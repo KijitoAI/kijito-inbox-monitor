@@ -18,6 +18,7 @@ import email.utils
 import errno
 import hashlib
 import http.client
+import ipaddress
 import json
 import math
 import os
@@ -111,11 +112,27 @@ def normalize_api_base(raw, source="--api-base"):
     host = (parts.hostname or "").lower()
     if not host:
         raise FatalConfig("%s %r names no host" % (source, base))
+    # THE NETLOC MUST BE EXACTLY host[:port] (review N1). Python 3.9's urlsplit accepts `http://[::1]evil.com`,
+    # `http://[localhost]` or `http://[::1]x:80` and quietly extracts a hostname from them, while 3.11+ refuses
+    # them - so the same value meant different things on different interpreters. Rebuild the netloc from what
+    # was parsed and require it to be what was written: one meaning everywhere, or a refusal.
+    rebuilt = ("[%s]" % host if ":" in host else host) + ("" if parts.port is None else ":%d" % parts.port)
+    if parts.netloc.lower() != rebuilt or (":" in host and not _is_ip(host)):
+        raise FatalConfig("%s %r: the host part must be exactly host[:port] (an IPv6 address in brackets)"
+                          % (source, base))
     if scheme == "http" and host not in _LOOPBACK_HOSTS:
         raise FatalConfig("%s %r refused: plain http is allowed only for localhost, 127.0.0.1 or [::1], because "
                           "every request carries your API token and http would send it unencrypted to %s - "
                           "use https://" % (source, base, host))
     return "%s://%s%s" % (scheme, parts.netloc.lower(), parts.path.rstrip("/"))
+
+
+def _is_ip(text):
+    try:
+        ipaddress.ip_address(text)
+        return True
+    except ValueError:
+        return False
 
 
 def resolve_api_base(flag_value, environ=None):
@@ -227,7 +244,13 @@ def build_opener(pinned_ip):
         def https_open(self, req):
             return self.do_open(lambda h, **kw: _PinnedHTTPSConnection(h, pinned_ip=pinned_ip, **kw), req)
 
-    return urllib.request.build_opener(_NoRedirect, _PinnedHTTPHandler, _PinnedHTTPSHandler)
+    # ProxyHandler({}) - NO environment proxies (review F1). urllib's default ProxyHandler reads HTTP(S)_PROXY /
+    # ALL_PROXY and swaps the request's host:port for the proxy's, but the connection still goes to the address
+    # pinned from the API host - so with a proxy set, the token-bearing request went to <API address>:<proxy
+    # port>, i.e. whatever listens on that local port. A proxy can never have worked with the pin, so nothing
+    # depended on it; refusing it outright is the only consistent choice.
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect, _PinnedHTTPHandler,
+                                       _PinnedHTTPSHandler)
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -1362,7 +1385,7 @@ class Emitter:
             keymap = {
                 "id": "KIJITOMON_ID", "from": "KIJITOMON_FROM", "content": "KIJITOMON_CONTENT",
                 "created": "KIJITOMON_CREATED", "cursor": "KIJITOMON_CURSOR",
-                "persona": "KIJITOMON_PERSONA",
+                "persona": "KIJITOMON_PERSONA", "api_base": "KIJITOMON_API_BASE",
                 "reason": "KIJITOMON_REASON", "consecutive_failures": "KIJITOMON_FAILURES",
                  "seconds": "KIJITOMON_SECONDS", "floor_seconds": "KIJITOMON_FLOOR_SECONDS",
                 "seeded": "KIJITOMON_SEEDED", "current_max": "KIJITOMON_CURRENT_MAX",
@@ -2111,12 +2134,36 @@ def persona_url(persona):
     return "%s?persona=%s&mark_read=false" % (INBOX_URL, urllib.parse.quote(persona))
 
 
-def make_opener_for(url):
+def pin_for(url):
+    """The addresses a connection to `url` may use: resolved once, and for plain http ONLY loopback ones.
+
+    The http allowance (normalize_api_base) is granted to the NAMES localhost / 127.0.0.1 / ::1, but what is
+    connected to is whatever the resolver returned (review F2). A host with no hosts-file entry for localhost
+    can fall through to DNS and get a remote address, and the token would then cross the network in the clear.
+    So for http the resolution itself must be loopback; if nothing loopback remains, refuse to start.
+    """
     p = urllib.parse.urlsplit(url)
     host = p.hostname or ""
     port = p.port or (443 if p.scheme == "https" else 80)
     pinned = resolve_and_pin(host, port)
-    return build_opener(pinned)
+    if p.scheme == "http":
+        loopback = tuple(a for a in pinned if _is_loopback_address(a))
+        if not loopback:
+            raise FatalConfig("refusing plain http to %r: it resolved to %s, which is not this machine - the API "
+                              "token would cross the network unencrypted" % (host, ", ".join(pinned) or "nothing"))
+        pinned = loopback
+    return pinned
+
+
+def _is_loopback_address(addr):
+    try:
+        return ipaddress.ip_address(addr.split("%", 1)[0]).is_loopback
+    except ValueError:
+        return False
+
+
+def make_opener_for(url):
+    return build_opener(pin_for(url))
 
 
 def _persona_path(template, persona):
@@ -2874,7 +2921,7 @@ class WatchTarget:
                 if diag:
                     self.lifecycle(diag[0], **diag[1])
                 if do_arm:
-                    self.lifecycle("armed", cursor=self.cursor)
+                    self.lifecycle("armed", cursor=self.cursor, api_base=KIJITO_BASE)
                 # §5.1 A BOUNDED WINDOW MUST NOT SILENTLY SWALLOW MAIL.
                 # The server returns the NEWEST messages that fit, and declares what it left out. If it
                 # omitted anything AND the window does not reach back to our cursor, un-emitted mail can
@@ -3171,7 +3218,7 @@ class WatchTarget:
             self.last_newest = _newest_unread(self.unread_persona)
 
         if args.heartbeat and (_monotonic() - self.last_heartbeat) >= args.heartbeat:
-            self.lifecycle("heartbeat", cursor=self.cursor)
+            self.lifecycle("heartbeat", cursor=self.cursor, api_base=KIJITO_BASE)
             self.last_heartbeat = _monotonic()
 
         self.first_poll = False

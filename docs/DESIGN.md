@@ -703,8 +703,13 @@ read-state-neutral (DONE-WHEN #5 holds after self-test).
   than re-implementing it): `http(s)://host[:port][/path]` only - no user, query or fragment, and no character a
   supervisor file would interpret (`%`, `$`, `&`, `<`, whitespace); a trailing slash is dropped; **plain http only
   for `localhost`, `127.0.0.1`, `[::1]`**, because the bearer token rides on every request. A refused base exits
-  before any resolution or request. A different base is a different state-file identity (§7.3), so a cursor is
-  never resumed against another server.
+  before any resolution or request. For plain http the RESOLUTION must agree with the name: non-loopback
+  addresses are dropped from the pin, and none left is fatal at startup (`pin_for`). The netloc must rebuild
+  exactly as `host[:port]` (3.9's urlsplit accepts bracket forms 3.11+ rejects). A different base is a different
+  state-file identity (§7.3), so a cursor is never resumed against another server. `armed` and `heartbeat` carry
+  `api_base`, so a producer moved by an inherited supervisor `$KIJITO_BASE` is visible in its own stream.
+- **No environment proxies.** The opener installs `ProxyHandler({})`: a proxy swaps the request's host:port but
+  the pinned socket still dials the API address, so the token would reach `<API address>:<proxy port>`.
 - Two hardenings remain as defense-in-depth: **(IP-pin)**
   resolve the host once and pin the connection to the addresses that resolution returned, tried in order - no
   re-resolve at connect time, so no TOCTOU (`_PinnedHTTPSConnection` connects to a pinned IP while verifying the

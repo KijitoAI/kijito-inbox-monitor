@@ -396,7 +396,8 @@ class _RecordingKijito:
 
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
         self.port = self.server.server_address[1]
-        t = threading.Thread(target=self.server.serve_forever, daemon=True)
+        # poll_interval: shutdown() waits up to one interval, and the default 0.5 s per server dominated the suite.
+        t = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
         t.start()
         testcase.addCleanup(self.server.server_close)
         testcase.addCleanup(self.server.shutdown)
@@ -505,9 +506,13 @@ class ApiBaseTest(unittest.TestCase):
         self.assertEqual(km._connect_pinned(None, "h", 1, 5), "sock:h")
 
     # ---- the producer, end to end, as a real process --------------------------------------------------
-    def _env(self, **extra):
-        env = {k: v for k, v in os.environ.items() if k != "KIJITO_BASE"}
-        env["KIJITOMON_TOKEN"] = "m486-test-token"
+    def _env(self, token=True, **extra):
+        """The child's environment. token=False for every spawn that is not meant to reach a server
+        (`--print-api-base`, the render and arm helpers): with no token a regression that fell through to the
+        watcher stops at build_headers, before any resolution - it cannot send anything anywhere (review F4)."""
+        env = {k: v for k, v in os.environ.items() if k not in ("KIJITO_BASE", "KIJITOMON_TOKEN")}
+        if token:
+            env["KIJITOMON_TOKEN"] = "m486-test-token"
         env["PYTHONWARNINGS"] = "default"
         env.update(extra)
         return env
@@ -568,14 +573,25 @@ class ApiBaseTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(srv.requests)
 
-    def test_the_watch_loop_long_polls_the_configured_base(self):
+    def test_the_watch_loop_long_polls_the_configured_base_and_says_so_in_its_events(self):
         srv = _RecordingKijito(self)
-        p = subprocess.Popen(self._producer(["--persona", "alice", "--api-base", "http://127.0.0.1:%d" % srv.port,
-                                             "--poll-seconds", "1", "--wait", "1"]),
+        d = tempfile.mkdtemp()
+        events_path = os.path.join(d, "events.ndjson")
+        base = "http://127.0.0.1:%d" % srv.port
+        p = subprocess.Popen(self._producer(["--persona", "alice", "--api-base", base, "--poll-seconds", "1",
+                                             "--wait", "1", "--heartbeat", "1", "--events-file", events_path]),
                              cwd=self.HERE, env=self._env(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                              text=True)
+        events = []
         try:
             self.assertTrue(srv.seen.wait(30), "the producer never reached /api/notify/pending on the base")
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if os.path.exists(events_path):
+                    events = [json.loads(l) for l in read_file(events_path).splitlines() if l.strip()]
+                    if any(e["event"] == "heartbeat" for e in events):
+                        break
+                time.sleep(0.2)
         finally:
             p.terminate()
             try:
@@ -586,6 +602,15 @@ class ApiBaseTest(unittest.TestCase):
         pending = [q["path"] for q in srv.requests if q["path"].startswith("/api/notify/pending")]
         self.assertTrue(pending)
         self.assertIn("wait=1", pending[0])
+        # Review F3: the base the producer is ACTUALLY watching is on the record, so fleet tooling reading the
+        # stream can see a producer that an inherited $KIJITO_BASE moved somewhere unexpected.
+        by_kind = {}
+        for e in events:
+            by_kind.setdefault(e["event"], e)
+        self.assertIn("armed", by_kind, events)
+        self.assertIn("heartbeat", by_kind, events)
+        self.assertEqual(by_kind["armed"].get("api_base"), base)
+        self.assertEqual(by_kind["heartbeat"].get("api_base"), base)
 
     def test_plain_http_to_a_remote_host_exits_before_any_request(self):
         def no_network(*a, **kw):
@@ -605,19 +630,79 @@ class ApiBaseTest(unittest.TestCase):
 
     def test_print_api_base(self):
         exe = [sys.executable, os.path.join(self.HERE, "kijito_inbox_monitor.py"), "--print-api-base"]
-        r = subprocess.run(exe, env=self._env(), capture_output=True, text=True, timeout=60)
+        r = subprocess.run(exe, env=self._env(token=False), capture_output=True, text=True, timeout=60)
         self.assertEqual((r.returncode, r.stdout), (0, "https://api.kijito.ai\n"))
-        r = subprocess.run(exe, env=self._env(KIJITO_BASE="http://127.0.0.1:7474/"), capture_output=True,
+        r = subprocess.run(exe, env=self._env(token=False, KIJITO_BASE="http://127.0.0.1:7474/"), capture_output=True,
                            text=True, timeout=60)
         self.assertEqual((r.returncode, r.stdout), (0, "http://127.0.0.1:7474\n"))
-        r = subprocess.run(exe + ["--api-base", "http://kijito.example.com"], env=self._env(),
+        r = subprocess.run(exe + ["--api-base", "http://kijito.example.com"], env=self._env(token=False),
                            capture_output=True, text=True, timeout=60)
         self.assertEqual((r.returncode, r.stdout), (2, ""))
+
+    def test_environment_proxies_cannot_take_the_request_or_the_token(self):
+        # Review F1. urllib's default ProxyHandler would swap in the proxy's host:port while the pinned
+        # connection still dialled the API's address - i.e. <API address>:<proxy port>, whatever listens there.
+        api, proxy = _RecordingKijito(self), _RecordingKijito(self)
+        url = "http://127.0.0.1:%d" % proxy.port
+        env = self._env(**{k: url for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                                            "http_proxy", "https_proxy", "all_proxy")})
+        for k in ("NO_PROXY", "no_proxy"):
+            env.pop(k, None)
+        r = self._self_test(["--persona", "alice", "--api-base", "http://127.0.0.1:%d" % api.port], env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(api.requests, "the configured base must receive the poll")
+        self.assertEqual(proxy.requests, [], "nothing - and so no token - may reach the proxy port")
+
+    def _stub_resolver(self, answers):
+        real = km.socket.getaddrinfo
+        km.socket.getaddrinfo = lambda host, port, *a, **kw: [(0, 0, 0, "", (ip, port)) for ip in answers[host]]
+        self.addCleanup(setattr, km.socket, "getaddrinfo", real)
+
+    def test_plain_http_keeps_only_loopback_addresses(self):
+        # Review F2: the http allowance is granted to the NAME; the resolution must agree with it.
+        self._stub_resolver({"localhost": ["10.0.0.5", "127.0.0.1", "::1"], "api.example.com": ["10.0.0.5"]})
+        self.assertEqual(km.pin_for("http://localhost:7474/api/inbox"), ("127.0.0.1", "::1"))
+        self.assertEqual(km.pin_for("https://api.example.com/api/inbox"), ("10.0.0.5",), "https is not filtered")
+
+    def test_plain_http_with_no_loopback_address_refuses_to_start(self):
+        self._stub_resolver({"localhost": ["10.0.0.5"]})
+        with self.assertRaises(km.FatalConfig) as cm:
+            km.pin_for("http://localhost:7474/api/personas")
+        self.assertIn("not this machine", str(cm.exception))
+        saved = os.environ.get("KIJITOMON_TOKEN")
+        os.environ["KIJITOMON_TOKEN"] = "t"
+        self.addCleanup(lambda: os.environ.pop("KIJITOMON_TOKEN") if saved is None
+                        else os.environ.__setitem__("KIJITOMON_TOKEN", saved))
+        err = _capture_stderr(self)
+        self.assertEqual(km.main(["--persona", "alice", "--api-base", "http://localhost:7474"]), 2)
+        self.assertIn("not this machine", err.getvalue())
+
+    def test_the_host_part_must_parse_cleanly_on_every_python(self):
+        # Review N1: 3.9's urlsplit extracts a hostname from these; 3.11+ refuses them. One meaning everywhere.
+        for raw in ("http://[::1]evil.com", "http://[::1]x:80", "http://[127.0.0.1]", "http://[localhost]",
+                    "https://[::1]]", "http://[v1.x]", "http://localhost:", "https://api.kijito.ai:"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(km.FatalConfig):
+                    km.normalize_api_base(raw)
+        self.assertEqual(km.normalize_api_base("https://[2001:db8::1]:8443/"), "https://[2001:db8::1]:8443")
+
+    def test_the_base_reaches_an_exec_consumer(self):
+        captured = {}
+        real = km.subprocess.run
+
+        def fake(*a, **k):
+            captured.update(k.get("env") or {})
+            return km.subprocess.CompletedProcess(args=a[0] if a else "", returncode=0)
+        km.subprocess.run = fake
+        self.addCleanup(setattr, km.subprocess, "run", real)
+        km.Emitter("exec-per-event", "true", 220, False).emit(
+            {"event": "heartbeat", "source": "kijito-inbox", "ts": "t", "cursor": 1, "api_base": "http://[::1]:7474"})
+        self.assertEqual(captured["KIJITOMON_API_BASE"], "http://[::1]:7474")
 
     # ---- the setup helpers ---------------------------------------------------------------------------
     def _render(self, argv, **env):
         return subprocess.run(["sh", os.path.join(self.HERE, "scripts", "render-service.sh")] + argv,
-                              env=self._env(**env), capture_output=True, timeout=60)
+                              env=self._env(token=False, **env), capture_output=True, timeout=60)
 
     LAUNCHD = ["launchd", "--python", "/usr/bin/python3", "--program", "/opt/kim/kijito_inbox_monitor.py",
                "--home", "/HOMEDIR"]
@@ -690,7 +775,8 @@ class ApiBaseTest(unittest.TestCase):
 
     def test_arm_hive_monitor_passes_the_env_base_through(self):
         r = subprocess.run(["sh", os.path.join(self.HERE, "arm-hive-monitor.sh"), "--print-api-base"],
-                           env=self._env(KIJITO_BASE="http://127.0.0.1:7474/"), capture_output=True, text=True,
+                           env=self._env(token=False, KIJITO_BASE="http://127.0.0.1:7474/"), capture_output=True,
+                           text=True,
                            timeout=60)
         self.assertEqual((r.returncode, r.stdout), (0, "http://127.0.0.1:7474\n"), r.stderr)
 
@@ -5178,6 +5264,7 @@ class RetryAfterPacingTest(unittest.TestCase):
         body = io.BytesIO(json.dumps({"error": "edge_bad_gateway", "retry_after_seconds": 10}).encode())
         err = urllib.error.HTTPError(km.NOTIFY_PENDING_URL, 502, "Bad Gateway",
                                      email.message.Message(), body)
+        self.addCleanup(err.close)   # an HTTPError owns its body; leaving it to the GC is a ResourceWarning
         err.headers["Retry-After"] = "12"
         available, counts, cursor = km.fetch_unread_counts_longpoll(FakeOpener(exc=err), {}, 50, "keep")
         self.assertEqual((available, counts, cursor), (False, {}, "keep"))

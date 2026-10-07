@@ -9,8 +9,11 @@
 #             template's header documents. Write it to ~/Library/LaunchAgents/com.kijito.inbox-monitor.plist.
 #   systemd   kijito-inbox-monitor@.service.template. Write it to ~/.config/systemd/user/kijito-inbox-monitor@.service.
 #
-# THE API BASE (row M486). A supervisor does not run your shell, so an exported $KIJITO_BASE never reaches the
-# service. This script resolves the base the way the producer does (--api-base, else $KIJITO_BASE, else
+# THE API BASE (row M486). A supervisor does not run your shell, so a $KIJITO_BASE exported there does not
+# reach the service - but the supervisor's OWN environment does (launchctl setenv; systemctl --user
+# set-environment / import-environment, dbus-update-activation-environment, ~/.config/environment.d), and a
+# service rendered without --api-base reads $KIJITO_BASE from it. Writing the base into the definition pins it.
+# This script resolves the base the way the producer does (--api-base, else $KIJITO_BASE, else
 # https://api.kijito.ai), validates it WITH the producer (`--print-api-base`, the one place the rule lives),
 # and writes `--api-base URL` into the definition's command line so the running service uses it.
 # For the default base nothing is added: the output is byte-for-byte what the template rendered before this
