@@ -21,12 +21,14 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 - For the server's account check it sends the SHA-256 of every key it finds on the machine (key files, the MCP
   client configs of Claude Code, Codex and OpenCode, and key-shaped environment values), at most 32, and never
   a key or an `Authorization` header. A key file that is not 0600, or a symlink, stops the run.
+- The legacy key files are one glob, `~/.claude/.kijito_api_token*`, as the README says: a renamed or backed-up
+  copy such as `.kijito_api_token-old` is hashed too, not only the bare file and its `.<name>` siblings.
 - An interrupt, SIGTERM or SIGHUP during `--redeem-key` still prints an outcome and cleans up; once the key is
   in place the outcome is read from the disk, so a saved key is never reported lost. A server that does not
   offer pickup answers `PICKUP_UNAVAILABLE` (exit 7: nothing collected; revoke the minted key and ask for it
   with delivery="inline").
 - `scripts/mutation-check.py` accepts the multi-part `(label, [(pattern, replacement), ...])` form its docstring
-  already described, and gains 60 `M488-*` mutants, one per defence.
+  already described, and gains 61 `M488-*` mutants, one per defence.
 
 ## [0.5.15] - 2026-10-07
 
