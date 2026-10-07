@@ -3,6 +3,31 @@
 All notable changes to kijito-inbox-monitor are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [Unreleased]
+
+### Added
+- **`--redeem-key`: one-time key pickup (row M488).** A key minted with `delivery="pickup"` is never shown to the
+  agent; the reply carries a single-use code, and `printf '%s\n' '<code>' | kijito-inbox-monitor --redeem-key
+  --kind watcher|rest` collects the key over TLS and writes it to its key file (0600, in a 0700 directory). The
+  key never appears in an argv, a prompt or any output; the helper prints one `KEY_SAVED file=... mode=0600
+  prefix=... scopes=... account=... verified=yes` line. Exit codes 0 and 2 to 8 are documented in the README.
+- It talks only to `https://api.kijito.ai`, or to a base the human wrote into the owner-only
+  `~/.config/kijito-inbox-monitor/api_base` (loopback included; a flag or `$KIJITO_BASE` alone is refused), and
+  only with a code whose host matches that base. On Windows only the default base is accepted.
+- It writes only the canonical key files (`~/.config/kijito-inbox-monitor/token`, `~/.config/kijito/api_token`)
+  or a per-persona `token.<persona>`; never over an existing key without `--replace` or a matching
+  `--replace-prefix`; a target that changes during the redeem leaves the key in an owner-only temp file
+  (`KEY_PARKED`). Paths come from the account's passwd entry, and a disagreeing `$HOME` stops the run.
+- For the server's account check it sends the SHA-256 of every key it finds on the machine (key files, the MCP
+  client configs of Claude Code, Codex and OpenCode, and key-shaped environment values), at most 32, and never
+  a key or an `Authorization` header. A key file that is not 0600, or a symlink, stops the run.
+- An interrupt, SIGTERM or SIGHUP during `--redeem-key` still prints an outcome and cleans up; once the key is
+  in place the outcome is read from the disk, so a saved key is never reported lost. A server that does not
+  offer pickup answers `PICKUP_UNAVAILABLE` (exit 7: nothing collected; revoke the minted key and ask for it
+  with delivery="inline").
+- `scripts/mutation-check.py` accepts the multi-part `(label, [(pattern, replacement), ...])` form its docstring
+  already described, and gains 60 `M488-*` mutants, one per defence.
+
 ## [0.5.15] - 2026-10-07
 
 ### Added
