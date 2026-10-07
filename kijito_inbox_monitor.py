@@ -16,12 +16,15 @@ import argparse
 import datetime
 import email.utils
 import errno
+import getpass
+import glob
 import hashlib
 import http.client
 import ipaddress
 import json
 import math
 import os
+import re
 import select
 import signal
 import socket
@@ -42,6 +45,10 @@ try:
     import msvcrt  # Windows only: the single-writer lock there (StateFile.lock)
 except ImportError:
     msvcrt = None
+try:
+    import pwd  # POSIX only: the account's home directory for --redeem-key (row M488)
+except ImportError:  # pragma: no cover - Windows
+    pwd = None
 
 __version__ = "0.5.15"
 SOURCE = "kijito-inbox"
@@ -73,6 +80,10 @@ IS_POSIX = os.name == "posix"
 # --------------------------------------------------------------------------------------------------------------------
 class FatalConfig(Exception):
     """A fatal startup/config error → exit non-zero (NOT a per-poll liveness failure)."""
+
+
+class ResolveFailed(FatalConfig):
+    """The API host did not resolve. A FatalConfig for the watcher; for --redeem-key it means nothing was sent."""
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -192,7 +203,7 @@ def resolve_and_pin(host, port):
     try:
         infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
     except socket.gaierror as e:
-        raise FatalConfig("cannot resolve host %r: %s" % (host, e))
+        raise ResolveFailed("cannot resolve host %r: %s" % (host, e))
     return tuple(dict.fromkeys(info[4][0] for info in infos))
 
 
@@ -4021,6 +4032,952 @@ def run(args):
 
 
 # --------------------------------------------------------------------------------------------------------------------
+# One-time key pickup (row M488): --redeem-key
+# --------------------------------------------------------------------------------------------------------------------
+# A key minted with delivery="pickup" is never shown to the agent. The reply carries a single-use pickup code
+# (kpc_<32>@host[:port], dead after one redeem or 10 minutes); this mode collects the key over TLS and writes it
+# straight to the key file, so the key never passes through a conversation, an argv, a prompt or any output.
+#
+# What it refuses, and why (each is a test in RedeemKey* and a mutant in scripts/mutation-check.py):
+#   * any API base but https://api.kijito.ai, unless the human wrote that exact base into an owner-only
+#     ~/.config/kijito-inbox-monitor/api_base. A flag or an environment value alone is never enough: under prompt
+#     injection both the code's host and --api-base are attacker-written, and a fake server would hand back the
+#     attacker's key. Loopback is not exempt (an injected command can start a local fake server too).
+#   * a code whose host is not the base's host[:port] (exit 3), before anything is sent.
+#   * any target but the canonical key files (or a per-persona watcher file), so a key cannot be routed into a
+#     workspace; a wider (rest) key never goes into the read-only watcher file.
+#   * an occupied target without --replace, or --replace-prefix naming a key that is not there.
+# What it sends: the code, the kind, the optional expected account, and the SHA-256 of every key already on this
+# machine that it can find (KEY_LOCATIONS, MCP client configs, key-shaped environment values) - never a key, and
+# never an Authorization header, so even a server that should not have been reached receives nothing usable.
+# The server refuses (and burns) a code of another account than those keys belong to.
+
+REDEEM_TIMEOUT = 60                       # one redeem round trip; no automatic retry, ever
+REDEEM_PATH = "/api/auth/key-pickup"
+VERIFY_PATH = "/api/auth/me?probe=1"      # a read with no write path
+PICKUP_CODE_ENV = "KIJITO_PICKUP_CODE"    # fallback when stdin carries no code
+WATCHER_KEY_FILE = ".config/kijito-inbox-monitor/token"   # read-only (memory.read) keys; relative to home
+REST_KEY_FILE = ".config/kijito/api_token"                 # every other key
+API_BASE_FILE = ".config/kijito-inbox-monitor/api_base"    # a non-default base the HUMAN allowed
+# THE ONE PLACE this helper learns where keys live (plan §3.3 step 4). Ordered: the current files first, so the
+# hashes that survive the cap are the ones most likely to matter. Each pattern's matches are sorted by name.
+# The helper's own temps are `.<name>.<rand>.tmp` dot-files and match none of these.
+KEY_LOCATIONS = (
+    ".config/kijito-inbox-monitor/token",
+    ".config/kijito/api_token",
+    ".config/kijito-inbox-monitor/token.*",
+    ".config/kijito/api_token*",
+    ".claude/.kijito_api_token",
+    ".claude/.kijito_api_token.*",
+)
+# MCP client configs, regex-scanned (never parsed) for key-shaped header or env values. Best effort: a config
+# that cannot be read safely is skipped with a warning, never a refusal. Home first, then the working directory.
+MCP_CONFIGS_HOME = (".claude.json", ".claude/settings.json", ".codex/config.toml",
+                    ".config/opencode/opencode.json", ".config/opencode/opencode.jsonc")
+MCP_CONFIGS_CWD = (".mcp.json", ".claude/settings.json", ".claude/settings.local.json", ".codex/config.toml")
+MAX_PRESENTED_KEY_HASHES = 32             # the server's own cap; one indexed lookup each
+MCP_CONFIG_MAX_BYTES = 1 << 20
+PRIVATE_READ_MAX_BYTES = 1 << 20          # a key or api_base file larger than this is not one
+REDEEM_BODY_MAX_BYTES = 1 << 20
+
+_KEY_IN_TEXT = re.compile(r"kjt_[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])")
+_KEY_WHOLE = re.compile(r"kjt_[A-Za-z0-9_-]{43}")
+_SERVED_KEY = re.compile(r"kjt_[A-Za-z0-9_-]{20,256}")   # what a 200 may carry (shape-checked, never printed)
+_PICKUP_CODE = re.compile(r"kpc_[0-9A-HJKMNP-TV-Z]{32}@(?:[a-z0-9.\-]{1,253}|\[[0-9a-f:.]{2,45}\])(?::[0-9]{1,5})?")
+_ACCOUNT_FP = re.compile(r"acct_[0-9a-f]{16}")
+_REPLACE_PREFIX = re.compile(r"kjt_[A-Za-z0-9_-]{8,43}")
+_SAFE_FIELD = re.compile(r"[A-Za-z0-9_.:@-]{1,64}")
+# The stat module defines these only on Windows builds; the values are the documented Windows constants.
+IO_REPARSE_TAG_SYMLINK = getattr(stat, "IO_REPARSE_TAG_SYMLINK", 0xA000000C)
+IO_REPARSE_TAG_MOUNT_POINT = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
+
+REDEEM_EXIT_SAVED = 0
+REDEEM_EXIT_USAGE = 2       # usage / config / base not allowed / target / insecure key file / 400; nothing sent
+REDEEM_EXIT_WRONG_HOST = 3  # the code is for another server; nothing sent
+REDEEM_EXIT_REFUSED = 4     # a definite refusal (PICKUP_*)
+REDEEM_EXIT_LOST = 5        # collected, could not be saved: revoke it
+REDEEM_EXIT_RETRY = 6       # nothing was consumed: rerun the same command
+REDEEM_EXIT_AMBIGUOUS = 7   # sent, no usable answer: the key may be collected; revoke and mint again
+REDEEM_EXIT_PARKED = 8      # saved, but at the temp path it prints (the target changed under us)
+
+# Body `code` -> the definite refusals (exit 4). Branch on the code, never on the status or on JSON-ness.
+_PICKUP_REFUSALS = {
+    "not_found": "PICKUP_NOT_FOUND",
+    "pickup_expired": "PICKUP_EXPIRED",
+    "pickup_used": "PICKUP_USED",
+    "pickup_wrong_account": "PICKUP_WRONG_ACCOUNT",
+    "pickup_wrong_kind": "PICKUP_WRONG_KIND",
+    "pickup_unsealable": "PICKUP_FAILED",
+}
+# Answered before the daemon saw the request (or a quota): nothing was consumed, the same command can be rerun.
+# edge_gateway_timeout is connect-only (Cloudflare's 524 fires first for a slow daemon). edge_bad_gateway is NOT
+# here: an nginx 502 also covers an upstream that closed after receiving the request, i.e. maybe after a commit.
+_PICKUP_RETRY_CODES = frozenset({"rate_limited", "edge_request_too_large", "edge_rate_limited",
+                                 "edge_internal_error", "edge_unavailable", "edge_gateway_timeout"})
+_LINK_FALLBACK_ERRNOS = frozenset(e for e in (getattr(errno, "EPERM", None), getattr(errno, "ENOTSUP", None),
+                                              getattr(errno, "EOPNOTSUPP", None), getattr(errno, "EXDEV", None))
+                                  if e is not None)
+
+_REVOKE_HINT = 'kijito_api_key(action="revoke", token_id="<the key id in the reply>")'
+_MESSAGES = {
+    "PICKUP_NOT_FOUND": "no such pickup code. Retry with the exact code from the reply; otherwise revoke the key "
+                        "(%s) and create a new one." % _REVOKE_HINT,
+    "PICKUP_EXPIRED": "the code expired or was cancelled, and its key is already revoked. Create a new key.",
+    "PICKUP_USED": "this code was already collected. If you did not collect it, someone else did: revoke the key "
+                   "now (%s) and tell the user. If an earlier run printed PICKUP_RETRY_LATER, revoke it and "
+                   "create a new key." % _REVOKE_HINT,
+    "PICKUP_WRONG_ACCOUNT": "the code belongs to a different Kijito account than the keys already on this machine "
+                            "(or than --expect-account); the server revoked that key. Tell the user which "
+                            "sources are listed below. For a key of a second account use the web account page "
+                            "or delivery=\"inline\".",
+    "PICKUP_WRONG_KIND": "the server expects this key in the other key file. Nothing was used up: rerun the exact "
+                         "command from the reply unchanged; if it repeats, tell the user.",
+    "PICKUP_FAILED": "the server could not recover the key and revoked it. Create a new key.",
+    "PICKUP_RETRY_LATER": "nothing was collected. Rerun the same command before the code expires.",
+    "PICKUP_AMBIGUOUS": "the request was sent but no usable answer came back, so the key may have been collected. "
+                        "Do not retry: revoke the key (%s) and create a new one." % _REVOKE_HINT,
+}
+
+
+class RedeemExit(Exception):
+    """A terminal outcome of --redeem-key: an exit code, a machine token (first word of the stdout line), a human
+    explanation for stderr, and key=value fields. Nothing in here may ever carry a key, a code or a body."""
+
+    def __init__(self, code, token, message, **fields):
+        super().__init__(token)
+        self.code = code
+        self.token = token
+        self.message = message
+        self.fields = fields
+
+
+def _redeem_environ():
+    """The environment --redeem-key reads ($HOME, $KIJITO_BASE, the code fallback, the key scan). A seam."""
+    return os.environ
+
+
+def _redeem_cwd():
+    """The working directory whose project-level MCP configs are scanned. A seam."""
+    return os.getcwd()
+
+
+def _redeem_stdin():
+    return sys.stdin
+
+
+def _lstat(path):
+    return os.lstat(path)
+
+
+def _is_link(st):
+    """A symlink, or on Windows a symlink or junction reparse point (not every reparse point: a OneDrive
+    placeholder is a reparse point too and must still read). Checked with lstat BEFORE every open, because
+    Windows has no O_NOFOLLOW; where O_NOFOLLOW exists it stays as the race-free second check."""
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    return getattr(st, "st_reparse_tag", 0) in (IO_REPARSE_TAG_SYMLINK, IO_REPARSE_TAG_MOUNT_POINT)
+
+
+def _ro_flags():
+    return (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_BINARY", 0))
+
+
+def _check_private_fd(fd, path):
+    """CHECK-ONLY twin of _assert_private_fd: a regular file, owned by us, mode exactly 0600, else InsecureFile.
+
+    It never fchmods. _assert_private_fd TIGHTENS a wrong mode, which is right for a file we are about to write
+    mail into and wrong for a key file we are only reading: a 0644 key has already been readable by other users,
+    and quietly fixing it would hide that from the person who has to rotate it. Off POSIX only the regular-file
+    check applies (Windows has no owner or mode bits; access there is the profile's ACL)."""
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise InsecureFile("%s is not a regular file" % path)
+    if not IS_POSIX:
+        return st
+    if st.st_uid != os.geteuid():
+        raise InsecureFile("%s is owned by uid %d, not by you (uid %d)" % (path, st.st_uid, os.geteuid()))
+    if st.st_mode & 0o777 != PRIVATE_FILE_MODE:
+        raise InsecureFile("%s has mode %o, not 0600 - run: chmod 600 %s" % (path, st.st_mode & 0o777, path))
+    return st
+
+
+def _read_private(path, limit=PRIVATE_READ_MAX_BYTES):
+    """Read an owner-only file without changing it. FileNotFoundError when absent; InsecureFile for a symlink,
+    anything not a regular file (a FIFO cannot hang us: O_NONBLOCK), another owner, a mode other than 0600, or
+    more than `limit` bytes."""
+    st = _lstat(path)
+    if _is_link(st):
+        raise InsecureFile("%s is a symbolic link - replace the symlink with the file itself" % path)
+    try:
+        fd = os.open(path, _ro_flags())
+    except FileNotFoundError:
+        raise
+    except OSError as e:
+        raise InsecureFile("cannot open %s: %s" % (path, e.strerror or type(e).__name__))
+    try:
+        _check_private_fd(fd, path)
+        chunks, size = [], 0
+        while size <= limit:
+            b = os.read(fd, 65536)
+            if not b:
+                break
+            chunks.append(b)
+            size += len(b)
+    finally:
+        os.close(fd)
+    if size > limit:
+        raise InsecureFile("%s is larger than %d bytes" % (path, limit))
+    return b"".join(chunks)
+
+
+def _write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        view = view[n:]
+
+
+def _passwd_home():
+    return pwd.getpwuid(os.geteuid()).pw_dir
+
+
+def _windows_home():
+    import pathlib
+    return str(pathlib.Path.home())
+
+
+def _windows_profile_dir():
+    """The profile folder from SHGetKnownFolderPath(FOLDERID_Profile): what Windows itself says the account's
+    home is, independent of %USERPROFILE% and %HOME%, which an injected command prefix can set."""
+    import ctypes
+    import uuid
+    from ctypes import wintypes
+    guid = (ctypes.c_ubyte * 16).from_buffer_copy(uuid.UUID("5E6C858F-0E22-4760-9AFE-EA3317B67173").bytes_le)
+    out = ctypes.c_wchar_p()
+    fn = ctypes.windll.shell32.SHGetKnownFolderPath
+    fn.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.HANDLE, ctypes.POINTER(ctypes.c_wchar_p)]
+    hr = fn(ctypes.byref(guid), 0, None, ctypes.byref(out))
+    try:
+        if hr != 0 or not out.value:
+            raise OSError("SHGetKnownFolderPath failed (0x%08x)" % (hr & 0xFFFFFFFF))
+        return out.value
+    finally:
+        ctypes.windll.ole32.CoTaskMemFree(ctypes.cast(out, ctypes.c_void_p))
+
+
+def _same_dir(a, b):
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
+def _redeem_home(environ):
+    """The account's home directory, which every path under --redeem-key is relative to.
+
+    POSIX: the passwd entry, NOT $HOME - an injected `HOME=/workspace ...` prefix must not move the canonical key
+    files or the api_base file. But the watcher and its start script find the key through $HOME, so a $HOME that
+    disagrees would save the key where nothing looks: refuse, naming both. (An unset HOME counts as agreeing.)
+    Windows: Path.home() must equal the profile folder Windows reports."""
+    if IS_POSIX:
+        try:
+            if pwd is None:
+                raise KeyError("no pwd module")
+            home = _passwd_home()
+        except KeyError:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED",
+                             "this account has no passwd entry (uid %d), so its home directory is unknown - "
+                             "run the helper as a user with a home directory" % os.geteuid(), reason="no_home")
+        if "HOME" in environ and not (environ["HOME"] and _same_dir(environ["HOME"], home)):
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED",
+                             "$HOME is %r but your account's home is %s - fix one, then rerun (the key must land "
+                             "where the watcher looks)" % (environ["HOME"], home), reason="home_mismatch")
+        return home
+    try:
+        home, profile = _windows_home(), _windows_profile_dir()
+    except Exception as e:
+        raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED",
+                         "cannot determine your profile folder (%s)" % type(e).__name__, reason="no_home")
+    if os.path.normcase(os.path.realpath(home)).casefold() != os.path.normcase(os.path.realpath(profile)).casefold():
+        raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED",
+                         "your home resolves to %s but your Windows profile folder is %s - fix USERPROFILE/HOME, "
+                         "then rerun" % (home, profile), reason="home_mismatch")
+    return home
+
+
+def _redeem_base_refusal(base, home):
+    """None when --redeem-key may talk to `base`, else why not. The default base is always allowed. Any other -
+    loopback included - only when it equals the normalised contents of the human-written, owner-only
+    ~/.config/kijito-inbox-monitor/api_base. Windows cannot check that file's owner or mode, so there only the
+    default base is allowed."""
+    if base == DEFAULT_API_BASE:
+        return None
+    if not IS_POSIX:
+        return ("a non-default server is not supported by --redeem-key on Windows; ask for the key with "
+                "delivery=\"inline\" instead")
+    path = os.path.join(home, API_BASE_FILE)
+    try:
+        raw = _read_private(path, 4096)
+    except FileNotFoundError:
+        return ("%s is not the default API base, and %s does not exist. If this is your own server, write its base "
+                "into that file yourself (one line, chmod 600) and rerun; an agent must not create it"
+                % (base, path))
+    except OSError as e:
+        return "%s cannot be trusted: %s" % (path, e)
+    try:
+        allowed = normalize_api_base(raw.decode("utf-8"), path)
+    except (FatalConfig, UnicodeDecodeError) as e:
+        return "%s does not hold a valid API base (%s)" % (path, type(e).__name__)
+    if allowed != base:
+        return "%s allows %s, not %s" % (path, allowed, base)
+    return None
+
+
+class _Redeem:
+    """One --redeem-key run. `phase` decides what an interrupt or an unexpected error means:
+    pre (nothing sent: exit 6) -> sent (no parsed answer: exit 7) -> parsed (key in memory: exit 5, or 8 once the
+    temp holds it) -> saved (the key is in place)."""
+
+    def __init__(self, args, environ, cwd, stdin):
+        self.args = args
+        self.environ = environ
+        self.cwd = cwd
+        self.stdin = stdin
+        self.phase = "pre"
+        self.tmp = None
+        self.tmp_fd = None
+        self.tmp_holds_key = False
+        self.parked = False
+        self.key_id = None
+        self.secret = None          # bytearray, zeroed when done
+        self.pinned = None
+        self.target = None
+        self.sources = []
+        self.project_only = False
+
+    # ---- steps --------------------------------------------------------------------------------------------
+    def run(self):
+        self._check_args()
+        self.home = _redeem_home(self.environ)
+        base = self._allowed_base()
+        code = self._read_code()
+        self._check_code(code, base)
+        if base != DEFAULT_API_BASE:
+            _redeem_say("redeeming against NON-DEFAULT API base %s" % base)
+        target, mode = self._preflight()
+        self.target = target
+        hashes = self._scan()
+        self._open_temp(target)
+        meta = self._post(base, code, hashes)
+        code = None
+        self._install(target, mode)
+        self.phase = "saved"
+        shown_mode = self._confirm_private(target)
+        verified, reason = self._verify(base, meta)
+        fields = [("file", target), ("mode", shown_mode), ("prefix", meta["prefix"]),
+                  ("scopes", ",".join(meta["scopes"]) or "none"), ("account", meta["account"] or "none"),
+                  ("verified", verified)]
+        if reason:
+            fields.append(("reason", reason))
+        _redeem_line("KEY_SAVED", fields)
+        if verified == "no":
+            _redeem_say("the key was saved, but checking it against %s failed (%s). The file is kept; if the "
+                        "reason is 'revoked', create a new key." % (base, reason))
+        return REDEEM_EXIT_SAVED
+
+    def _check_args(self):
+        a = self.args
+        if not a.kind:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "--redeem-key needs --kind watcher|rest (the "
+                             "command in the reply carries it)", reason="usage")
+        others = [f for f, on in (("--print-api-base", a.print_api_base), ("--safe-persona", a.safe_persona),
+                                  ("--check-activity", a.check_activity), ("--self-test", a.self_test),
+                                  ("--token-file-template", a.token_file_template)) if on]
+        if others:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "--redeem-key cannot be combined with %s"
+                             % ", ".join(others), reason="usage")
+        if a.replace and a.replace_prefix:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "--replace and --replace-prefix are mutually "
+                             "exclusive", reason="usage")
+        if a.replace_prefix is not None and not _REPLACE_PREFIX.fullmatch(a.replace_prefix):
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "--replace-prefix must be a key prefix such as "
+                             "kjt_AbCd1234", reason="usage")
+        if a.expect_account and not _ACCOUNT_FP.fullmatch(a.expect_account):
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "--expect-account must look like "
+                             "acct_<16 hex>", reason="usage")
+
+    def _allowed_base(self):
+        try:
+            base, _ = resolve_api_base(self.args.api_base, self.environ)
+        except FatalConfig as e:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "PICKUP_BASE_NOT_ALLOWED", str(e))
+        why = _redeem_base_refusal(base, self.home)
+        if why is not None:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "PICKUP_BASE_NOT_ALLOWED",
+                             "%s. Nothing was sent. Stop and tell the user." % why)
+        return base
+
+    def _read_code(self):
+        """stdin (first line) when it is not a terminal; a no-echo prompt on a terminal; $KIJITO_PICKUP_CODE as
+        the fallback. Never argv: a positional is a usage error, so the code is not in this process's argv."""
+        raw = ""
+        s = self.stdin
+        if s is not None:
+            try:
+                if s.isatty():
+                    raw = getpass.getpass("Kijito pickup code: ")
+                else:
+                    raw = s.readline(4096)
+            except (OSError, ValueError, EOFError):
+                raw = ""
+        if not (raw or "").strip():
+            raw = self.environ.get(PICKUP_CODE_ENV, "")
+        code = (raw or "").strip()
+        if not code:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "no pickup code: pipe it on stdin, e.g. "
+                             "printf '%%s\\n' 'kpc_...@host' | kijito-inbox-monitor --redeem-key --kind watcher",
+                             reason="no_code")
+        return code
+
+    def _check_code(self, code, base):
+        if not _PICKUP_CODE.fullmatch(code):
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "that is not a pickup code (kpc_<32 "
+                             "characters>@host); copy it exactly from the reply", reason="bad_code")
+        host = code.split("@", 1)[1]
+        want = urllib.parse.urlsplit(base).netloc.lower()
+        if host != want:
+            raise RedeemExit(REDEEM_EXIT_WRONG_HOST, "PICKUP_WRONG_HOST",
+                             "the code was issued by %s, but this helper talks to %s. Nothing was sent. Stop and "
+                             "tell the user." % (host, base), code_host=host)
+
+    def _preflight(self):
+        """Exactly one target, checked before anything is sent, so no later failure can lose the key."""
+        a = self.args
+        home = self.home
+        watcher = os.path.join(home, WATCHER_KEY_FILE)
+        rest = os.path.join(home, REST_KEY_FILE)
+        if a.token_file:
+            target = self._canonical_target(a.token_file, watcher, rest)
+        else:
+            target = watcher if a.kind == "watcher" else rest
+        if a.kind == "rest" and self._same_path(target, watcher):
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "--kind rest never writes the read-only watcher "
+                             "file %s (a wider key does not go there)" % watcher, reason="target")
+        parent = os.path.dirname(target)
+        _makedirs_private(parent)
+        target = os.path.join(os.path.realpath(parent), os.path.basename(target))
+        parent = os.path.dirname(target)
+        if IS_POSIX:
+            st = os.stat(parent)
+            if (st.st_mode & 0o022) and not (st.st_mode & stat.S_ISVTX):
+                raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED",
+                                 "%s is writable by other users (mode %o); another user could swap the key file "
+                                 "- run: chmod 700 %s" % (parent, st.st_mode & 0o777, parent),
+                                 reason="unsafe_dir", file=parent)
+        content = None
+        try:
+            content = _read_private(target).strip()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "%s. Nothing was sent." % e,
+                             reason="insecure_target", file=target)
+        if a.replace_prefix:
+            if not content or not content.startswith(a.replace_prefix.encode("ascii")):
+                raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED",
+                                 "%s no longer holds key %s - tell the user. Nothing was sent."
+                                 % (target, a.replace_prefix), reason="prefix_mismatch", file=target)
+            return target, "prefix"
+        if content:
+            if not a.replace:
+                hint = ""
+                if a.kind == "watcher" and self._same_path(target, watcher):
+                    hint = (" If it holds a different persona's key, pass --token-file "
+                            "~/.config/kijito-inbox-monitor/token.<persona> instead - never --replace.")
+                raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED",
+                                 "%s already holds a key. Nothing was sent; the code is still live.%s Replacing it "
+                                 "needs the user's OK and --replace." % (target, hint),
+                                 reason="target_exists", file=target)
+            return target, "replace"
+        if content is not None:
+            return target, ("replace" if a.replace else "empty")
+        return target, "absent"
+
+    def _canonical_target(self, given, watcher, rest):
+        home = self.home
+        p = given
+        if p == "~" or p.startswith("~/") or p.startswith("~" + os.sep):
+            p = home + p[1:]
+        else:
+            for prefix in ("$HOME", "${HOME}"):
+                if p == prefix or p.startswith(prefix + "/") or p.startswith(prefix + os.sep):
+                    p = home + p[len(prefix):]
+                    break
+        p = os.path.join(self.cwd, p)
+        if self._same_path(p, watcher) or self._same_path(p, rest):
+            return p
+        name = os.path.basename(p)
+        if self.args.kind == "watcher" and _same_dir(os.path.dirname(p), os.path.dirname(watcher)) \
+                and name.startswith("token."):
+            persona = name[len("token."):]
+            if persona and _state_safe_persona(persona) == persona:
+                return p
+        raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED",
+                         "--token-file must be %s or %s (or, for --kind watcher, %s.<persona> with the name "
+                         "--safe-persona prints); %s is none of these. Nothing was sent."
+                         % (watcher, rest, watcher, given), reason="target")
+
+    @staticmethod
+    def _same_path(a, b):
+        return (os.path.normcase(os.path.basename(a)) == os.path.normcase(os.path.basename(b))
+                and _same_dir(os.path.dirname(a), os.path.dirname(b)))
+
+    def _scan(self):
+        """Every key already on this machine that we can find, as sha256 hex (the server's own lookup form).
+        A KEY_LOCATIONS file that is a symlink, not 0600, someone else's or unreadable stops the run (exit 2):
+        those are key files, and silently skipping one would silently weaken the account check."""
+        home = self.home
+        hashes = {}          # hash -> [source label, ...] in discovery order
+        project = set()      # labels that are working-directory files
+        seen = set()
+
+        def add(raw, label):
+            h = hashlib.sha256(raw).hexdigest()
+            hashes.setdefault(h, [])
+            if label not in hashes[h]:
+                hashes[h].append(label)
+
+        for pattern in KEY_LOCATIONS:
+            for path in sorted(glob.glob(os.path.join(glob.escape(home), pattern))):
+                ident = os.path.normcase(os.path.abspath(path))
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                try:
+                    raw = _read_private(path).strip()
+                except FileNotFoundError:
+                    continue
+                except OSError as e:
+                    raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "key file %s. Fix it and rerun; nothing "
+                                     "was sent." % e, reason="insecure_key_file", file=path)
+                if raw:
+                    add(raw, path)
+        configs = [(os.path.join(home, rel), False) for rel in MCP_CONFIGS_HOME]
+        configs += [(os.path.join(self.cwd, rel), True) for rel in MCP_CONFIGS_CWD]
+        seen_cfg = set()
+        for path, is_project in configs:
+            ident = os.path.normcase(os.path.realpath(path))
+            if ident in seen_cfg:
+                continue
+            seen_cfg.add(ident)
+            for raw in _scan_mcp_config(path):
+                add(raw, path)
+                if is_project:
+                    project.add(path)
+        for name in sorted(self.environ):
+            value = (self.environ.get(name) or "").strip()
+            if _KEY_WHOLE.fullmatch(value):
+                add(value.encode("ascii"), "$" + name)
+        found = list(hashes)
+        sent = found[:MAX_PRESENTED_KEY_HASHES]
+        if len(found) > len(sent):
+            _redeem_say("KEY_SCAN_TRUNCATED found=%d sent=%d" % (len(found), len(sent)))
+        labels = []
+        for h in sent:
+            for label in hashes[h]:
+                if label not in labels:
+                    labels.append(label)
+        self.sources = labels
+        self.project_only = bool(labels) and all(lb in project for lb in labels)
+        return sent
+
+    def _open_temp(self, target):
+        d, name = os.path.split(target)
+        tmp = os.path.join(d, ".%s.%s.tmp" % (name, os.urandom(8).hex()))
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                 | getattr(os, "O_BINARY", 0))
+        try:
+            fd = os.open(tmp, flags, PRIVATE_FILE_MODE)
+        except OSError as e:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "cannot create a temp file in %s: %s. Nothing "
+                             "was sent." % (d, e.strerror or type(e).__name__), reason="temp")
+        self.tmp, self.tmp_fd = tmp, fd
+        try:
+            _assert_private_fd(fd, tmp)
+        except OSError as e:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "%s. Nothing was sent." % e, reason="temp")
+
+    def _post(self, base, code, hashes):
+        """POST the redeem. Exactly one request, no retry, no Authorization header. The connection is opened
+        EXPLICITLY first, so a refusal, a TLS failure or a timeout before anything was written is known to have
+        consumed nothing (exit 6), and anything that goes wrong after the request was written is ambiguous
+        (exit 7). http.client follows no redirect and uses no proxy."""
+        a = self.args
+        body = {"code": code, "kind": a.kind}
+        if a.expect_account:
+            body["expect_account"] = a.expect_account
+        if hashes:
+            body["presented_key_sha256s"] = hashes
+        data = json.dumps(body).encode("ascii")
+        body = None
+        url = base + REDEEM_PATH
+        try:
+            self.pinned = pin_for(url)
+        except ResolveFailed as e:
+            raise RedeemExit(REDEEM_EXIT_RETRY, "PICKUP_RETRY_LATER", "%s. %s" % (e, _MESSAGES["PICKUP_RETRY_LATER"]),
+                             reason="resolve")
+        except FatalConfig as e:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "PICKUP_BASE_NOT_ALLOWED", "%s. Nothing was sent." % e)
+        parts = urllib.parse.urlsplit(url)
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        cls = _PinnedHTTPSConnection if parts.scheme == "https" else _PinnedHTTPConnection
+        conn = cls(parts.hostname, port=port, pinned_ip=self.pinned, timeout=REDEEM_TIMEOUT)
+        try:
+            try:
+                conn.connect()
+            except (OSError, http.client.HTTPException) as e:
+                raise RedeemExit(REDEEM_EXIT_RETRY, "PICKUP_RETRY_LATER", "could not connect to %s (%s). %s"
+                                 % (base, type(e).__name__, _MESSAGES["PICKUP_RETRY_LATER"]), reason="connect")
+            self.phase = "sent"
+            try:
+                conn.request("POST", parts.path, body=data, headers={
+                    "User-Agent": USER_AGENT, "Content-Type": "application/json", "Accept": "application/json"})
+                resp = conn.getresponse()
+                status = resp.status
+                raw = resp.read(REDEEM_BODY_MAX_BYTES + 1)
+            except (OSError, http.client.HTTPException) as e:
+                raise RedeemExit(REDEEM_EXIT_AMBIGUOUS, "PICKUP_AMBIGUOUS", "%s (%s)"
+                                 % (_MESSAGES["PICKUP_AMBIGUOUS"], type(e).__name__), reason="no_answer")
+        finally:
+            conn.close()
+        try:
+            payload = json.loads(raw.decode("utf-8")) if len(raw) <= REDEEM_BODY_MAX_BYTES else None
+        except (ValueError, UnicodeDecodeError):
+            payload = None
+        raw = None
+        if status == 200:
+            result = payload.get("result") if isinstance(payload, dict) else None
+            token = result.get("token") if isinstance(result, dict) else None
+            if not (isinstance(token, str) and _SERVED_KEY.fullmatch(token)):
+                raise RedeemExit(REDEEM_EXIT_AMBIGUOUS, "PICKUP_AMBIGUOUS", "the server answered 200 without a "
+                                 "usable key. " + _MESSAGES["PICKUP_AMBIGUOUS"], reason="unparseable_200")
+            self.secret = bytearray(token.encode("ascii"))
+            prefix = token[:12]
+            result["token"] = None
+            token = None
+            self.phase = "parsed"
+            self.key_id = _redeem_field(result.get("id"))
+            scopes = result.get("scopes") if isinstance(result.get("scopes"), list) else []
+            account = result.get("account")
+            return {"prefix": prefix, "scopes": [_redeem_field(x) for x in scopes],
+                    "account": account if isinstance(account, str) and _ACCOUNT_FP.fullmatch(account) else None}
+        err_code = payload.get("code") if isinstance(payload, dict) else None
+        err_code = err_code if isinstance(err_code, str) else None
+        if status == 400:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "the server rejected the request as malformed "
+                             "(this helper and the server disagree). Nothing was used up.", reason="bad_request")
+        if err_code in _PICKUP_REFUSALS:
+            token_name = _PICKUP_REFUSALS[err_code]
+            message = _MESSAGES[token_name]
+            if token_name == "PICKUP_WRONG_ACCOUNT":
+                message = self._wrong_account_message(message)
+            raise RedeemExit(REDEEM_EXIT_REFUSED, token_name, message)
+        if err_code in _PICKUP_RETRY_CODES:
+            raise RedeemExit(REDEEM_EXIT_RETRY, "PICKUP_RETRY_LATER", _MESSAGES["PICKUP_RETRY_LATER"],
+                             reason=err_code)
+        raise RedeemExit(REDEEM_EXIT_AMBIGUOUS, "PICKUP_AMBIGUOUS", _MESSAGES["PICKUP_AMBIGUOUS"],
+                         reason=err_code or ("http_%d" % status))
+
+    def _wrong_account_message(self, message):
+        if not self.sources:
+            return message + " No existing key was found on this machine, so the mismatch is --expect-account."
+        lines = [message, "The hashes sent came from:"]
+        lines += ["  " + ("environment variable %s" % s if s.startswith("$") else s) for s in self.sources]
+        if self.project_only:
+            lines.append("These came only from the project's own files - if you did not put a key there, use "
+                         "the web account page instead.")
+        return "\n".join(lines)
+
+    def _install(self, target, mode):
+        """Write the key to the temp, then move it into place without ever clobbering something that appeared
+        or changed after pre-flight. Once the temp holds the key, any failure parks it there (exit 8)."""
+        try:
+            _write_all(self.tmp_fd, self.secret)
+            _write_all(self.tmp_fd, b"\n")
+            os.fsync(self.tmp_fd)
+        except OSError as e:
+            raise RedeemExit(REDEEM_EXIT_LOST, "KEY_LOST", "the key was collected but could not be written (%s). "
+                             "Revoke it now: kijito_api_key(action=\"revoke\", token_id=\"%s\") and create a new "
+                             "one." % (e.strerror or type(e).__name__, self.key_id), id=self.key_id)
+        finally:
+            fd, self.tmp_fd = self.tmp_fd, None
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.tmp_holds_key = True
+        try:
+            if mode == "prefix":
+                try:
+                    current = _read_private(target).strip()
+                except FileNotFoundError:
+                    self._park("%s vanished while the key was being collected" % target)
+                if not current.startswith(self.args.replace_prefix.encode("ascii")):
+                    self._park("%s no longer holds key %s" % (target, self.args.replace_prefix))
+                os.replace(self.tmp, target)
+            elif mode in ("empty", "replace"):
+                try:
+                    current = _read_private(target).strip()
+                except FileNotFoundError:
+                    self._install_new(target)
+                    return
+                if mode == "empty" and current:
+                    self._park("%s was filled while the key was being collected" % target)
+                os.replace(self.tmp, target)
+            else:
+                self._install_new(target)
+                return
+        except RedeemExit:
+            raise
+        except OSError as e:
+            self._park("%s could not be installed (%s)" % (target, e.strerror or e))
+        self.tmp = None
+
+    def _install_new(self, target):
+        """Target absent at pre-flight: link (atomic, never clobbers), with an O_EXCL copy where the filesystem
+        has no hard links. Windows: rename, which fails if the target exists."""
+        if not IS_POSIX:
+            try:
+                os.rename(self.tmp, target)
+            except OSError as e:
+                self._park("%s could not be created (%s)" % (target, e.strerror or type(e).__name__))
+            self.tmp = None
+            return
+        try:
+            os.link(self.tmp, target)
+        except FileExistsError:
+            self._park("%s appeared while the key was being collected" % target)
+        except OSError as e:
+            if e.errno not in _LINK_FALLBACK_ERRNOS:
+                self._park("%s could not be created (%s)" % (target, e.strerror or type(e).__name__))
+            self._copy_new(target)
+        tmp, self.tmp = self.tmp, None
+        try:
+            os.unlink(tmp)
+        except OSError as e:
+            _redeem_say("WARNING the key is saved, but the temp copy %s could not be removed (%s) - delete it"
+                        % (tmp, e.strerror or type(e).__name__))
+
+    def _copy_new(self, target):
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                 | getattr(os, "O_BINARY", 0))
+        try:
+            fd = os.open(target, flags, PRIVATE_FILE_MODE)
+        except FileExistsError:
+            self._park("%s appeared while the key was being collected" % target)
+        except OSError as e:
+            self._park("%s could not be created (%s)" % (target, e.strerror or type(e).__name__))
+        try:
+            _assert_private_fd(fd, target)
+            _write_all(fd, self.secret)
+            _write_all(fd, b"\n")
+            os.fsync(fd)
+        except OSError as e:
+            os.close(fd)
+            try:
+                os.unlink(target)        # ours (O_EXCL), and incomplete
+            except OSError:
+                pass
+            self._park("%s could not be written (%s)" % (target, e.strerror or type(e).__name__))
+        os.close(fd)
+
+    def _park(self, why):
+        self.parked = True
+        raise RedeemExit(REDEEM_EXIT_PARKED, "KEY_PARKED", "%s, so the key was left in %s (owner-only). Tell the "
+                         "user; do not open it." % (why, self.tmp), file=self.tmp)
+
+    def _confirm_private(self, target):
+        if not _fsync_dir(os.path.dirname(target)):
+            _redeem_say("WARNING the key file's directory could not be synced to disk")
+        try:
+            if _is_link(_lstat(target)):
+                raise InsecureFile("%s is now a symbolic link" % target)
+            fd = os.open(target, _ro_flags())
+        except OSError as e:
+            raise RedeemExit(REDEEM_EXIT_LOST, "KEY_LOST", "the key was written to %s but cannot be confirmed "
+                             "(%s). Revoke it now: kijito_api_key(action=\"revoke\", token_id=\"%s\") and create a "
+                             "new one." % (target, e.strerror or type(e).__name__, self.key_id), id=self.key_id)
+        try:
+            _assert_private_fd(fd, target)
+            st = os.fstat(fd)
+        except OSError as e:
+            raise RedeemExit(REDEEM_EXIT_LOST, "KEY_LOST", "the key was written to %s but it is not private (%s). "
+                             "Revoke it now: kijito_api_key(action=\"revoke\", token_id=\"%s\") and create a new "
+                             "one." % (target, e, self.key_id), id=self.key_id)
+        finally:
+            os.close(fd)
+        return "%04o" % (st.st_mode & 0o777) if IS_POSIX else "acl"
+
+    def _verify(self, base, meta):
+        """GET /api/auth/me?probe=1 with the new key over the same pinned addresses: the key works, and it
+        belongs to the account the redeem said. Never changes the exit code; the file is kept either way."""
+        if self.args.no_verify:
+            return "skipped", None
+        url = base + VERIFY_PATH
+        headers = {"User-Agent": USER_AGENT, "Accept": "application/json",
+                   "Authorization": "Bearer " + self.secret.decode("ascii")}
+        try:
+            opener = build_opener(self.pinned)
+            req = urllib.request.Request(url, headers=headers, method="GET")
+            with opener.open(req, timeout=REDEEM_TIMEOUT) as resp:
+                status, raw = resp.status, resp.read(REDEEM_BODY_MAX_BYTES)
+        except urllib.error.HTTPError as e:
+            e.close()
+            return "no", ("revoked" if e.code == 401 else "http_%d" % e.code)
+        except Exception as e:  # noqa: BLE001 - a failed check must never turn a saved key into an error
+            return "no", "unreachable_%s" % type(e).__name__
+        finally:
+            headers = None
+        if status != 200:
+            return "no", "http_%d" % status
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return "no", "bad_response"
+        if not isinstance(data, dict) or data.get("probe") is not True:
+            return "no", "probe_not_honoured"
+        if meta["account"] and data.get("account") != meta["account"]:
+            return "no", "account_mismatch"
+        return "yes", None
+
+    # ---- the end of a run -------------------------------------------------------------------------------------
+    def abort(self, why):
+        """An interrupt or an unexpected exception. Its meaning depends only on how far we got."""
+        if self.phase == "pre":
+            return RedeemExit(REDEEM_EXIT_RETRY, "PICKUP_RETRY_LATER", "%s before anything was sent. %s"
+                              % (why, _MESSAGES["PICKUP_RETRY_LATER"]), reason="interrupted")
+        if self.phase == "sent":
+            return RedeemExit(REDEEM_EXIT_AMBIGUOUS, "PICKUP_AMBIGUOUS", "%s after the request was sent. %s"
+                              % (why, _MESSAGES["PICKUP_AMBIGUOUS"]), reason="interrupted")
+        if self.phase == "parsed":
+            if self.tmp_holds_key and self.tmp:
+                self.parked = True
+                return RedeemExit(REDEEM_EXIT_PARKED, "KEY_PARKED", "%s; the key was left in %s (owner-only). "
+                                  "Tell the user; do not open it." % (why, self.tmp), file=self.tmp)
+            return RedeemExit(REDEEM_EXIT_LOST, "KEY_LOST", "%s after the key was collected. Revoke it now: "
+                              "kijito_api_key(action=\"revoke\", token_id=\"%s\") and create a new one."
+                              % (why, self.key_id), id=self.key_id)
+        return None   # saved: the key is in place
+
+    def cleanup(self):
+        if self.tmp_fd is not None:
+            try:
+                os.close(self.tmp_fd)
+            except OSError:
+                pass
+            self.tmp_fd = None
+        if self.tmp and not self.parked:
+            try:
+                os.unlink(self.tmp)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                _redeem_say("WARNING could not remove the temp file %s (%s) - delete it"
+                            % (self.tmp, e.strerror or type(e).__name__))
+        if self.secret is not None:
+            for i in range(len(self.secret)):      # best effort: Python may hold other copies
+                self.secret[i] = 0
+            self.secret = None
+
+
+def _scan_mcp_config(path):
+    """Key-shaped tokens inside one MCP client config, as bytes. Never a refusal: these files belong to the
+    clients and are often 0644, so a loose mode is only a warning, and a symlink, anything not a regular file,
+    another owner's file or one over 1 MiB is skipped with a warning (best effort, plan §1c)."""
+    def skip(why):
+        _redeem_say("WARNING not checking %s for keys: %s" % (path, why))
+        return []
+    try:
+        st = _lstat(path)
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        return skip(e.strerror or type(e).__name__)
+    if _is_link(st):
+        return skip("it is a symbolic link")
+    try:
+        fd = os.open(path, _ro_flags())
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        return skip(e.strerror or type(e).__name__)
+    try:
+        fst = os.fstat(fd)
+        if not stat.S_ISREG(fst.st_mode):
+            return skip("it is not a regular file")
+        if IS_POSIX and fst.st_uid != os.geteuid():
+            return skip("it is owned by uid %d, not by you" % fst.st_uid)
+        if fst.st_size > MCP_CONFIG_MAX_BYTES:
+            return skip("it is larger than %d bytes" % MCP_CONFIG_MAX_BYTES)
+        if IS_POSIX and fst.st_mode & 0o077:
+            _redeem_say("WARNING %s is readable by other users (mode %o) and may hold an API key - consider "
+                        "chmod 600 %s" % (path, fst.st_mode & 0o777, path))
+        chunks, size = [], 0
+        while size <= MCP_CONFIG_MAX_BYTES:
+            b = os.read(fd, 65536)
+            if not b:
+                break
+            chunks.append(b)
+            size += len(b)
+    except OSError as e:
+        return skip(e.strerror or type(e).__name__)
+    finally:
+        os.close(fd)
+    if size > MCP_CONFIG_MAX_BYTES:
+        return skip("it is larger than %d bytes" % MCP_CONFIG_MAX_BYTES)
+    text = b"".join(chunks).decode("utf-8", "replace")
+    return [m.group(0).encode("ascii") for m in _KEY_IN_TEXT.finditer(text)]
+
+
+def _redeem_field(v):
+    s = str(v) if isinstance(v, (str, int)) and not isinstance(v, bool) else ""
+    return s if _SAFE_FIELD.fullmatch(s) else "unknown"
+
+
+def _redeem_say(text):
+    sys.stderr.write("kijito-inbox-monitor: %s\n" % text)
+
+
+def _redeem_line(token, fields):
+    sys.stdout.write(" ".join([token] + ["%s=%s" % kv for kv in fields if kv[1] is not None]) + "\n")
+    sys.stdout.flush()
+
+
+def redeem_key(args):
+    """--redeem-key: collect a key minted with delivery="pickup" and save it. Returns the exit code.
+
+    Routed from main() BEFORE validate_args/run, inside its own catch-all, so the watcher's KeyboardInterrupt -> 0
+    and OSError -> 2 arms never apply: an interrupt means 6, 7, 5 or 8 depending on how far the run got."""
+    r = _Redeem(args, _redeem_environ(), _redeem_cwd(), _redeem_stdin())
+    outcome = None
+    try:
+        return r.run()
+    except RedeemExit as e:
+        outcome = e
+    except KeyboardInterrupt:
+        outcome, why = r.abort("interrupted"), "interrupted"
+    except Exception as e:  # noqa: BLE001 - the type only: an exception's text could carry a response body
+        outcome, why = r.abort("unexpected %s" % type(e).__name__), "error_%s" % type(e).__name__
+    finally:
+        r.cleanup()
+    if outcome is None:
+        # The key was already in place when the run stopped: say where, and that it was not checked.
+        _redeem_line("KEY_SAVED", [("file", r.target), ("verified", "no"), ("reason", why)])
+        return REDEEM_EXIT_SAVED
+    _redeem_line(outcome.token, [(k, v) for k, v in outcome.fields.items()])
+    _redeem_say("%s: %s" % (outcome.token, outcome.message))
+    return outcome.code
+
+
+# --------------------------------------------------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------------------------------------------------
 def build_parser():
@@ -4145,10 +5102,37 @@ def build_parser():
                    help="Fast-path safety floor: force a full inbox poll after at most N consecutive cheap "
                         "skips, so a stale/wrong unread count can never blind the watcher (default 10, min 1).")
     p.add_argument("--self-test", action="store_true", help="Probe + synthetic emit, then exit (run before trusting).")
+    # Row M488: one-time key pickup. Only with --redeem-key; the code itself is read from stdin, never argv.
+    p.add_argument("--redeem-key", action="store_true",
+                   help="Collect an API key minted with delivery=\"pickup\" and save it to its key file, so the "
+                        "key never passes through a conversation. The pickup code is read from stdin (first "
+                        "line), else a no-echo prompt on a terminal, else $%s. Talks only to %s, or to the base "
+                        "written in the owner-only file ~/%s. Prints one KEY_SAVED line (file, mode, prefix), "
+                        "never the key. Exits 0 saved, 2 refused before sending, 3 code for another server, "
+                        "4 refused by the server, 5 collected but not saved, 6 nothing consumed (rerun), "
+                        "7 outcome unknown (revoke and mint again), 8 saved at the temp path it prints."
+                        % (PICKUP_CODE_ENV, DEFAULT_API_BASE, API_BASE_FILE))
+    p.add_argument("--kind", choices=("watcher", "rest"),
+                   help="With --redeem-key (required): watcher saves to ~/%s, rest to ~/%s. The reply that "
+                        "carries the code names it." % (WATCHER_KEY_FILE, REST_KEY_FILE))
+    p.add_argument("--replace", action="store_true",
+                   help="With --redeem-key: replace a key already in the target file (ask the user first).")
+    p.add_argument("--replace-prefix", metavar="PREFIX",
+                   help="With --redeem-key: replace the target's key only if it starts with PREFIX (a renewal "
+                        "replaces the key it renews). Mutually exclusive with --replace.")
+    p.add_argument("--expect-account", metavar="ACCT",
+                   help="With --redeem-key: the account fingerprint (acct_...) the code must belong to.")
+    p.add_argument("--no-verify", action="store_true",
+                   help="With --redeem-key: skip checking the saved key against /api/auth/me?probe=1.")
     return p
 
 
 def validate_args(args):
+    stray = [f for f, on in (("--kind", args.kind), ("--replace", args.replace),
+                             ("--replace-prefix", args.replace_prefix), ("--expect-account", args.expect_account),
+                             ("--no-verify", args.no_verify)) if on]
+    if stray:
+        raise FatalConfig("%s only apply with --redeem-key" % ", ".join(stray))
     if args.alert_after < 1:
         raise FatalConfig("--alert-after must be >= 1")
     if args.alert_floor_seconds is not None and args.alert_floor_seconds < 0:
@@ -4226,6 +5210,11 @@ def _utf8_stdout():
 def main(argv=None):
     _utf8_stdout()
     args = build_parser().parse_args(argv)
+    # Row M488: --redeem-key has its own exit contract (0/2-8) and its own catch-all, so it is routed before
+    # everything else - in particular before validate_args/run, whose KeyboardInterrupt -> 0 and OSError -> 2
+    # arms would misreport a half-collected key.
+    if args.redeem_key:
+        return redeem_key(args)
     # A pure read of an existing report: no token, no network, no state file, no watch loop. Placed
     # before validate_args so a heartbeat can call it without satisfying the watcher's own config.
     # A pure string transform, deliberately reachable with NO other configuration: every caller that

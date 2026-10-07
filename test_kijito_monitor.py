@@ -2,10 +2,13 @@ import contextlib
 import datetime
 import email.message
 import email.utils
+import errno
+import hashlib
 import io
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -7362,3 +7365,1194 @@ class NoFleetNameInUserFacingFiles(unittest.TestCase):
                 with open(os.path.join(t, "x.py"), "w", encoding="utf-8") as fh:
                     fh.write(line + "\n")
                 self.assertEqual(self._hits(t, ["x.py"]), [], line)
+
+
+# ======================================================================================================================
+# Row M488: --redeem-key (one-time key pickup). Every test runs in a temp home with a fake passwd entry, a fake
+# working directory, a controlled environment and a loopback fake server, so no real key or config on this machine
+# is ever read and nothing leaves the machine (a guard fails the test if a non-loopback host is ever resolved).
+# The keys below are key-SHAPED fixtures built from a hash of a label; none is a real key.
+# ======================================================================================================================
+_CROCKFORD_FIXTURE = "7QK3ZP9MXW4H2T6R8NCVBJ5DGA0YEF1S"   # 32 Crockford characters
+ACCT_A = "acct_3f9a1c2e40d7b815"
+ACCT_B = "acct_0000000000000bbb"
+
+
+def _fixture_key(label):
+    """kjt_ + exactly 43 characters of [A-Za-z0-9_-]: the real key SHAPE, derived from a label."""
+    return "kjt_" + hashlib.sha256(label.encode()).hexdigest()[:43]
+
+
+def _sha(key):
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def _pickup_code(host):
+    return "kpc_" + _CROCKFORD_FIXTURE + "@" + host
+
+
+class _FakePwd:
+    def __init__(self, home, missing=False):
+        self.home, self.missing = home, missing
+
+    def getpwuid(self, uid):
+        if self.missing:
+            raise KeyError("getpwuid(): uid not found: %d" % uid)
+        return type("pw", (), {"pw_dir": self.home})()
+
+
+class _FakeStat:
+    """An lstat result as Windows reports a symlink or a junction: a reparse tag, not S_IFLNK."""
+    def __init__(self, tag):
+        self.st_mode = stat.S_IFREG | 0o600
+        self.st_reparse_tag = tag
+
+
+class _FakePickupServer:
+    """A loopback stand-in for the redeem door and /api/auth/me. Records every request (method, path, headers,
+    body). `pickup` decides the POST answer: ("ok",) the success body, ("json", status, obj), ("raw", status,
+    bytes), ("drop",) read the request and close without answering, ("redirect", location). Hashes in `foreign`
+    belong to another account: presenting one answers 403 pickup_wrong_account, as the real server does."""
+
+    def __init__(self, testcase, key=None, account=ACCT_A, scopes=("memory.read",)):
+        import http.server
+        import threading
+        self.requests = []
+        self.posted = threading.Event()
+        self.key = key or _fixture_key("issued")
+        self.account = account
+        self.scopes = list(scopes)
+        self.pickup = ("ok",)
+        self.me = ("json", 200, {"probe": True, "account": account})
+        self.before_reply = None
+        self.foreign = set()
+        outer = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def _record(self, body=b""):
+                outer.requests.append({"method": self.command, "path": self.path, "body": body,
+                                       "headers": {k.lower(): v for k, v in self.headers.items()}})
+
+            def _send(self, status, data, ctype="application/json", extra=()):
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                for k, v in extra:
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_POST(self):  # noqa: N802 - stdlib handler name
+                body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self._record(body)
+                outer.posted.set()
+                if self.path != "/api/auth/key-pickup":
+                    return self._send(404, b'{"error": "no", "code": "not_found"}')
+                if outer.before_reply is not None:
+                    outer.before_reply()
+                try:
+                    sent = set(json.loads(body).get("presented_key_sha256s") or [])
+                except ValueError:
+                    sent = set()
+                spec = outer.pickup
+                if sent & outer.foreign:
+                    return self._send(403, json.dumps({"error": "x", "code": "pickup_wrong_account"}).encode())
+                if spec[0] == "ok":
+                    result = {"token": outer.key, "id": "tok_123", "prefix": outer.key[:12],
+                              "scopes": outer.scopes, "expires_at": None, "persona": "alice",
+                              "account": outer.account, "kind": "watcher"}
+                    return self._send(200, json.dumps({"result": result}).encode())
+                if spec[0] == "json":
+                    return self._send(spec[1], json.dumps(spec[2]).encode())
+                if spec[0] == "raw":
+                    return self._send(spec[1], spec[2], ctype="text/html")
+                if spec[0] == "redirect":
+                    return self._send(302, b"", extra=[("Location", spec[1])])
+                # "drop": the request was read; close without a word
+                self.close_connection = True
+
+            def do_GET(self):  # noqa: N802 - stdlib handler name
+                self._record()
+                spec = outer.me
+                if spec[0] == "redirect":
+                    return self._send(302, b"", extra=[("Location", spec[1])])
+                self._send(spec[1], json.dumps(spec[2]).encode())
+
+            def log_message(self, *a):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.port = self.server.server_address[1]
+        t = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
+        t.start()
+        testcase.addCleanup(self.server.server_close)
+        testcase.addCleanup(self.server.shutdown)
+
+    def posts(self):
+        return [r for r in self.requests if r["method"] == "POST"]
+
+    def gets(self):
+        return [r for r in self.requests if r["method"] == "GET"]
+
+    def presented(self):
+        return json.loads(self.posts()[-1]["body"]).get("presented_key_sha256s")
+
+
+class _RedeemCase(unittest.TestCase):
+    """Shared fixture: temp home + working dir, fake passwd entry, controlled environment, code on stdin."""
+
+    def setUp(self):
+        t = tempfile.TemporaryDirectory()
+        self.addCleanup(t.cleanup)
+        self.root = os.path.realpath(t.name)
+        self.home = os.path.join(self.root, "home")
+        self.cwd = os.path.join(self.root, "work")
+        os.mkdir(self.home, 0o700)
+        os.mkdir(self.cwd, 0o700)
+        self.env = {"HOME": self.home}
+        self.stdin_text = ""
+        self.server = None
+        self.base = None
+        self.out = self.err = ""
+        self.escaped = []
+        self._patch(km, "pwd", _FakePwd(self.home))
+        self._patch(km, "_redeem_environ", lambda: self.env)
+        self._patch(km, "_redeem_cwd", lambda: self.cwd)
+        self._patch(km, "_redeem_stdin", lambda: io.StringIO(self.stdin_text))
+        real_pin = km.pin_for
+
+        def guarded_pin(url):
+            import urllib.parse
+            host = urllib.parse.urlsplit(url).hostname
+            if host not in ("127.0.0.1", "localhost", "::1"):
+                self.escaped.append(url)
+                raise AssertionError("the test tried to reach a non-loopback host")
+            return real_pin(url)
+        self._patch(km, "pin_for", guarded_pin)
+        self.addCleanup(lambda: self.assertEqual(self.escaped, [], "a redeem test resolved a non-loopback host"))
+
+    def _patch(self, obj, name, value):
+        old = getattr(obj, name)
+        setattr(obj, name, value)
+        self.addCleanup(setattr, obj, name, old)
+
+    def path(self, rel, root=None):
+        return os.path.join(root or self.home, rel)
+
+    def put(self, rel, content, mode=0o600, root=None):
+        p = self.path(rel, root)
+        os.makedirs(os.path.dirname(p), mode=0o700, exist_ok=True)
+        with open(p, "w") as fh:
+            fh.write(content)
+        os.chmod(p, mode)
+        return p
+
+    def serve(self, allow=True, **kw):
+        self.server = _FakePickupServer(self, **kw)
+        self.base = "http://127.0.0.1:%d" % self.server.port
+        if allow:
+            self.put(km.API_BASE_FILE, self.base + "\n")
+        return self.server
+
+    def code(self, host=None):
+        return _pickup_code(host or ("127.0.0.1:%d" % self.server.port))
+
+    def redeem(self, *flags, code=None, api_base=True):
+        """Run main() exactly as the CLI does. The code goes on stdin, never argv."""
+        if code is None and self.server is not None:
+            code = self.code()
+        self.stdin_text = (code or "") + "\n"
+        argv = ["--redeem-key"]
+        if api_base and self.base:
+            argv += ["--api-base", self.base]
+        argv += list(flags)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = km.main(argv)
+        self.out, self.err = out.getvalue(), err.getvalue()
+        return rc
+
+    def watcher(self):
+        return self.path(km.WATCHER_KEY_FILE)
+
+    def rest(self):
+        return self.path(km.REST_KEY_FILE)
+
+    def temps(self, d=None):
+        d = d or os.path.dirname(self.watcher())
+        if not os.path.isdir(d):
+            return []
+        return [f for f in os.listdir(d) if f.startswith(".") and f.endswith(".tmp")]
+
+    def mode(self, p):
+        return stat.S_IMODE(os.lstat(p).st_mode)
+
+    def read(self, p):
+        with open(p) as fh:
+            return fh.read()
+
+    def assertNothingSent(self):
+        self.assertEqual(self.server.requests if self.server else [], [], "a request was sent")
+
+    def assertNoKeyInOutput(self, key=None):
+        key = key or (self.server.key if self.server else None)
+        both = self.out + self.err
+        self.assertNotIn(key, both)
+        for i in range(4, len(key) - 15):
+            self.assertNotIn(key[i:i + 16], both, "a 16-char window of the key was printed")
+
+
+class RedeemKeyHappyPathTest(_RedeemCase):
+    def test_a_watcher_key_is_saved_0600_in_a_0700_dir_and_verified(self):
+        self.serve()
+        rc = self.redeem("--kind", "watcher", "--expect-account", ACCT_A)
+        self.assertEqual(rc, 0, self.err)
+        p = self.watcher()
+        self.assertEqual(self.read(p), self.server.key + "\n")
+        self.assertEqual(self.mode(p), 0o600)
+        self.assertEqual(self.mode(os.path.dirname(p)), 0o700)
+        self.assertEqual(self.out.strip(), "KEY_SAVED file=%s mode=0600 prefix=%s scopes=memory.read account=%s "
+                         "verified=yes" % (p, self.server.key[:12], ACCT_A))
+        self.assertIn("NON-DEFAULT API base", self.err)
+        self.assertEqual(self.temps(), [])
+        self.assertNoKeyInOutput()
+
+    def test_the_request_carries_code_kind_and_account_and_no_authorization(self):
+        self.serve()
+        mine = _fixture_key("mine")
+        self.put(km.REST_KEY_FILE, mine + "\n")
+        self.assertEqual(self.redeem("--kind", "watcher", "--expect-account", ACCT_A), 0, self.err)
+        post = self.server.posts()[0]
+        body = json.loads(post["body"])
+        self.assertEqual(body, {"code": self.code(), "kind": "watcher", "expect_account": ACCT_A,
+                                "presented_key_sha256s": [_sha(mine)]})
+        self.assertNotIn("authorization", post["headers"])
+        self.assertEqual(post["headers"]["user-agent"], km.USER_AGENT)
+        self.assertEqual(post["headers"]["content-type"], "application/json")
+        wire = post["body"].decode() + json.dumps(post["headers"])
+        for i in range(0, len(mine) - 11):
+            self.assertNotIn(mine[i:i + 12], wire, "a piece of an existing key went on the wire")
+
+    def test_no_key_on_disk_means_no_hash_field(self):
+        self.serve()
+        self.assertEqual(self.redeem("--kind", "watcher"), 0, self.err)
+        self.assertNotIn("presented_key_sha256s", json.loads(self.server.posts()[0]["body"]))
+
+    def test_verify_calls_the_probe_with_the_new_key(self):
+        self.serve()
+        self.assertEqual(self.redeem("--kind", "watcher"), 0, self.err)
+        (get,) = self.server.gets()
+        self.assertEqual(get["path"], "/api/auth/me?probe=1")
+        self.assertEqual(get["headers"]["authorization"], "Bearer " + self.server.key)
+        self.assertEqual(get["headers"]["user-agent"], km.USER_AGENT)
+
+    def test_rest_kind_writes_only_the_rest_file(self):
+        self.serve(scopes=("memory.read", "memory.write"))
+        self.assertEqual(self.redeem("--kind", "rest"), 0, self.err)
+        self.assertEqual(self.read(self.rest()), self.server.key + "\n")
+        self.assertEqual(self.mode(self.rest()), 0o600)
+        self.assertFalse(os.path.exists(self.watcher()))
+        self.assertIn("scopes=memory.read,memory.write", self.out)
+
+    def test_no_verify_sends_no_probe(self):
+        self.serve()
+        self.assertEqual(self.redeem("--kind", "watcher", "--no-verify"), 0, self.err)
+        self.assertEqual(self.server.gets(), [])
+        self.assertIn("verified=skipped", self.out)
+
+    def test_code_is_read_from_the_first_stdin_line_and_env_is_the_fallback(self):
+        self.serve()
+        self.stdin_text = self.code() + "\nsecond line ignored\n"
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = km.main(["--redeem-key", "--api-base", self.base, "--kind", "watcher", "--no-verify"])
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual(json.loads(self.server.posts()[0]["body"])["code"], self.code())
+        os.unlink(self.watcher())
+        self.env[km.PICKUP_CODE_ENV] = self.code()
+        self.assertEqual(self.redeem("--kind", "watcher", "--no-verify", code=""), 0, self.err)
+        self.assertEqual(len(self.server.posts()), 2)
+
+    def test_a_terminal_gets_a_no_echo_prompt(self):
+        self.serve()
+        asked = []
+
+        class Tty(io.StringIO):
+            def isatty(self):
+                return True
+        self._patch(km, "_redeem_stdin", lambda: Tty(""))
+        self._patch(km.getpass, "getpass", lambda prompt="": asked.append(prompt) or self.code())
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = km.main(["--redeem-key", "--api-base", self.base, "--kind", "watcher"])
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual(len(asked), 1)
+
+    def test_no_code_at_all_is_a_usage_error(self):
+        self.serve()
+        self.assertEqual(self.redeem("--kind", "watcher", code=""), 2)
+        self.assertNothingSent()
+
+    def test_a_positional_code_is_a_usage_error(self):
+        self.serve()
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
+            km.main(["--redeem-key", "--kind", "watcher", self.code()])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertNothingSent()
+
+    def test_kind_is_required(self):
+        self.serve()
+        self.assertEqual(self.redeem(), 2)
+        self.assertIn("--kind", self.err)
+        self.assertNothingSent()
+
+    def test_a_malformed_expect_account_is_refused_before_sending(self):
+        self.serve()
+        self.assertEqual(self.redeem("--kind", "watcher", "--expect-account", "acct_XYZ"), 2)
+        self.assertNothingSent()
+
+    def test_redeem_key_never_reaches_validate_args_or_run(self):
+        self.serve()
+
+        def boom(*a, **kw):
+            raise AssertionError("the watcher path was entered")
+        self._patch(km, "validate_args", boom)
+        self._patch(km, "run", boom)
+        self.assertEqual(self.redeem("--kind", "watcher"), 0, self.err)
+
+    def test_redeem_flags_without_redeem_key_are_refused_by_the_watcher(self):
+        for flags in (["--kind", "watcher"], ["--replace"], ["--replace-prefix", "kjt_AbCd1234"],
+                      ["--expect-account", ACCT_A], ["--no-verify"]):
+            with self.subTest(flags=flags):
+                args = km.build_parser().parse_args(flags)
+                with self.assertRaises(km.FatalConfig):
+                    km.validate_args(args)
+
+    def test_redeem_key_refuses_the_other_one_shot_modes(self):
+        self.serve()
+        self.assertEqual(self.redeem("--kind", "watcher", "--print-api-base"), 2)
+        self.assertNothingSent()
+
+
+class RedeemKeyTargetTest(_RedeemCase):
+    def test_an_occupied_target_is_refused_with_zero_requests_and_a_persona_hint(self):
+        self.serve()
+        other = _fixture_key("other persona")
+        self.put(km.WATCHER_KEY_FILE, other + "\n")
+        self.assertEqual(self.redeem("--kind", "watcher"), 2)
+        self.assertNothingSent()
+        self.assertEqual(self.read(self.watcher()), other + "\n")
+        self.assertIn("--token-file ~/.config/kijito-inbox-monitor/token.<persona>", self.err)
+        self.assertIn("never --replace", self.err)
+        self.assertEqual(self.temps(), [])
+
+    def test_a_writable_non_sticky_target_dir_is_refused(self):
+        self.serve()
+        d = os.path.dirname(self.watcher())
+        os.makedirs(d, exist_ok=True)
+        for mode, want in ((0o777, 2), (0o770, 2), (0o1777, 0)):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(d, mode)
+                self.server.requests.clear()
+                rc = self.redeem("--kind", "watcher", "--no-verify", "--replace")
+                self.assertEqual(rc, want, self.err)
+                if want == 2:
+                    self.assertNothingSent()
+                    self.assertIn("chmod 700", self.err)
+                self.assertEqual(self.temps(d), [])
+
+    def test_a_symlinked_target_is_refused(self):
+        self.serve()
+        elsewhere = self.put("elsewhere/real", "", root=self.root)
+        os.makedirs(os.path.dirname(self.watcher()), mode=0o700, exist_ok=True)
+        os.symlink(elsewhere, self.watcher())
+        self.assertEqual(self.redeem("--kind", "watcher"), 2)
+        self.assertNothingSent()
+        self.assertEqual(self.read(elsewhere), "")
+        self.assertIn("symbolic link", self.err)
+
+    def test_an_empty_left_over_file_is_accepted(self):
+        self.serve()
+        self.put(km.WATCHER_KEY_FILE, "\n")
+        self.assertEqual(self.redeem("--kind", "watcher"), 0, self.err)
+        self.assertEqual(self.read(self.watcher()), self.server.key + "\n")
+
+    def test_an_empty_file_swapped_for_a_symlink_during_the_redeem_parks_the_key(self):
+        self.serve()
+        p = self.put(km.WATCHER_KEY_FILE, "")
+        pointee = self.put("pointee", "", root=self.root)
+
+        def swap():
+            os.unlink(p)
+            os.symlink(pointee, p)
+        self.server.before_reply = swap
+        self.assertEqual(self.redeem("--kind", "watcher"), 8)
+        self.assertEqual(self.read(pointee), "", "the symlink was followed")
+        (tmp,) = self.temps()
+        tmp = os.path.join(os.path.dirname(p), tmp)
+        self.assertEqual(self.mode(tmp), 0o600)
+        self.assertEqual(self.read(tmp), self.server.key + "\n")
+        self.assertIn("KEY_PARKED file=%s" % tmp, self.out)
+        self.assertNoKeyInOutput()
+
+    def test_an_empty_file_filled_during_the_redeem_parks_the_key(self):
+        self.serve()
+        p = self.put(km.WATCHER_KEY_FILE, "")
+        other = _fixture_key("raced in")
+
+        def fill():
+            with open(p, "w") as fh:
+                fh.write(other + "\n")
+        self.server.before_reply = fill
+        self.assertEqual(self.redeem("--kind", "watcher"), 8)
+        self.assertEqual(self.read(p), other + "\n")
+        self.assertEqual(len(self.temps()), 1)
+
+    def test_replace_swaps_atomically_and_a_failed_rename_keeps_the_old_key(self):
+        self.serve()
+        old = _fixture_key("old")
+        self.put(km.WATCHER_KEY_FILE, old + "\n")
+        real_replace = os.replace
+
+        def failing(src, dst):
+            raise OSError(errno.EIO, "injected")
+        self._patch(km.os, "replace", failing)
+        self.assertEqual(self.redeem("--kind", "watcher", "--replace"), 8)
+        self.assertEqual(self.read(self.watcher()), old + "\n", "the old key did not survive")
+        self.assertEqual(len(self.temps()), 1)
+        km.os.replace = real_replace
+        os.unlink(os.path.join(os.path.dirname(self.watcher()), self.temps()[0]))
+        self.assertEqual(self.redeem("--kind", "watcher", "--replace"), 0, self.err)
+        self.assertEqual(self.read(self.watcher()), self.server.key + "\n")
+        self.assertEqual(self.mode(self.watcher()), 0o600)
+
+    def test_filesystems_without_hard_links_fall_back_to_an_exclusive_create(self):
+        self.serve()
+        for err in (errno.EPERM, errno.ENOTSUP, errno.EXDEV):
+            with self.subTest(errno=errno.errorcode[err]):
+                if os.path.exists(self.watcher()):
+                    os.unlink(self.watcher())
+
+                def no_links(src, dst, _e=err):
+                    raise OSError(_e, os.strerror(_e))
+                self._patch(km.os, "link", no_links)
+                self.assertEqual(self.redeem("--kind", "watcher"), 0, self.err)
+                self.assertEqual(self.read(self.watcher()), self.server.key + "\n")
+                self.assertEqual(self.mode(self.watcher()), 0o600)
+                self.assertEqual(self.temps(), [])
+
+    def test_a_target_created_during_the_redeem_is_never_clobbered(self):
+        self.serve()
+        other = _fixture_key("raced in")
+        self.server.before_reply = lambda: self.put(km.WATCHER_KEY_FILE, other + "\n")
+        self.assertEqual(self.redeem("--kind", "watcher"), 8)
+        self.assertEqual(self.read(self.watcher()), other + "\n")
+        (tmp,) = self.temps()
+        tmp = os.path.join(os.path.dirname(self.watcher()), tmp)
+        self.assertEqual(self.mode(tmp), 0o600)
+        self.assertIn("KEY_PARKED file=%s" % tmp, self.out)
+
+    def test_replace_prefix_replaces_only_the_key_being_renewed(self):
+        self.serve()
+        old = _fixture_key("renewed")
+        self.put(km.WATCHER_KEY_FILE, old + "\n")
+        self.assertEqual(self.redeem("--kind", "watcher", "--replace-prefix", old[:12]), 0, self.err)
+        self.assertEqual(self.read(self.watcher()), self.server.key + "\n")
+
+    def test_replace_prefix_refuses_another_key_an_empty_or_an_absent_target(self):
+        self.serve()
+        prefix = _fixture_key("renewed")[:12]
+        for content in (_fixture_key("someone else") + "\n", "", None):
+            with self.subTest(content=content and content[:6]):
+                if os.path.exists(self.watcher()):
+                    os.unlink(self.watcher())
+                if content is not None:
+                    self.put(km.WATCHER_KEY_FILE, content)
+                self.assertEqual(self.redeem("--kind", "watcher", "--replace-prefix", prefix), 2)
+                self.assertNothingSent()
+                self.assertIn("no longer holds key %s" % prefix, self.err)
+                self.assertEqual(self.temps(), [])
+
+    def test_replace_and_replace_prefix_are_mutually_exclusive(self):
+        self.serve()
+        self.assertEqual(self.redeem("--kind", "watcher", "--replace", "--replace-prefix", "kjt_AbCd1234"), 2)
+        self.assertNothingSent()
+
+    def test_a_renewed_key_swapped_out_during_the_redeem_parks(self):
+        self.serve()
+        old, other = _fixture_key("renewed"), _fixture_key("swapped in")
+        self.put(km.WATCHER_KEY_FILE, old + "\n")
+        self.server.before_reply = lambda: self.put(km.WATCHER_KEY_FILE, other + "\n")
+        self.assertEqual(self.redeem("--kind", "watcher", "--replace-prefix", old[:12]), 8)
+        self.assertEqual(self.read(self.watcher()), other + "\n")
+
+    def test_token_file_accepts_the_two_canonical_paths(self):
+        self.serve(scopes=("memory.read",))
+        for kind, given, where in (
+                ("watcher", "~/.config/kijito-inbox-monitor/token", self.watcher),
+                ("watcher", "$HOME/.config/kijito-inbox-monitor/token", self.watcher),
+                ("watcher", "${HOME}/.config/kijito/api_token", self.rest),
+                ("rest", os.path.join(self.home, ".config", "kijito", "api_token"), self.rest)):
+            with self.subTest(given=given):
+                for p in (self.watcher(), self.rest()):
+                    if os.path.exists(p):
+                        os.unlink(p)
+                self.assertEqual(self.redeem("--kind", kind, "--token-file", given, "--no-verify"), 0, self.err)
+                self.assertTrue(os.path.exists(where()))
+
+    def test_token_file_anywhere_else_is_refused(self):
+        self.serve()
+        ws = os.path.join(self.cwd, "ws")
+        os.mkdir(ws)
+        os.symlink(ws, os.path.join(self.cwd, "link"))
+        for given in ("./token", "token", os.path.join(self.root, "x"), os.path.join(self.cwd, "link", "token"),
+                      os.path.join(self.home, ".config", "kijito-inbox-monitor", "token.alice", "x"),
+                      "~/.config/kijito-inbox-monitor/token" + "." + "." + "." + "/x",
+                      "~/.config/kijito-inbox-monitor/token.Alice", "~/.config/kijito-inbox-monitor/token.",
+                      "~/.config/kijito-inbox-monitor/token.a b", "~/token"):
+            with self.subTest(given=given):
+                self.assertEqual(self.redeem("--kind", "watcher", "--token-file", given), 2)
+                self.assertNothingSent()
+        self.assertEqual(os.listdir(ws), [])
+
+    def test_a_per_persona_watcher_file_is_accepted(self):
+        self.serve()
+        self.put(km.WATCHER_KEY_FILE, _fixture_key("another persona") + "\n")
+        self.assertEqual(self.redeem("--kind", "watcher", "--token-file",
+                                     "~/.config/kijito-inbox-monitor/token.alice"), 0, self.err)
+        p = self.path(".config/kijito-inbox-monitor/token.alice")
+        self.assertEqual(self.read(p), self.server.key + "\n")
+        self.assertEqual(self.mode(p), 0o600)
+
+    def test_rest_kind_never_targets_the_watcher_file(self):
+        self.serve()
+        os.makedirs(os.path.dirname(self.watcher()), mode=0o700, exist_ok=True)
+        os.symlink(os.path.dirname(self.watcher()), os.path.join(self.cwd, "w"))
+        for given in ("~/.config/kijito-inbox-monitor/token", os.path.join(self.cwd, "w", "token"),
+                      "~/.config/kijito-inbox-monitor/token.alice"):
+            with self.subTest(given=given):
+                self.assertEqual(self.redeem("--kind", "rest", "--token-file", given), 2)
+                self.assertNothingSent()
+        self.assertFalse(os.path.exists(self.watcher()))
+
+    def test_a_narrowed_renewal_replaces_the_key_in_the_rest_file(self):
+        self.serve()
+        old = _fixture_key("rest key being narrowed")
+        self.put(km.REST_KEY_FILE, old + "\n")
+        self.assertEqual(self.redeem("--kind", "watcher", "--token-file", "~/.config/kijito/api_token",
+                                     "--replace-prefix", old[:12]), 0, self.err)
+        self.assertEqual(self.read(self.rest()), self.server.key + "\n")
+        self.assertFalse(os.path.exists(self.watcher()))
+
+
+class RedeemKeyScanTest(_RedeemCase):
+    def test_another_accounts_key_is_found_wherever_it_is_scanned(self):
+        self.serve()
+        theirs = _fixture_key("other account")
+        self.server.foreign = {_sha(theirs)}
+        header = '{"mcpServers": {"kijito": {"headers": {"Authorization": "Bearer %s"}}}}' % theirs
+        cases = [
+            (".claude/.kijito_api_token.alice", theirs + "\n"),
+            (".config/kijito-inbox-monitor/token.bob", theirs + "\n"),
+            (".config/kijito/api_token.prev-1", theirs + "\n"),
+            (".claude/.kijito_api_token", theirs + "\n"),
+            (".claude.json", header),
+            (".claude/settings.json", '{"env": {"KIJITO_API_TOKEN": "%s"}}' % theirs),
+            (".codex/config.toml", '[mcp_servers.kijito]\nhttp_headers = { Authorization = "Bearer %s" }\n' % theirs),
+            (".config/opencode/opencode.json", header),
+            (".config/opencode/opencode.jsonc", "// comment\n" + header),
+        ]
+        for rel, content in cases:
+            with self.subTest(where=rel):
+                p = self.put(rel, content)
+                self.assertEqual(self.redeem("--kind", "watcher"), 4, self.err)
+                self.assertIn("PICKUP_WRONG_ACCOUNT", self.out)
+                self.assertIn(p, self.err)
+                self.assertIn(_sha(theirs), self.server.presented())
+                self.assertFalse(os.path.exists(self.watcher()))
+                self.assertEqual(self.temps(), [])
+                os.unlink(p)
+        with self.subTest(where="env"):
+            self.env["FOO"] = theirs
+            self.assertEqual(self.redeem("--kind", "watcher"), 4, self.err)
+            self.assertIn("environment variable $FOO", self.err)
+
+    def test_a_key_file_that_is_not_0600_stops_the_run_and_is_left_alone(self):
+        self.serve()
+        for rel in (".claude/.kijito_api_token.alice", ".config/kijito-inbox-monitor/token.bob",
+                    ".claude/.kijito_api_token"):
+            with self.subTest(rel=rel):
+                p = self.put(rel, _fixture_key(rel) + "\n", mode=0o644)
+                self.assertEqual(self.redeem("--kind", "watcher"), 2)
+                self.assertNothingSent()
+                self.assertIn(p, self.err)
+                self.assertIn("chmod 600 %s" % p, self.err)
+                self.assertEqual(self.mode(p), 0o644, "a read-only check changed the file's mode")
+                self.assertEqual(self.temps(), [])
+                os.unlink(p)
+
+    def test_a_symlinked_fifo_or_foreign_key_file_stops_the_run(self):
+        self.serve()
+        real = self.put("real", _fixture_key("x") + "\n", root=self.root)
+        link = self.path(".claude/.kijito_api_token")
+        os.makedirs(os.path.dirname(link), mode=0o700)
+        os.symlink(real, link)
+        self.assertEqual(self.redeem("--kind", "watcher"), 2)
+        self.assertIn("symbolic link", self.err)
+        os.unlink(link)
+        fifo = self.path(".claude/.kijito_api_token.pipe")
+        os.mkfifo(fifo, 0o600)
+        self.assertEqual(self.redeem("--kind", "watcher"), 2)
+        self.assertIn("not a regular file", self.err)
+        os.unlink(fifo)
+        self.put(".claude/.kijito_api_token.theirs", _fixture_key("y") + "\n")
+        uid = os.geteuid()
+        self._patch(km.os, "geteuid", lambda: uid + 1)
+        self.assertEqual(self.redeem("--kind", "watcher"), 2)
+        self.assertIn("owned by uid", self.err)
+        self.assertNothingSent()
+
+    def test_forty_keys_send_the_first_thirty_two_in_key_locations_order(self):
+        self.serve()
+        self.server.pickup = ("json", 410, {"error": "x", "code": "pickup_expired"})
+        order = []
+
+        def plant(rel):
+            k = _fixture_key(rel)
+            self.put(rel, k + "\n")
+            order.append(_sha(k))
+        plant(".config/kijito-inbox-monitor/token")
+        plant(".config/kijito/api_token")
+        for i in range(20):
+            plant(".config/kijito-inbox-monitor/token.p%02d" % i)
+        for i in range(10):
+            plant(".config/kijito/api_token.b%02d" % i)
+        plant(".claude/.kijito_api_token")
+        for i in range(7):
+            plant(".claude/.kijito_api_token.c%d" % i)
+        self.assertEqual(len(set(order)), 40)
+        self.assertEqual(self.redeem("--kind", "watcher", "--replace"), 4)
+        self.assertEqual(self.server.presented(), order[:32])
+        self.assertIn("KEY_SCAN_TRUNCATED found=40 sent=32", self.err)
+
+    def test_the_same_key_in_two_places_is_one_hash(self):
+        self.serve()
+        k = _fixture_key("shared")
+        self.put(".claude/.kijito_api_token", k + "\n")
+        self.put(".config/kijito/api_token", k)
+        self.env["KIJITO_API_TOKEN"] = k
+        self.assertEqual(self.redeem("--kind", "watcher"), 0, self.err)
+        self.assertEqual(self.server.presented(), [_sha(k)])
+
+    def test_the_helpers_own_temp_files_are_not_read(self):
+        self.serve()
+        self.put(".config/kijito-inbox-monitor/.token.0123abcd.tmp", _fixture_key("parked") + "\n", mode=0o644)
+        self.assertEqual(self.redeem("--kind", "watcher"), 0, self.err)
+        self.assertNotIn("presented_key_sha256s", json.loads(self.server.posts()[0]["body"]))
+
+    def test_an_empty_key_file_is_skipped_not_hashed(self):
+        self.serve()
+        self.put(".claude/.kijito_api_token", "  \n")
+        self.put(".config/kijito/api_token", "")
+        self.assertEqual(self.redeem("--kind", "watcher"), 0, self.err)
+        body = json.loads(self.server.posts()[0]["body"])
+        self.assertNotIn("presented_key_sha256s", body)
+        self.assertNotIn(hashlib.sha256(b"").hexdigest(), self.server.posts()[0]["body"].decode())
+
+    def test_a_loose_mcp_config_is_warned_about_and_still_scanned(self):
+        self.serve()
+        k = _fixture_key("mine in a 0644 config")
+        p = self.put(".claude.json", '{"headers": {"Authorization": "Bearer %s"}}' % k, mode=0o644)
+        self.assertEqual(self.redeem("--kind", "watcher"), 0, self.err)
+        self.assertIn(p, self.err)
+        self.assertIn("readable by other users", self.err)
+        self.assertEqual(self.server.presented(), [_sha(k)])
+        self.assertEqual(self.mode(p), 0o644)
+
+    def test_a_symlinked_or_oversized_config_is_skipped_with_a_warning(self):
+        self.serve()
+        k1, k2 = _fixture_key("in symlinked config"), _fixture_key("in big config")
+        real = self.put("cfg.json", '"Bearer %s"' % k1, root=self.root)
+        os.symlink(real, self.path(".claude.json"))
+        big = self.put(".codex/config.toml", ('"Bearer %s"\n' % k2) + "#" * (2 << 20))
+        self.assertEqual(self.redeem("--kind", "watcher"), 0, self.err)
+        self.assertIn("not checking %s for keys: it is a symbolic link" % self.path(".claude.json"), self.err)
+        self.assertIn("not checking %s for keys: it is larger than" % big, self.err)
+        self.assertNotIn("presented_key_sha256s", json.loads(self.server.posts()[0]["body"]))
+
+    def test_only_a_whole_key_shaped_env_value_is_hashed(self):
+        self.serve()
+        k = _fixture_key("env")
+        self.env.update({"SHORT": k[:-1], "LONG": k + "x", "PREFIXED": "Bearer " + k, "PADDED": "  %s\n" % k,
+                         "NOT_A_KEY": "hello"})
+        self.assertEqual(self.redeem("--kind", "watcher"), 0, self.err)
+        self.assertEqual(self.server.presented(), [_sha(k)])
+
+    def test_project_configs_are_scanned_and_a_project_only_hit_is_flagged(self):
+        self.serve()
+        mine = _fixture_key("same account, project file")
+        for rel in (".mcp.json", ".claude/settings.json", ".claude/settings.local.json", ".codex/config.toml"):
+            with self.subTest(rel=rel):
+                p = self.put(rel, '"%s"' % mine, root=self.cwd)
+                if os.path.exists(self.watcher()):
+                    os.unlink(self.watcher())
+                self.assertEqual(self.redeem("--kind", "watcher"), 0, self.err)
+                self.assertEqual(self.server.presented(), [_sha(mine)])
+                os.unlink(p)
+        theirs = _fixture_key("other account, project file")
+        self.server.foreign = {_sha(theirs)}
+        p = self.put(".claude/settings.local.json", '{"env": {"KIJITO_API_TOKEN": "%s"}}' % theirs, root=self.cwd)
+        os.unlink(self.watcher())
+        self.assertEqual(self.redeem("--kind", "watcher"), 4)
+        self.assertIn("PICKUP_WRONG_ACCOUNT", self.out)
+        self.assertIn(p, self.err)
+        self.assertIn("project's own files", self.err)
+
+
+class RedeemKeyBaseTest(_RedeemCase):
+    def test_a_non_default_base_needs_the_api_base_file_loopback_included(self):
+        self.serve(allow=False)
+        self.assertEqual(self.redeem("--kind", "watcher"), 2)
+        self.assertIn("PICKUP_BASE_NOT_ALLOWED", self.out)
+        self.assertNothingSent()
+        self.env["KIJITO_BASE"] = self.base
+        self.assertEqual(self.redeem("--kind", "watcher", api_base=False), 2)
+        self.assertIn("PICKUP_BASE_NOT_ALLOWED", self.out)
+        self.assertNothingSent()
+        self.assertEqual(self.temps(), [])
+
+    def test_a_matching_owner_only_api_base_file_allows_it(self):
+        self.serve()
+        self.env["KIJITO_BASE"] = self.base
+        self.assertEqual(self.redeem("--kind", "watcher", api_base=False), 0, self.err)
+
+    def test_an_api_base_file_that_is_loose_linked_or_different_is_refused(self):
+        self.serve(allow=False)
+        p = self.path(km.API_BASE_FILE)
+        real = self.put("api_base", self.base + "\n", root=self.root)
+        for setup in ("loose", "symlink", "different", "garbage"):
+            with self.subTest(setup=setup):
+                if os.path.lexists(p):
+                    os.unlink(p)
+                if setup == "loose":
+                    self.put(km.API_BASE_FILE, self.base + "\n", mode=0o644)
+                elif setup == "symlink":
+                    os.makedirs(os.path.dirname(p), mode=0o700, exist_ok=True)
+                    os.symlink(real, p)
+                elif setup == "different":
+                    self.put(km.API_BASE_FILE, "http://127.0.0.1:1\n")
+                else:
+                    self.put(km.API_BASE_FILE, "not a url\n")
+                self.assertEqual(self.redeem("--kind", "watcher"), 2)
+                self.assertIn("PICKUP_BASE_NOT_ALLOWED", self.out)
+                self.assertNothingSent()
+                if setup == "loose":
+                    self.assertEqual(self.mode(p), 0o644)
+
+    def test_the_default_base_needs_no_file(self):
+        self.assertIsNone(km._redeem_base_refusal(km.DEFAULT_API_BASE, self.home))
+        self.assertIsNotNone(km._redeem_base_refusal("https://kijito.example.com", self.home))
+
+    def test_a_code_for_another_host_exits_3_before_sending(self):
+        self.serve()
+        self.assertEqual(self.redeem("--kind", "watcher", code=_pickup_code("api.kijito.ai")), 3)
+        self.assertIn("PICKUP_WRONG_HOST", self.out)
+        self.assertNothingSent()
+        self.assertEqual(self.redeem("--kind", "watcher", code=_pickup_code("127.0.0.1:1")), 3)
+        self.assertNothingSent()
+
+    def test_a_malformed_code_is_a_usage_error(self):
+        self.serve()
+        for bad in ("kpc_short@127.0.0.1:%d" % self.server.port,
+                    "kpc_" + _CROCKFORD_FIXTURE.lower() + "@127.0.0.1:%d" % self.server.port,
+                    _fixture_key("a key is not a code"), self.code() + " trailing"):
+            with self.subTest(bad=bad[:10]):
+                self.assertEqual(self.redeem("--kind", "watcher", code=bad), 2)
+                self.assertNothingSent()
+
+
+class RedeemKeyHomeTest(_RedeemCase):
+    def test_a_home_that_disagrees_with_the_passwd_entry_is_refused(self):
+        self.serve()
+        other = os.path.join(self.root, "elsewhere")
+        os.mkdir(other)
+        for value in (other, ""):
+            with self.subTest(value=value):
+                self.env["HOME"] = value
+                self.assertEqual(self.redeem("--kind", "watcher"), 2)
+                self.assertIn(self.home, self.err)
+                if value:
+                    self.assertIn(other, self.err)
+                self.assertNothingSent()
+        self.assertFalse(os.path.exists(os.path.join(other, ".config")))
+
+    def test_no_passwd_entry_is_refused(self):
+        self.serve()
+        self._patch(km, "pwd", _FakePwd(self.home, missing=True))
+        self.assertEqual(self.redeem("--kind", "watcher"), 2)
+        self.assertIn("passwd", self.err)
+        self.assertNothingSent()
+
+    def test_an_unset_home_or_one_that_reaches_the_same_dir_through_a_symlink_proceeds(self):
+        self.serve()
+        link = os.path.join(self.root, "home-link")
+        os.symlink(self.home, link)
+        self.env["HOME"] = link
+        self.assertEqual(self.redeem("--kind", "watcher", "--no-verify"), 0, self.err)
+        os.unlink(self.watcher())
+        del self.env["HOME"]
+        self.assertEqual(self.redeem("--kind", "watcher", "--no-verify"), 0, self.err)
+
+    def test_a_symlinked_config_dir_is_accepted(self):
+        self.serve()
+        real = os.path.join(self.root, "realconfig")
+        os.mkdir(real, 0o700)
+        os.makedirs(os.path.join(real, "kijito-inbox-monitor"), mode=0o700)
+        os.rename(self.path(km.API_BASE_FILE), os.path.join(real, "kijito-inbox-monitor", "api_base"))
+        os.rmdir(os.path.dirname(self.path(km.API_BASE_FILE)))
+        os.rmdir(self.path(".config"))
+        os.symlink(real, self.path(".config"))
+        self.assertEqual(self.redeem("--kind", "watcher", "--token-file",
+                                     "~/.config/kijito-inbox-monitor/token"), 0, self.err)
+        self.assertEqual(self.read(os.path.join(real, "kijito-inbox-monitor", "token")), self.server.key + "\n")
+
+
+class RedeemKeyNetworkTest(_RedeemCase):
+    def test_every_answer_maps_to_its_exit_by_body_code(self):
+        self.serve()
+        table = [
+            (400, {"error": "x", "code": "invalid_argument"}, 2, "REDEEM_REFUSED"),
+            (400, {"error": "x"}, 2, "REDEEM_REFUSED"),
+            (404, {"error": "x", "code": "not_found"}, 4, "PICKUP_NOT_FOUND"),
+            (410, {"error": "x", "code": "pickup_expired"}, 4, "PICKUP_EXPIRED"),
+            (409, {"error": "x", "code": "pickup_used"}, 4, "PICKUP_USED"),
+            (403, {"error": "x", "code": "pickup_wrong_account"}, 4, "PICKUP_WRONG_ACCOUNT"),
+            (409, {"error": "x", "code": "pickup_wrong_kind"}, 4, "PICKUP_WRONG_KIND"),
+            (500, {"error": "x", "code": "pickup_unsealable"}, 4, "PICKUP_FAILED"),
+            (429, {"error": "x", "code": "rate_limited"}, 6, "PICKUP_RETRY_LATER"),
+            (413, {"error": "x", "code": "edge_request_too_large"}, 6, "PICKUP_RETRY_LATER"),
+            (429, {"error": "x", "code": "edge_rate_limited"}, 6, "PICKUP_RETRY_LATER"),
+            (500, {"error": "x", "code": "edge_internal_error"}, 6, "PICKUP_RETRY_LATER"),
+            (503, {"error": "x", "code": "edge_unavailable"}, 6, "PICKUP_RETRY_LATER"),
+            (504, {"error": "x", "code": "edge_gateway_timeout"}, 6, "PICKUP_RETRY_LATER"),
+            (502, {"error": "x", "code": "edge_bad_gateway"}, 7, "PICKUP_AMBIGUOUS"),
+            (500, {"error": "x", "code": "internal_error"}, 7, "PICKUP_AMBIGUOUS"),
+            (503, {"error": "x", "code": "control_plane_unavailable"}, 7, "PICKUP_AMBIGUOUS"),
+            (409, {"error": "x", "code": "pickup_unavailable"}, 7, "PICKUP_AMBIGUOUS"),
+            (418, {"error": "x", "code": "a_code_from_the_future"}, 7, "PICKUP_AMBIGUOUS"),
+            (500, {"error": "no code"}, 7, "PICKUP_AMBIGUOUS"),
+        ]
+        for status, body, want, token in table:
+            with self.subTest(status=status, code=body.get("code")):
+                self.server.pickup = ("json", status, body)
+                self.assertEqual(self.redeem("--kind", "watcher"), want, self.err)
+                self.assertTrue(self.out.startswith(token), self.out)
+                self.assertFalse(os.path.exists(self.watcher()))
+                self.assertEqual(self.temps(), [])
+        for status in (502, 504, 524):
+            with self.subTest(status=status, body="html"):
+                self.server.pickup = ("raw", status, b"<html>Cloudflare</html>")
+                self.assertEqual(self.redeem("--kind", "watcher"), 7)
+                self.assertTrue(self.out.startswith("PICKUP_AMBIGUOUS"), self.out)
+
+    def test_a_200_without_a_usable_key_is_ambiguous(self):
+        self.serve()
+        for spec in (("raw", 200, b"not json"), ("json", 200, {"result": {}}),
+                     ("json", 200, {"result": {"token": "kjt_short"}}), ("json", 200, ["x"])):
+            with self.subTest(spec=spec[0]):
+                self.server.pickup = spec
+                self.assertEqual(self.redeem("--kind", "watcher"), 7)
+                self.assertFalse(os.path.exists(self.watcher()))
+                self.assertEqual(self.temps(), [])
+
+    def test_a_dropped_connection_after_the_request_is_ambiguous_and_never_retried(self):
+        self.serve()
+        self.server.pickup = ("drop",)
+        self.assertEqual(self.redeem("--kind", "watcher"), 7)
+        self.assertTrue(self.out.startswith("PICKUP_AMBIGUOUS"))
+        self.assertEqual(len(self.server.posts()), 1)
+        self.assertEqual(self.temps(), [])
+
+    def test_a_refused_connection_is_retry_safe(self):
+        self.serve()
+        dead = _dead_port()
+        self.base = "http://127.0.0.1:%d" % dead
+        os.unlink(self.path(km.API_BASE_FILE))
+        self.put(km.API_BASE_FILE, self.base + "\n")
+        self.assertEqual(self.redeem("--kind", "watcher", code=_pickup_code("127.0.0.1:%d" % dead)), 6)
+        self.assertTrue(self.out.startswith("PICKUP_RETRY_LATER"))
+        self.assertEqual(self.temps(), [])
+
+    def test_a_tls_failure_is_before_sending_and_retry_safe(self):
+        # https to a server that does not speak TLS: the handshake fails inside the explicit connect, so no
+        # HTTP request was ever written and the code is still live (exit 6, not 7).
+        self.serve(allow=False)
+        self.base = "https://127.0.0.1:%d" % self.server.port
+        self.put(km.API_BASE_FILE, self.base + "\n")
+        self.assertEqual(self.redeem("--kind", "watcher"), 6, self.err)
+        self.assertTrue(self.out.startswith("PICKUP_RETRY_LATER reason=connect"), self.out)
+        self.assertEqual(self.server.posts(), [])
+        self.assertEqual(self.temps(), [])
+
+    def test_a_redirect_is_never_followed(self):
+        self.serve()
+        self.server.pickup = ("redirect", self.base + "/api/auth/key-pickup2")
+        self.assertEqual(self.redeem("--kind", "watcher"), 7)
+        self.assertEqual([r["path"] for r in self.server.requests], ["/api/auth/key-pickup"])
+        self.server.requests.clear()
+        self.server.pickup = ("ok",)
+        self.server.me = ("redirect", self.base + "/elsewhere")
+        self.assertEqual(self.redeem("--kind", "watcher"), 0)
+        self.assertIn("verified=no reason=http_302", self.out)
+        self.assertEqual([r["path"] for r in self.server.gets()], ["/api/auth/me?probe=1"])
+
+    def test_proxy_variables_are_ignored(self):
+        self.serve()
+        dead = "http://127.0.0.1:%d" % _dead_port()
+        for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+            old = os.environ.get(name)
+            os.environ[name] = dead
+            self.addCleanup(lambda n=name, o=old: os.environ.pop(n, None) if o is None else os.environ.__setitem__(n, o))
+        for name in ("NO_PROXY", "no_proxy"):
+            if name in os.environ:
+                old = os.environ.pop(name)
+                self.addCleanup(os.environ.__setitem__, name, old)
+        self.env.update({k: dead for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")})
+        self.assertEqual(self.redeem("--kind", "watcher"), 0, self.err)
+        self.assertIn("verified=yes", self.out)
+        self.assertEqual(len(self.server.requests), 2)
+
+    def test_verify_reports_a_revoked_key_a_wrong_account_and_an_ignored_probe(self):
+        self.serve()
+        for me, reason in ((("json", 401, {"error": "x"}), "revoked"),
+                           (("json", 200, {"probe": True, "account": ACCT_B}), "account_mismatch"),
+                           (("json", 200, {"account": ACCT_A}), "probe_not_honoured"),
+                           (("json", 500, {"error": "x"}), "http_500")):
+            with self.subTest(reason=reason):
+                if os.path.exists(self.watcher()):
+                    os.unlink(self.watcher())
+                self.server.me = me
+                self.assertEqual(self.redeem("--kind", "watcher"), 0, self.err)
+                self.assertIn("verified=no reason=%s" % reason, self.out)
+                self.assertEqual(self.read(self.watcher()), self.server.key + "\n", "the file must be kept")
+
+    def test_interrupts_map_by_how_far_the_run_got_and_never_to_0(self):
+        self.serve()
+        real_pin = km.pin_for
+
+        def interrupt(*a, **kw):
+            raise KeyboardInterrupt
+        with self.subTest(at="before send"):
+            self._patch(km, "pin_for", interrupt)
+            self.assertEqual(self.redeem("--kind", "watcher"), 6)
+            self.assertTrue(self.out.startswith("PICKUP_RETRY_LATER"))
+            self.assertNothingSent()
+            self.assertEqual(self.temps(), [])
+            km.pin_for = real_pin
+        with self.subTest(at="after send"):
+            self._patch(km._PinnedHTTPConnection, "getresponse", interrupt)
+            self.assertEqual(self.redeem("--kind", "watcher"), 7)
+            self.assertTrue(self.out.startswith("PICKUP_AMBIGUOUS"))
+            self.assertTrue(self.server.posted.wait(5))
+            self.assertEqual(self.temps(), [])
+            del km._PinnedHTTPConnection.getresponse
+        with self.subTest(at="after the parsed 200, before the temp holds it"):
+            self._patch(km, "_write_all", interrupt)
+            self.assertEqual(self.redeem("--kind", "watcher"), 5)
+            self.assertIn("KEY_LOST id=tok_123", self.out)
+            self.assertFalse(os.path.exists(self.watcher()))
+            self.assertEqual(self.temps(), [])
+        self.assertNoKeyInOutput()
+
+    def test_an_interrupt_once_the_temp_holds_the_key_parks_it(self):
+        self.serve()
+
+        def interrupt(*a, **kw):
+            raise KeyboardInterrupt
+        self._patch(km.os, "link", interrupt)
+        self.assertEqual(self.redeem("--kind", "watcher"), 8)
+        (tmp,) = self.temps()
+        tmp = os.path.join(os.path.dirname(self.watcher()), tmp)
+        self.assertEqual(self.read(tmp), self.server.key + "\n")
+        self.assertEqual(self.mode(tmp), 0o600)
+        self.assertIn("KEY_PARKED file=%s" % tmp, self.out)
+
+    def test_an_interrupt_after_the_key_is_in_place_reports_it_saved_and_unchecked(self):
+        self.serve()
+
+        def interrupt(*a, **kw):
+            raise KeyboardInterrupt
+        self._patch(km, "build_opener", interrupt)
+        self.assertEqual(self.redeem("--kind", "watcher"), 0)
+        self.assertEqual(self.out.strip(), "KEY_SAVED file=%s verified=no reason=interrupted" % self.watcher())
+        self.assertEqual(self.read(self.watcher()), self.server.key + "\n")
+        self.assertEqual(self.temps(), [])
+        self.assertNoKeyInOutput()
+
+    def test_a_failed_write_after_the_200_is_key_lost_with_the_id(self):
+        self.serve()
+
+        def full(fd, data):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        self._patch(km, "_write_all", full)
+        self.assertEqual(self.redeem("--kind", "watcher"), 5)
+        self.assertTrue(self.out.startswith("KEY_LOST id=tok_123"), self.out)
+        self.assertIn('token_id="tok_123"', self.err)
+        self.assertFalse(os.path.exists(self.watcher()))
+        self.assertEqual(self.temps(), [])
+        self.assertNoKeyInOutput()
+
+    def test_the_key_is_never_printed_on_any_path(self):
+        self.serve()
+        runs = [("ok", (), 0), ("json", (410, {"code": "pickup_expired"}), 4), ("drop", (), 7)]
+        for kind, rest, want in runs:
+            with self.subTest(outcome=kind):
+                if os.path.exists(self.watcher()):
+                    os.unlink(self.watcher())
+                self.server.pickup = (kind,) + rest
+                self.assertEqual(self.redeem("--kind", "watcher"), want)
+                self.assertNoKeyInOutput()
+        self.server.pickup = ("ok",)
+        self.server.before_reply = lambda: self.put(km.WATCHER_KEY_FILE, "raced\n")
+        self.assertEqual(self.redeem("--kind", "watcher"), 8)
+        self.assertNoKeyInOutput()
+
+    def test_no_temp_is_left_behind_on_any_refusal(self):
+        self.serve()
+        d = os.path.dirname(self.watcher())
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        refusals = {
+            "unsafe dir": lambda: os.chmod(d, 0o777),
+            "prefix mismatch": lambda: self.put(km.WATCHER_KEY_FILE, _fixture_key("z") + "\n"),
+            "insecure key file": lambda: self.put(".claude/.kijito_api_token", _fixture_key("q"), mode=0o640),
+            "base not allowed": lambda: os.unlink(self.path(km.API_BASE_FILE)),
+            "home mismatch": lambda: self.env.__setitem__("HOME", self.root),
+        }
+        for name, arrange in refusals.items():
+            with self.subTest(refusal=name):
+                arrange()
+                flags = ["--kind", "watcher"] + (["--replace-prefix", "kjt_AbCd1234"]
+                                                 if name == "prefix mismatch" else [])
+                self.assertEqual(self.redeem(*flags), 2, name)
+                self.assertNothingSent()
+                self.assertEqual(self.temps(d), [], name)
+                os.chmod(d, 0o700)
+                self.env["HOME"] = self.home
+                for rel in (km.WATCHER_KEY_FILE, ".claude/.kijito_api_token"):
+                    if os.path.exists(self.path(rel)):
+                        os.unlink(self.path(rel))
+                if not os.path.exists(self.path(km.API_BASE_FILE)):
+                    self.put(km.API_BASE_FILE, self.base + "\n")
+
+
+class RedeemKeyWindowsTest(_RedeemCase):
+    """Native Windows, SIMULATED: IS_POSIX False and os.geteuid removed (as WindowsNativeTest does). The home is
+    the profile folder Windows reports; owner, mode and directory checks are skipped; symlinks and junctions are
+    still refused through the lstat reparse tag; only the default base is accepted."""
+
+    def setUp(self):
+        super().setUp()
+        self._patch(km, "IS_POSIX", False)
+        geteuid = getattr(os, "geteuid", None)
+        if geteuid is not None:
+            del os.geteuid
+            self.addCleanup(setattr, os, "geteuid", geteuid)
+        self._patch(km, "_windows_home", lambda: self.home)
+        self._patch(km, "_windows_profile_dir", lambda: self.home)
+
+    def allow_loopback(self):
+        # Test-only: Windows otherwise accepts only https://api.kijito.ai, which a test must never reach.
+        self._patch(km, "_redeem_base_refusal", lambda base, home: None)
+
+    def test_a_home_that_is_not_the_profile_folder_is_refused(self):
+        self.serve()
+        self.allow_loopback()
+        other = os.path.join(self.root, "Other")
+        os.mkdir(other)
+        self._patch(km, "_windows_profile_dir", lambda: other)
+        self.assertEqual(self.redeem("--kind", "watcher"), 2)
+        self.assertIn(other, self.err)
+        self.assertIn(self.home, self.err)
+        self.assertNothingSent()
+        km._windows_profile_dir = lambda: self.home.upper() if os.path.normcase("A") == "a" else self.home
+        self.assertEqual(self.redeem("--kind", "watcher"), 0, self.err)
+
+    def test_the_whole_redeem_path_without_posix_flags_or_modes(self):
+        self.serve()
+        self.allow_loopback()
+        for flag in ("O_NOFOLLOW", "O_NONBLOCK"):
+            if hasattr(os, flag):
+                old = getattr(os, flag)
+                delattr(os, flag)
+                self.addCleanup(setattr, os, flag, old)
+        d = os.path.dirname(self.watcher())
+        os.makedirs(d, exist_ok=True)
+        os.chmod(d, 0o777)
+        k1, k2, k3 = _fixture_key("win config"), _fixture_key("win env"), _fixture_key("win legacy file")
+        self.put(".claude.json", '{"headers": {"Authorization": "Bearer %s"}}' % k1, mode=0o666)
+        self.put(".claude/.kijito_api_token", k3 + "\n", mode=0o666)
+        self.env["FOO"] = k2
+        self.assertEqual(self.redeem("--kind", "watcher"), 0, self.err)
+        self.assertTrue(self.out.startswith("KEY_SAVED file=%s mode=acl " % self.watcher()), self.out)
+        self.assertIn("verified=yes", self.out)
+        self.assertEqual(self.read(self.watcher()), self.server.key + "\n")
+        self.assertEqual(sorted(self.server.presented()), sorted([_sha(k1), _sha(k2), _sha(k3)]))
+        self.assertEqual(self.temps(d), [])
+
+    @contextlib.contextmanager
+    def _reparse(self, path, tag):
+        real = km._lstat
+        km._lstat = lambda p: _FakeStat(tag) if p == path else real(p)
+        try:
+            yield
+        finally:
+            km._lstat = real
+
+    def test_symlinks_and_junctions_are_refused_by_their_reparse_tag(self):
+        self.serve()
+        self.allow_loopback()
+        for tag in (km.IO_REPARSE_TAG_SYMLINK, km.IO_REPARSE_TAG_MOUNT_POINT):
+            with self.subTest(tag=hex(tag), what="target"):
+                p = self.put(km.WATCHER_KEY_FILE, "")
+                with self._reparse(p, tag):
+                    self.assertEqual(self.redeem("--kind", "watcher"), 2)
+                self.assertIn("symbolic link", self.err)
+                self.assertNothingSent()
+                os.unlink(p)
+            with self.subTest(tag=hex(tag), what="key file"):
+                p = self.put(".claude/.kijito_api_token", _fixture_key("t"))
+                with self._reparse(p, tag):
+                    self.assertEqual(self.redeem("--kind", "watcher"), 2)
+                self.assertIn(p, self.err)
+                self.assertIn("symbolic link", self.err)
+                self.assertNothingSent()
+                os.unlink(p)
+            with self.subTest(tag=hex(tag), what="config"):
+                k = _fixture_key("in a linked config")
+                p = self.put(".claude.json", '"%s"' % k)
+                with self._reparse(p, tag):
+                    self.assertEqual(self.redeem("--kind", "watcher", "--no-verify"), 0, self.err)
+                self.assertIn("not checking %s for keys: it is a symbolic link" % p, self.err)
+                self.assertNotIn("presented_key_sha256s", json.loads(self.server.posts()[-1]["body"]))
+                os.unlink(p)
+                os.unlink(self.watcher())
+                self.server.requests.clear()
+
+    def test_a_directory_in_place_of_the_target_or_a_key_file_is_refused(self):
+        self.serve()
+        self.allow_loopback()
+        os.makedirs(self.watcher())
+        self.assertEqual(self.redeem("--kind", "watcher"), 2)
+        self.assertIn("not a regular file", self.err)
+        os.rmdir(self.watcher())
+        os.makedirs(self.path(".claude/.kijito_api_token"))
+        self.assertEqual(self.redeem("--kind", "watcher"), 2)
+        self.assertIn("not a regular file", self.err)
+        self.assertNothingSent()
+
+    def test_any_non_default_base_is_refused_even_with_an_api_base_file(self):
+        self.serve()
+        self.assertEqual(self.redeem("--kind", "watcher"), 2)
+        self.assertIn("PICKUP_BASE_NOT_ALLOWED", self.out)
+        self.assertIn('delivery="inline"', self.err)
+        self.assertNothingSent()

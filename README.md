@@ -34,6 +34,55 @@ Generate one in your Kijito account settings.
 export KIJITOMON_TOKEN="<your-kijito-api-token>"
 ```
 
+## Collecting a new API key (`--redeem-key`)
+
+When an agent asks Kijito for an API key with `delivery="pickup"`, the reply does not contain the key. It
+contains a single-use pickup code (`kpc_...@api.kijito.ai`, dead after one use or 10 minutes) and one command
+that collects the key over TLS and writes it straight to its key file, so the key never passes through the
+conversation, a command line, an approval prompt or any output:
+
+```sh
+printf '%s\n' 'kpc_...@api.kijito.ai' | uvx kijito-inbox-monitor@latest --redeem-key --kind watcher --expect-account acct_...
+```
+
+Run the command exactly as the reply gives it. The code is read from stdin (a positional code is refused); on a
+terminal it is asked for without echo, and `$KIJITO_PICKUP_CODE` is the fallback.
+
+- **Where it saves.** `--kind watcher` saves to `~/.config/kijito-inbox-monitor/token` (read-only keys, the file
+  this watcher reads), `--kind rest` to `~/.config/kijito/api_token`. `--token-file` may only name one of those
+  two, or `~/.config/kijito-inbox-monitor/token.<persona>` for a watcher key (the name `--safe-persona` prints).
+  The file is created owner-only (0600) in an owner-only directory; a directory other users can write is
+  refused. Paths are under your account's home directory from the system's user database; if `$HOME` points
+  somewhere else, the command stops and names both.
+- **It never overwrites a key by accident.** A target that already holds a key is refused unless you pass
+  `--replace` (ask the user first), or `--replace-prefix kjt_XXXXXXXX`, which a renewal reply carries and which
+  replaces the target only if it still holds the key being renewed. If the target changes while the key is
+  being collected, the key is left in an owner-only temp file next to it and the path is printed (`KEY_PARKED`).
+- **Which server.** Only `https://api.kijito.ai`. For your own server, local ones included, you write its base
+  into `~/.config/kijito-inbox-monitor/api_base` yourself (one line, `chmod 600`); `--api-base` or `$KIJITO_BASE`
+  alone is not enough, and the code's host must match the base. On Windows only the default server is supported.
+- **Account check.** It sends the SHA-256 of every Kijito key it finds on this machine (the key files above,
+  `~/.claude/.kijito_api_token*`, `~/.config/kijito/api_token*`, the API-key headers in the MCP configs of Claude
+  Code, Codex and OpenCode, including the working directory's, and any environment variable whose whole value
+  is a key), never a key itself and no `Authorization` header. The server refuses (and revokes) a key for a
+  different account than those. A key file with any mode but 0600, or a symlink, stops the run and is named.
+- **Output.** One line, never the key:
+  `KEY_SAVED file=... mode=0600 prefix=kjt_AbCd1234 scopes=memory.read account=acct_... verified=yes`.
+  `verified` checks the new key against `/api/auth/me?probe=1` (`--no-verify` skips it).
+
+| exit | meaning |
+|------|---------|
+| 0 | saved (`KEY_SAVED`) |
+| 2 | refused before anything was sent: usage, target, insecure key file, `PICKUP_BASE_NOT_ALLOWED`, `$HOME` mismatch |
+| 3 | `PICKUP_WRONG_HOST`: the code is for a different server; nothing was sent |
+| 4 | the server refused: `PICKUP_EXPIRED`, `PICKUP_USED`, `PICKUP_NOT_FOUND`, `PICKUP_WRONG_ACCOUNT`, `PICKUP_WRONG_KIND`, `PICKUP_FAILED` |
+| 5 | `KEY_LOST id=...`: collected but not saved; revoke that key |
+| 6 | `PICKUP_RETRY_LATER`: nothing was consumed; rerun the same command before the code expires |
+| 7 | `PICKUP_AMBIGUOUS`: sent, but no usable answer; the key may be collected, so revoke it and mint a new one |
+| 8 | `KEY_PARKED file=...`: saved, but at the temp path printed |
+
+There is no automatic retry.
+
 ## Local or self-hosted API
 
 The producer watches `https://api.kijito.ai` unless you name another Kijito API, with `--api-base URL` or the
@@ -609,6 +658,11 @@ four sat above it. Only the newest page's count answers the question "is there u
 | `--no-fast-path` | Disable the `/api/notify/pending` pre-check; always full-poll the inbox list. |
 | `--resync-every N` | Fast-path safety floor: force a full inbox poll after at most N cheap skips (default 10), so a stale unread count can never blind the watcher. |
 | `--self-test` | Probe the source and do a synthetic emit (fires `--exec` too), then exit. Run it before trusting a live arm. |
+| `--redeem-key` | Collect a key minted with `delivery="pickup"` (code on stdin) and save it; see [Collecting a new API key](#collecting-a-new-api-key---redeem-key). Runs alone, before any watcher option is checked. |
+| `--kind watcher\|rest` | With `--redeem-key` (required): which key file. |
+| `--replace` / `--replace-prefix PREFIX` | With `--redeem-key`: replace a key already in the target / only the key starting with PREFIX. |
+| `--expect-account ACCT` | With `--redeem-key`: the account fingerprint the code must belong to. |
+| `--no-verify` | With `--redeem-key`: skip the `/api/auth/me?probe=1` check of the saved key. |
 
 ## Design
 
