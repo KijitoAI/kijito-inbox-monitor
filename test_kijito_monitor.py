@@ -7999,6 +7999,7 @@ class RedeemKeyScanTest(_RedeemCase):
             (".config/kijito-inbox-monitor/token.bob", theirs + "\n"),
             (".config/kijito/api_token.prev-1", theirs + "\n"),
             (".claude/.kijito_api_token", theirs + "\n"),
+            (".claude/.kijito_api_token-old", theirs + "\n"),
             (".claude.json", header),
             (".claude/settings.json", '{"env": {"KIJITO_API_TOKEN": "%s"}}' % theirs),
             (".codex/config.toml", '[mcp_servers.kijito]\nhttp_headers = { Authorization = "Bearer %s" }\n' % theirs),
@@ -8115,6 +8116,23 @@ class RedeemKeyScanTest(_RedeemCase):
         self.assertEqual(self.redeem("--kind", "watcher", "--replace"), 4)
         self.assertEqual(self.server.presented(), order[:32])
         self.assertIn("KEY_SCAN_TRUNCATED found=40 sent=32", self.err)
+
+    def test_every_kijito_api_token_variant_is_hashed_in_name_order(self):
+        # The README promises ~/.claude/.kijito_api_token*: a renamed or backed-up copy (`-old`, `_bak`) is a key
+        # file too, not only the bare file and its `.<name>` siblings.
+        self.serve()
+        keys = {}
+        for rel in (".claude/.kijito_api_token.alice", ".claude/.kijito_api_token-old",
+                    ".claude/.kijito_api_token", ".claude/.kijito_api_token_bak"):
+            keys[rel] = _fixture_key(rel)
+            self.put(rel, keys[rel] + "\n")
+        self.assertEqual(self.redeem("--kind", "watcher"), 0, self.err)
+        self.assertEqual(self.server.presented(), [_sha(keys[r]) for r in (
+            ".claude/.kijito_api_token", ".claude/.kijito_api_token-old", ".claude/.kijito_api_token.alice",
+            ".claude/.kijito_api_token_bak")])
+        loose = self.put(".claude/.kijito_api_token-old", keys[".claude/.kijito_api_token-old"] + "\n", mode=0o644)
+        self.assertEqual(self.redeem("--kind", "watcher", "--replace"), 2)
+        self.assertIn("chmod 600 %s" % loose, self.err)
 
     def test_the_same_key_in_two_places_is_one_hash(self):
         self.serve()

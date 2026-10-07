@@ -4067,8 +4067,7 @@ KEY_LOCATIONS = (
     ".config/kijito/api_token",
     ".config/kijito-inbox-monitor/token.*",
     ".config/kijito/api_token*",
-    ".claude/.kijito_api_token",
-    ".claude/.kijito_api_token.*",
+    ".claude/.kijito_api_token*",   # the bare file, per-persona `.<name>` files and any backup or rename of them
 )
 # MCP client configs, regex-scanned (never parsed) for key-shaped header or env values. Best effort: a config
 # that cannot be read safely is skipped with a warning, never a refusal. Home first, then the working directory.
