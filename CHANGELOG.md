@@ -5,6 +5,8 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-08
+
 ### Added
 - **`--redeem-key`: one-time key pickup (row M488).** A key minted with `delivery="pickup"` is never shown to the
   agent; the reply carries a single-use code, and `printf '%s\n' '<code>' | kijito-inbox-monitor --redeem-key

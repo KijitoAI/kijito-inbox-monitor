@@ -50,7 +50,7 @@ try:
 except ImportError:  # pragma: no cover - Windows
     pwd = None
 
-__version__ = "0.5.15"
+__version__ = "0.6.0"
 SOURCE = "kijito-inbox"
 # A named User-Agent is REQUIRED: api.kijito.ai is fronted by a WAF that 403s the default Python-urllib UA.
 USER_AGENT = "kijito-inbox-monitor/%s" % __version__
