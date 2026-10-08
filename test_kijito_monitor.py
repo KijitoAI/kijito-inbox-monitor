@@ -7873,6 +7873,19 @@ class RedeemKeyTargetTest(_RedeemCase):
                 self.assertIn("no longer holds key %s" % prefix, self.err)
                 self.assertEqual(self.temps(), [])
 
+    def test_replace_prefix_is_exactly_the_eight_characters_a_renewal_reply_shows(self):
+        # A longer "prefix" would let a whole key into argv (and the shell history, and an approval prompt).
+        self.serve()
+        old = _fixture_key("renewed")
+        self.put(km.WATCHER_KEY_FILE, old + "\n")
+        for prefix in (old[:13], old[:11], old, "kjt_AbCd123!", "KJT_AbCd1234"):
+            with self.subTest(length=len(prefix)):
+                self.assertEqual(self.redeem("--kind", "watcher", "--replace-prefix", prefix), 2)
+                self.assertNothingSent()
+                self.assertIn("kjt_ and 8 characters", self.err)
+                self.assertNotIn(old[4:20], self.out + self.err)
+        self.assertEqual(self.redeem("--kind", "watcher", "--replace-prefix", old[:12]), 0, self.err)
+
     def test_replace_and_replace_prefix_are_mutually_exclusive(self):
         self.serve()
         old = _fixture_key("renewed")
@@ -8456,7 +8469,115 @@ class RedeemKeyNetworkTest(_RedeemCase):
         self.assertTrue(self.out.startswith("PICKUP_AMBIGUOUS reason=interrupted"), self.out)
         self.assertEqual(self.temps(), [])
         self.assertEqual(seen, [], "the redeem's handler, not the caller's, took the signal")
-        self.assertIs(signal.getsignal(signal.SIGTERM), sentinel, "the caller's handler was not restored")
+        # A run that a signal ended leaves TERM ignored (the process is about to exit with the outcome code): a
+        # duplicate arriving now, such as a launcher's late relay of the same group kill, must not end it as 143.
+        self.assertIs(signal.getsignal(signal.SIGTERM), signal.SIG_IGN)
+        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(0.05)
+        self.assertEqual(seen, [])
+
+    def test_a_run_no_signal_ended_restores_the_callers_handlers(self):
+        import signal
+        self.serve()
+        sentinel = lambda signum, frame: None   # noqa: E731
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            self.addCleanup(signal.signal, sig, signal.signal(sig, sentinel))
+        self.assertEqual(self.redeem("--kind", "watcher"), 0, self.err)          # saved
+        self.assertEqual(self.redeem("--kind", "watcher"), 2, self.err)          # refused: the file exists
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            self.assertIs(signal.getsignal(sig), sentinel)
+
+    def test_a_second_signal_cannot_cut_the_clean_up_or_the_outcome_line_short(self):
+        # A process-group SIGTERM reaches the helper directly AND through a launcher that relays it (kijito-tools'
+        # npm launcher); a harness may repeat its TERM; a user may press Ctrl-C twice. Only the FIRST signal may
+        # act. Here a second TERM, a SIGINT and a SIGHUP land inside the clean-up and inside the outcome line.
+        import signal
+        self.serve()
+        seen = []
+        sentinel = lambda signum, frame: seen.append(signum)   # noqa: E731 - the caller's handler
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            self.addCleanup(signal.signal, sig, signal.signal(sig, sentinel))
+        real_get = km._PinnedHTTPConnection.getresponse
+
+        def term_then_answer(conn, *a, **kw):
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(0.05)
+            return real_get(conn, *a, **kw)
+        self._patch(km._PinnedHTTPConnection, "getresponse", term_then_answer)
+        real_cleanup = km._Redeem.cleanup
+
+        def cleanup_under_fire(r):
+            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                os.kill(os.getpid(), sig)
+                time.sleep(0.02)
+            return real_cleanup(r)
+        self._patch(km._Redeem, "cleanup", cleanup_under_fire)
+        real_line = km._redeem_line
+
+        def line_under_fire(token, fields):
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(0.02)
+            return real_line(token, fields)
+        self._patch(km, "_redeem_line", line_under_fire)
+        try:
+            rc = self.redeem("--kind", "watcher")
+        except KeyboardInterrupt:
+            # (Caught here so the defect reads as a test failure, not as unittest stopping the whole run.)
+            self.fail("a later signal escaped as an interrupt from inside the clean-up or the outcome line")
+        self.assertEqual(rc, 7)
+        self.assertEqual(self.out.count("\n"), 1, self.out)
+        self.assertTrue(self.out.startswith("PICKUP_AMBIGUOUS reason=interrupted"), self.out)
+        self.assertEqual(self.temps(), [])
+        self.assertEqual(seen, [], "a later signal reached the caller's handler before the outcome was printed")
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            self.assertIs(signal.getsignal(sig), signal.SIG_IGN, "a signal ended the run: duplicates stay ignored")
+
+    def test_sigint_and_ctrl_break_take_the_interrupt_path(self):
+        # Ctrl-Break (SIGBREAK, Windows only) used to end the process with no outcome line. Off Windows the name is
+        # bound to SIGUSR1 here so the same code path runs; the caller's recorder must never see it.
+        import signal
+        for name in ("SIGINT", "SIGBREAK"):
+            with self.subTest(signal=name):
+                if name == "SIGBREAK" and not hasattr(signal, "SIGBREAK"):
+                    signal.SIGBREAK = signal.SIGUSR1   # km.signal is this same module
+                    self.addCleanup(delattr, signal, "SIGBREAK")
+                sig = getattr(signal, name)
+                seen = []
+                prev = signal.signal(sig, lambda signum, frame: seen.append(signum))
+                self.addCleanup(signal.signal, sig, prev)
+                self.serve()
+                real = km._PinnedHTTPConnection.getresponse
+
+                def sig_then_answer(conn, *a, _sig=sig, _real=real, **kw):
+                    os.kill(os.getpid(), _sig)
+                    time.sleep(0.05)
+                    return _real(conn, *a, **kw)
+                self._patch(km._PinnedHTTPConnection, "getresponse", sig_then_answer)
+                try:
+                    rc = self.redeem("--kind", "watcher")
+                except KeyboardInterrupt:
+                    self.fail("%s escaped the redeem as an interrupt" % name)
+                self.assertEqual(rc, 7, self.err)
+                self.assertTrue(self.out.startswith("PICKUP_AMBIGUOUS reason=interrupted"), self.out)
+                self.assertEqual(seen, [])
+                self.assertEqual(self.temps(), [])
+                km._PinnedHTTPConnection.getresponse = real
+
+    def test_a_signal_ignored_on_entry_stays_ignored(self):
+        # nohup ignores SIGHUP, a shell ignores SIGINT for a background job: the redeem must not re-arm them.
+        import signal
+        self.serve()
+        self.addCleanup(signal.signal, signal.SIGHUP, signal.signal(signal.SIGHUP, signal.SIG_IGN))
+        real = km._PinnedHTTPConnection.getresponse
+
+        def hup_then_answer(conn, *a, **kw):
+            os.kill(os.getpid(), signal.SIGHUP)
+            time.sleep(0.05)
+            return real(conn, *a, **kw)
+        self._patch(km._PinnedHTTPConnection, "getresponse", hup_then_answer)
+        self.assertEqual(self.redeem("--kind", "watcher"), 0, self.err)
+        self.assertTrue(self.out.startswith("KEY_SAVED"), self.out)
+        self.assertIs(signal.getsignal(signal.SIGHUP), signal.SIG_IGN)
 
     def test_an_unreadable_working_directory_skips_project_configs(self):
         self.serve()

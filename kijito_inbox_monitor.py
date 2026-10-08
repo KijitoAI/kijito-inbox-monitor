@@ -4084,7 +4084,8 @@ _KEY_WHOLE = re.compile(r"kjt_[A-Za-z0-9_-]{43}")
 _SERVED_KEY = re.compile(r"kjt_[A-Za-z0-9_-]{20,256}")   # what a 200 may carry (shape-checked, never printed)
 _PICKUP_CODE = re.compile(r"kpc_[0-9A-HJKMNP-TV-Z]{32}@(?:[a-z0-9.\-]{1,253}|\[[0-9a-f:.]{2,45}\])(?::[0-9]{1,5})?")
 _ACCOUNT_FP = re.compile(r"acct_[0-9a-f]{16}")
-_REPLACE_PREFIX = re.compile(r"kjt_[A-Za-z0-9_-]{8,43}")
+# Exactly the prefix a renewal reply renders (kjt_ + 8). A longer one would let a whole key into argv.
+_REPLACE_PREFIX = re.compile(r"kjt_[A-Za-z0-9_-]{8}")
 _SAFE_FIELD = re.compile(r"[A-Za-z0-9_.:@-]{1,64}")
 # The stat module defines these only on Windows builds; the values are the documented Windows constants.
 IO_REPARSE_TAG_SYMLINK = getattr(stat, "IO_REPARSE_TAG_SYMLINK", 0xA000000C)
@@ -4411,8 +4412,8 @@ class _Redeem:
             raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "--replace and --replace-prefix are mutually "
                              "exclusive", reason="usage")
         if a.replace_prefix is not None and not _REPLACE_PREFIX.fullmatch(a.replace_prefix):
-            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "--replace-prefix must be a key prefix such as "
-                             "kjt_AbCd1234", reason="usage")
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "--replace-prefix must be the key prefix the "
+                             "reply shows: kjt_ and 8 characters, such as kjt_AbCd1234", reason="usage")
         if a.expect_account and not _ACCOUNT_FP.fullmatch(a.expect_account):
             raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "--expect-account must look like "
                              "acct_<16 hex>", reason="usage")
@@ -4979,23 +4980,57 @@ def _redeem_line(token, fields):
 
 
 class _RedeemTerminated(KeyboardInterrupt):
-    """SIGTERM/SIGHUP during --redeem-key: a harness timeout kill takes the SAME path as Ctrl-C, so the run still
-    prints its outcome and cleans up instead of dying with a half-collected key and no instruction (review F5)."""
+    """SIGTERM/SIGHUP/SIGINT (and Ctrl-Break on Windows) during --redeem-key: a harness timeout kill takes the SAME
+    path as Ctrl-C, so the run still prints its outcome and cleans up instead of dying with a half-collected key and
+    no instruction (review F5)."""
 
 
-def _redeem_on_signal(signum, frame):
-    raise _RedeemTerminated()
+# The signals that end a redeem through the interrupt path. SIGBREAK exists only on Windows (Ctrl-Break), where
+# it would otherwise end the process without an outcome line.
+_REDEEM_SIGNALS = ("SIGTERM", "SIGHUP", "SIGINT", "SIGBREAK")
 
 
-def _redeem_trap_signals():
-    """Route SIGTERM (and SIGHUP where it exists) to the interrupt path; returns what to restore. Only the main
-    thread may set handlers, so elsewhere this is a no-op."""
-    restore = []
-    for name in ("SIGTERM", "SIGHUP"):
+def _redeem_mask_signals():
+    """Ignore every redeem signal from now on. The FIRST one already chose the outcome; a second (a process-group
+    kill that also reaches a launcher which relays it, a second Ctrl-C, a harness that repeats its TERM) must not
+    fire inside abort(), cleanup() or the outcome line and leave a temp file or no instruction behind. redeem_key
+    restores the caller's handlers after the outcome is printed, unless a signal ended the run (then they stay
+    ignored until the process exits; see _REDEEM_SIGNALLED)."""
+    for name in _REDEEM_SIGNALS:
         sig = getattr(signal, name, None)
         if sig is None:
             continue
         try:
+            signal.signal(sig, signal.SIG_IGN)
+        except (ValueError, OSError):
+            pass
+
+
+# Set by the first redeem signal of a run. A run that a signal ended leaves the redeem signals IGNORED on return:
+# the process is about to exit with the outcome code, and a duplicate that arrives after the outcome line (a
+# launcher's relay of the same group kill lands a few milliseconds late) must not turn exit 6 into a death by
+# SIGTERM (143) that the caller would read as "unknown".
+_REDEEM_SIGNALLED = []
+
+
+def _redeem_on_signal(signum, frame):
+    _redeem_mask_signals()
+    _REDEEM_SIGNALLED.append(signum)
+    raise _RedeemTerminated()
+
+
+def _redeem_trap_signals():
+    """Route each redeem signal to the interrupt path; returns what to restore. A signal already IGNORED on entry
+    (nohup's SIGHUP, a background job's SIGINT) stays ignored, as Python itself leaves an ignored SIGINT alone.
+    Only the main thread may set handlers, so elsewhere this is a no-op."""
+    restore = []
+    for name in _REDEEM_SIGNALS:
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            if signal.getsignal(sig) == signal.SIG_IGN:
+                continue
             restore.append((sig, signal.signal(sig, _redeem_on_signal)))
         except (ValueError, OSError):
             pass
@@ -5009,26 +5044,36 @@ def redeem_key(args):
     and OSError -> 2 arms never apply: an interrupt means 6, 7, 5 or 8 depending on how far the run got."""
     r = _Redeem(args, _redeem_environ(), _redeem_stdin())
     outcome = None
+    del _REDEEM_SIGNALLED[:]
     restore = _redeem_trap_signals()
     try:
-        return r.run()
-    except RedeemExit as e:
-        outcome = e
-    except KeyboardInterrupt:
-        outcome, why = r.abort("interrupted"), "interrupted"
-    except Exception as e:  # noqa: BLE001 - the type only: an exception's text could carry a response body
-        outcome, why = r.abort("unexpected %s" % type(e).__name__), "error_%s" % type(e).__name__
+        try:
+            return r.run()
+        except RedeemExit as e:
+            _redeem_mask_signals()
+            outcome = e
+        except KeyboardInterrupt:
+            _redeem_mask_signals()
+            outcome, why = r.abort("interrupted"), "interrupted"
+        except Exception as e:  # noqa: BLE001 - the type only: an exception's text could carry a response body
+            _redeem_mask_signals()
+            outcome, why = r.abort("unexpected %s" % type(e).__name__), "error_%s" % type(e).__name__
+        finally:
+            # The run is ending: no signal may cut the clean-up or the outcome line short. Masked until the
+            # caller's handlers are restored, AFTER the outcome is printed.
+            _redeem_mask_signals()
+            r.cleanup()
+        if outcome is None:
+            # The key was already in place when the run stopped: say where, and that it was not checked.
+            _redeem_line("KEY_SAVED", [("file", r.target), ("verified", "no"), ("reason", why)])
+            return REDEEM_EXIT_SAVED
+        _redeem_line(outcome.token, [(k, v) for k, v in outcome.fields.items()])
+        _redeem_say("%s: %s" % (outcome.token, outcome.message))
+        return outcome.code
     finally:
-        r.cleanup()
-        for sig, handler in restore:
-            signal.signal(sig, handler)
-    if outcome is None:
-        # The key was already in place when the run stopped: say where, and that it was not checked.
-        _redeem_line("KEY_SAVED", [("file", r.target), ("verified", "no"), ("reason", why)])
-        return REDEEM_EXIT_SAVED
-    _redeem_line(outcome.token, [(k, v) for k, v in outcome.fields.items()])
-    _redeem_say("%s: %s" % (outcome.token, outcome.message))
-    return outcome.code
+        if not _REDEEM_SIGNALLED:
+            for sig, handler in restore:
+                signal.signal(sig, handler)
 
 
 # --------------------------------------------------------------------------------------------------------------------
