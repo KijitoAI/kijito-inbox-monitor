@@ -27,8 +27,15 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
   in place the outcome is read from the disk, so a saved key is never reported lost. A server that does not
   offer pickup answers `PICKUP_UNAVAILABLE` (exit 7: nothing collected; revoke the minted key and ask for it
   with delivery="inline").
+- Only the first interrupt acts during `--redeem-key`. A second SIGTERM, SIGHUP or Ctrl-C (a process-group kill that
+  also reaches a launcher which relays it, as kijito-tools' npm launcher does, or a harness repeating its TERM) is
+  ignored, so it can no longer fire inside the clean-up or the outcome line; a run that a signal ended keeps them
+  ignored until it exits, so a late duplicate cannot turn exit 6 into a death by SIGTERM. Ctrl-Break (SIGBREAK) on
+  Windows takes the same path as Ctrl-C, and a signal already ignored on entry (`nohup`) stays ignored.
+- `--replace-prefix` accepts exactly `kjt_` and 8 characters, the prefix a renewal reply renders; a longer value,
+  such as a whole key, is refused before anything is sent.
 - `scripts/mutation-check.py` accepts the multi-part `(label, [(pattern, replacement), ...])` form its docstring
-  already described, and gains 61 `M488-*` mutants, one per defence.
+  already described, and gains 68 `M488-*` mutants, one per defence.
 
 ## [0.5.15] - 2026-10-07
 

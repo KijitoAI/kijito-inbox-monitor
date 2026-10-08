@@ -56,7 +56,8 @@ terminal it is asked for without echo, and `$KIJITO_PICKUP_CODE` is the fallback
   somewhere else, the command stops and names both.
 - **It never overwrites a key by accident.** A target that already holds a key is refused unless you pass
   `--replace` (ask the user first), or `--replace-prefix kjt_XXXXXXXX`, which a renewal reply carries and which
-  replaces the target only if it still holds the key being renewed. If the target changes while the key is
+  replaces the target only if it still holds the key being renewed. The prefix is exactly `kjt_` and the 8
+  characters the reply shows; anything longer is refused, so a whole key never goes on a command line. If the target changes while the key is
   being collected, the key is left in an owner-only temp file next to it and the path is printed (`KEY_PARKED`).
 - **Which server.** Only `https://api.kijito.ai`. For your own server, local ones included, you write its base
   into `~/.config/kijito-inbox-monitor/api_base` yourself (one line, `chmod 600`); `--api-base` or `$KIJITO_BASE`
@@ -81,7 +82,10 @@ terminal it is asked for without echo, and `$KIJITO_PICKUP_CODE` is the fallback
 | 7 | `PICKUP_AMBIGUOUS`: sent, but no usable answer; the key may be collected, so revoke it and mint a new one. `PICKUP_UNAVAILABLE`: the server does not offer pickup; nothing was collected, but revoke the minted key and ask for it with `delivery="inline"` |
 | 8 | `KEY_PARKED file=...`: saved, but at the temp path printed |
 
-There is no automatic retry. An interrupt, SIGTERM or SIGHUP still prints one of these outcomes.
+There is no automatic retry. An interrupt (Ctrl-C, or Ctrl-Break on Windows), SIGTERM or SIGHUP still prints one
+of these outcomes. Only the first signal acts: any later one (a process-group kill that also reaches a launcher
+which relays it, a second Ctrl-C) is ignored until the process exits, so it cannot cut the clean-up short or
+change the exit code. A signal that was already ignored when the command started (`nohup`'s SIGHUP) stays ignored.
 
 ## Local or self-hosted API
 
@@ -660,7 +664,7 @@ four sat above it. Only the newest page's count answers the question "is there u
 | `--self-test` | Probe the source and do a synthetic emit (fires `--exec` too), then exit. Run it before trusting a live arm. |
 | `--redeem-key` | Collect a key minted with `delivery="pickup"` (code on stdin) and save it; see [Collecting a new API key](#collecting-a-new-api-key---redeem-key). Runs alone, before any watcher option is checked. |
 | `--kind watcher\|rest` | With `--redeem-key` (required): which key file. |
-| `--replace` / `--replace-prefix PREFIX` | With `--redeem-key`: replace a key already in the target / only the key starting with PREFIX. |
+| `--replace` / `--replace-prefix PREFIX` | With `--redeem-key`: replace a key already in the target / only the key starting with PREFIX (`kjt_` + exactly 8 characters). |
 | `--expect-account ACCT` | With `--redeem-key`: the account fingerprint the code must belong to. |
 | `--no-verify` | With `--redeem-key`: skip the `/api/auth/me?probe=1` check of the saved key. |
 
