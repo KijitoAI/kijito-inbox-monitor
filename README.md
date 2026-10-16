@@ -354,6 +354,41 @@ that can watch every persona (`--events-file-template`), while the systemd templ
 persona**. Either way the stream and state paths below are what your consumer tails; derive them from your own
 setup rather than copying another host's.
 
+## What it does on your machine, and how to remove it
+
+Everything here is opt-in and per-user: nothing runs until you start it or install a supervisor job for it,
+nothing needs root, and nothing is installed system-wide. **It never updates itself.** The producer downloads
+and installs nothing; its only network traffic is HTTPS to the Kijito API base it is configured for
+(`https://api.kijito.ai` unless you set another), and the only program it starts is your own `--exec` command.
+The version you run changes only when you upgrade it yourself (`uv tool upgrade kijito-inbox-monitor`). One
+caveat: a supervisor job that runs `uvx kijito-inbox-monitor@latest` fetches whatever is newest each time it
+restarts, so point a supervisor at an installed command or a pinned path instead.
+
+To remove it, undo whichever of these you set up:
+
+```sh
+# 1. Stop it. A foreground or nohup run: Ctrl-C, or kill its pid (pgrep -af kijito-inbox-monitor).
+#    macOS launchd job:
+launchctl bootout gui/$(id -u)/com.kijito.inbox-monitor
+rm ~/Library/LaunchAgents/com.kijito.inbox-monitor.plist
+#    Linux systemd user unit (once per persona you enabled):
+systemctl --user disable --now kijito-inbox-monitor@YOURPERSONA
+rm ~/.config/systemd/user/kijito-inbox-monitor@.service
+systemctl --user daemon-reload
+
+# 2. Remove the command.
+uv tool uninstall kijito-inbox-monitor        # or: pipx uninstall / pip uninstall kijito-inbox-monitor
+
+# 3. Delete its files: keys and settings, event and state files, wake pipe, pinned copies.
+rm -rf ~/.config/kijito-inbox-monitor ~/.local/state/kijito-inbox-monitor \
+       ~/.cache/kijito-inbox-monitor ~/.local/share/kijito-inbox-monitor
+```
+
+If you wrote events or state anywhere else (`--events-file`, `--state-file`, `--events-file-template`), delete
+those paths too. `--redeem-key --kind rest` saves to `~/.config/kijito/api_token`; delete that only if nothing
+else uses it. Removing a key file does not revoke the key: revoke any key you no longer need at
+https://kijito.ai/account.
+
 ## Watching your whole account (multi-persona)
 
 One producer can watch **every persona in your account** at once (the default when you pass no `--persona`). It
