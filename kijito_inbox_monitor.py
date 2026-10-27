@@ -1,0 +1,5353 @@
+#!/usr/bin/env python3
+"""Kijito Inbox Monitor - client-side liveness watcher for your Kijito inbox.
+
+A standalone, zero-dependency (Python stdlib only) process that polls your Kijito inbox at api.kijito.ai and emits
+one event per new message into whatever harness is running - NDJSON on stdout and/or by exec-ing a command per
+event. It keeps a *running* agent's inbox live by waking it BETWEEN tool calls. It
+is NOT a server.
+
+The API is https://api.kijito.ai unless --api-base or $KIJITO_BASE names another (a local stack or a
+self-hosted server; plain http only for this machine).
+
+Authentication is required: set $KIJITOMON_TOKEN (or --token-file) to your Kijito API token. POSIX target
+(Linux/macOS); on Windows it runs interval-only (no SIGUSR1 seam, no flock).
+"""
+import argparse
+import datetime
+import email.utils
+import errno
+import getpass
+import glob
+import hashlib
+import http.client
+import ipaddress
+import json
+import math
+import os
+import re
+import select
+import signal
+import socket
+import ssl
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+
+try:
+    import fcntl  # POSIX only
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+try:
+    import msvcrt  # Windows only: the single-writer lock there (StateFile.lock)
+except ImportError:
+    msvcrt = None
+try:
+    import pwd  # POSIX only: the account's home directory for --redeem-key
+except ImportError:  # pragma: no cover - Windows
+    pwd = None
+
+__version__ = "0.6.2"
+SOURCE = "kijito-inbox"
+# A named User-Agent is REQUIRED: api.kijito.ai is fronted by a WAF that 403s the default Python-urllib UA.
+USER_AGENT = "kijito-inbox-monitor/%s" % __version__
+# The API base. Hosted Kijito by default; a local stack or a self-hosted server is named with --api-base or
+# $KIJITO_BASE (the same variable the rest of the Kijito tooling reads). run() calls set_api_base()
+# before anything is fetched, so the four names below always describe the base this process watches.
+DEFAULT_API_BASE = "https://api.kijito.ai"
+API_BASE_ENV = "KIJITO_BASE"
+KIJITO_BASE = DEFAULT_API_BASE
+INBOX_URL = KIJITO_BASE + "/api/inbox"
+PERSONAS_URL = KIJITO_BASE + "/api/personas"
+NOTIFY_PENDING_URL = KIJITO_BASE + "/api/notify/pending"
+EXEC_TIMEOUT = 10
+HTTP_TIMEOUT = 5  # per-request timeout default (normal fetches)
+LONGPOLL_SLACK = 10  # client socket timeout = server hold (--wait) + this, so a half-open hold is always detected
+LONGPOLL_BACKOFF_CAP = 30  # cap (s) on exponential backoff between failed long-poll attempts
+RETRY_AFTER_CAP = 120  # cap (s) on a server-stated Retry-After; a larger hint is clamped, never obeyed blindly
+PIN_TRACKING_CAP = 5000    # max delivered ids remembered above a pinned watermark (bounds the state file)
+WALK_BACK_MAX_PAGES = 50   # page budget for an authoritative backward walk over an omitted span
+BROKEN_SINK_RETRY_S = 30   # cooldown before re-trying a persona sink we refused; the refusal's RELEASE
+                           # condition, so removing a hostile path recovers without a restart
+IS_POSIX = os.name == "posix"
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# Errors
+# --------------------------------------------------------------------------------------------------------------------
+class FatalConfig(Exception):
+    """A fatal startup/config error → exit non-zero (NOT a per-poll liveness failure)."""
+
+
+class ResolveFailed(FatalConfig):
+    """The API host did not resolve. A FatalConfig for the watcher; for --redeem-key it means nothing was sent."""
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# API base: --api-base > $KIJITO_BASE > https://api.kijito.ai
+# --------------------------------------------------------------------------------------------------------------------
+# Plain http is accepted ONLY for these hosts. Every request carries the account's bearer token, and over http
+# to any other host that token crosses the network in the clear. The names are compared exactly (after the
+# usual hostname lowercasing): `127.0.0.1.example.com` or `localhost.` are remote hosts and are refused.
+_LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+# scheme://host[:port][/path] needs nothing else. Refusing every other character means no userinfo, query or
+# fragment, no whitespace, and nothing a supervisor file would interpret: `%` is a systemd specifier, `$` an
+# environment expansion, `&` and `<` are XML in a launchd plist. A base is written into those files as-is.
+_API_BASE_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~:/[]")
+
+
+def normalize_api_base(raw, source="--api-base"):
+    """Validate an API base and return it in canonical form (lowercase scheme and host, no trailing slash).
+
+    Raises FatalConfig, naming `source`, for anything that is not http(s)://host[:port][/path] or that would
+    send the token over plain http to a host other than this machine.
+    """
+    base = (raw or "").strip()
+    if not base:
+        raise FatalConfig("%s is empty - give the Kijito API base, e.g. %s" % (source, DEFAULT_API_BASE))
+    bad = sorted(set(c for c in base if c not in _API_BASE_CHARS))
+    if bad:
+        raise FatalConfig("%s %r contains %s - an API base is scheme://host[:port][/path], with no user, query "
+                          "or fragment" % (source, base, " ".join(repr(c) for c in bad)))
+    try:
+        parts = urllib.parse.urlsplit(base)
+        parts.port  # noqa: B018 - parsing the port is the check (a non-numeric or out-of-range port raises)
+    except ValueError as e:
+        raise FatalConfig("%s %r is not a valid URL: %s" % (source, base, e))
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise FatalConfig("%s %r must start with https:// (or http:// for a server on this machine)" % (source, base))
+    host = (parts.hostname or "").lower()
+    if not host:
+        raise FatalConfig("%s %r names no host" % (source, base))
+    # THE NETLOC MUST BE EXACTLY host[:port]. Python 3.9's urlsplit accepts `http://[::1]evil.com`,
+    # `http://[localhost]` or `http://[::1]x:80` and quietly extracts a hostname from them, while 3.11+ refuses
+    # them - so the same value meant different things on different interpreters. Rebuild the netloc from what
+    # was parsed and require it to be what was written: one meaning everywhere, or a refusal.
+    rebuilt = ("[%s]" % host if ":" in host else host) + ("" if parts.port is None else ":%d" % parts.port)
+    if parts.netloc.lower() != rebuilt or (":" in host and not _is_ip(host)):
+        raise FatalConfig("%s %r: the host part must be exactly host[:port] (an IPv6 address in brackets)"
+                          % (source, base))
+    if scheme == "http" and host not in _LOOPBACK_HOSTS:
+        raise FatalConfig("%s %r refused: plain http is allowed only for localhost, 127.0.0.1 or [::1], because "
+                          "every request carries your API token and http would send it unencrypted to %s - "
+                          "use https://" % (source, base, host))
+    return "%s://%s%s" % (scheme, parts.netloc.lower(), parts.path.rstrip("/"))
+
+
+def _is_ip(text):
+    try:
+        ipaddress.ip_address(text)
+        return True
+    except ValueError:
+        return False
+
+
+def resolve_api_base(flag_value, environ=None):
+    """The API base this process uses: --api-base, else a non-empty $KIJITO_BASE, else the hosted default.
+
+    Returns (base, source). An explicit flag is validated even when empty, so `--api-base ""` is an error
+    rather than a silent fall-through to the environment.
+    """
+    environ = os.environ if environ is None else environ
+    if flag_value is not None:
+        return normalize_api_base(flag_value, "--api-base"), "--api-base"
+    env_value = environ.get(API_BASE_ENV, "")
+    if env_value.strip():
+        return normalize_api_base(env_value, "$" + API_BASE_ENV), "$" + API_BASE_ENV
+    return DEFAULT_API_BASE, "default"
+
+
+def set_api_base(base):
+    """Point every endpoint this module fetches at `base` (already normalised)."""
+    global KIJITO_BASE, INBOX_URL, PERSONAS_URL, NOTIFY_PENDING_URL
+    KIJITO_BASE = base
+    INBOX_URL = base + "/api/inbox"
+    PERSONAS_URL = base + "/api/personas"
+    NOTIFY_PENDING_URL = base + "/api/notify/pending"
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# Canonical identity (computed BEFORE DNS resolution; trivial URL variations must not flip it)
+# --------------------------------------------------------------------------------------------------------------------
+def canonical_identity(url):
+    p = urllib.parse.urlsplit(url)
+    scheme = (p.scheme or "http").lower()
+    host = (p.hostname or "").lower()
+    port = p.port or (443 if scheme == "https" else 80)
+    path = (p.path or "/").rstrip("/") or "/"
+    # sort query params; the constant mark_read is excluded so its presence can't flip identity.
+    # Use LISTS (not tuples) so the identity is JSON-round-trip stable - a persisted identity reloads
+    # as lists, and the freshly-computed one must compare EQUAL (tuples would reload as lists → spurious
+    # mismatch → restart-resume silently re-baselines, defeating the state-file).
+    q = sorted([k, v] for k, v in urllib.parse.parse_qsl(p.query, keep_blank_values=True) if k != "mark_read")
+    return [scheme, host, port, path, q]
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# Connection hardening - resolve-once + pin the addresses (no TOCTOU re-resolve), and never follow redirects.
+# The destination is the Kijito API base the operator configured (validated once by normalize_api_base, above);
+# pinning + no-redirect remain as defense-in-depth against DNS games and redirect surprises.
+# --------------------------------------------------------------------------------------------------------------------
+def resolve_and_pin(host, port):
+    """Resolve host ONCE and return the addresses to pin connections to, in resolver order (no re-resolve at
+    connect time = no TOCTOU).
+
+    Every address is kept, not just the first: `localhost` resolves to ::1 before 127.0.0.1 on macOS, and a
+    local server listening on 127.0.0.1 only would otherwise refuse every poll of --api-base
+    http://localhost:PORT. The connection tries them in order, as an ordinary client does.
+    """
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as e:
+        raise ResolveFailed("cannot resolve host %r: %s" % (host, e))
+    return tuple(dict.fromkeys(info[4][0] for info in infos))
+
+
+def _connect_pinned(pinned, host, port, timeout):
+    """Open a TCP connection to the first reachable pinned address (or `host` when nothing is pinned)."""
+    addresses = (pinned,) if isinstance(pinned, str) else tuple(pinned or ()) or (host,)
+    err = None
+    for ip in addresses:
+        try:
+            return socket.create_connection((ip, port), timeout)
+        except OSError as e:
+            err = e
+    raise err
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host, pinned_ip=None, timeout=HTTP_TIMEOUT, **kw):
+        super().__init__(host, timeout=timeout, **kw)
+        self._pinned_ip = pinned_ip
+
+    def connect(self):
+        self.sock = _connect_pinned(self._pinned_ip, self.host, self.port, self.timeout)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, pinned_ip=None, timeout=HTTP_TIMEOUT, **kw):
+        super().__init__(host, timeout=timeout, **kw)
+        self._pinned_ip = pinned_ip
+
+    def connect(self):
+        sock = _connect_pinned(self._pinned_ip, self.host, self.port, self.timeout)
+        ctx = self._context or ssl.create_default_context()
+        # connect to the pinned IP but verify the cert against the real hostname (SNI preserved)
+        self.sock = ctx.wrap_socket(sock, server_hostname=self.host)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Redirects are never followed - a redirect is treated as an unhealthy poll."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def build_opener(pinned_ip):
+    class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(lambda h, **kw: _PinnedHTTPConnection(h, pinned_ip=pinned_ip, **kw), req)
+
+    class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(lambda h, **kw: _PinnedHTTPSConnection(h, pinned_ip=pinned_ip, **kw), req)
+
+    # ProxyHandler({}) - NO environment proxies. urllib's default ProxyHandler reads HTTP(S)_PROXY /
+    # ALL_PROXY and swaps the request's host:port for the proxy's, but the connection still goes to the address
+    # pinned from the API host - so with a proxy set, the token-bearing request would go to <API address>:<proxy
+    # port>, i.e. whatever listens on that local port. A proxy can never have worked with the pin, so nothing
+    # depended on it; refusing it outright is the only consistent choice.
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect, _PinnedHTTPHandler,
+                                       _PinnedHTTPSHandler)
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# http-poll adapter - peek + shape-validate + classify healthy/failure
+# --------------------------------------------------------------------------------------------------------------------
+def _is_int(v):
+    """A REAL integer. `bool` is a subclass of int in Python, so True would otherwise satisfy every
+    isinstance(x, int) check in this file and then behave as 1 - a malformed row id, a malformed
+    size_dropped and a malformed persisted cursor would all slip through that way."""
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+_MISSING = object()   # "the server did not send this field at all", distinct from an explicit null
+
+
+class Poll:
+    """Result of one fetch. ok=True → HEALTHY (items is the validated list). ok=False → liveness FAILURE.
+
+    `omitted` carries the server's OWN declaration that this window is incomplete. The inbox endpoint
+    returns the NEWEST messages that fit a count limit AND an aggregate content budget, and reports what
+    it left out via truncated / size_truncated / size_dropped. Discarding those fields is how a bounded
+    window turns into permanent mail loss: items the server omitted are never emitted, and the cursor
+    then advances past them. The truncation is not silent in the DATA - only in the handling of it.
+    """
+    def __init__(self, ok, items=None, reason=None, status=None, redirected=False, omitted=0,
+                 omitted_exact=True, next_before_id=None, continuation_ok=True, consistent=True,
+                 unread_not_shown=None):
+        self.ok = ok
+        self.items = items
+        self.reason = reason
+        self.status = status
+        self.redirected = redirected
+        self.omitted = omitted             # >0 iff the server said this window is incomplete
+        self.omitted_exact = omitted_exact  # False => `omitted` is only a LOWER BOUND, never closable by count
+        self.next_before_id = next_before_id  # backward cursor; None when nothing older was withheld
+        # False when the server's continuation was ABSENT or MALFORMED - i.e. it never answered. Distinct
+        # from next_before_id=None, which is the server AFFIRMING there is nothing older. A walk may treat
+        # only the affirmation as terminal; silence is a contract violation and must pin.
+        self.continuation_ok = continuation_ok
+        # False when the window's OWN TWO HALVES disagree - see fetch_from_payload(). A window that
+        # contradicts itself cannot be believed in either direction, so it can neither close a span nor
+        # be walked through; it PINS. Both directions of the contradiction are covered, not just the
+        # one that happens to have been seen in the wild.
+        self.consistent = consistent
+        # Unread mail the server holds that this response did NOT hand us. None = the server did not say
+        # (older API), which is NOT the same as 0 - see _hidden_unread() for why that distinction is the
+        # whole safety property of this field.
+        self.unread_not_shown = unread_not_shown
+
+
+def fetch(opener, url, headers):
+    """One peek fetch. Returns a Poll. A poll is HEALTHY iff 2xx AND parses AND shape-valid."""
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with opener.open(req, timeout=HTTP_TIMEOUT) as resp:
+            status = resp.status
+            body = resp.read()
+    except urllib.error.HTTPError as e:
+        # _NoRedirect makes 3xx raise here as well as 4xx/5xx
+        if 300 <= e.code < 400:
+            return Poll(False, reason="redirect", status=e.code, redirected=True)
+        return Poll(False, reason="http %d" % e.code, status=e.code)
+    except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as e:
+        return Poll(False, reason="unreachable: %s" % e)
+    if not (200 <= status < 300):
+        return Poll(False, reason="http %d" % status, status=status)
+    try:
+        data = json.loads(body)
+    except (ValueError, UnicodeDecodeError) as e:
+        return Poll(False, reason="parse-fail: %s" % e, status=status)
+    if not isinstance(data, dict):
+        return Poll(False, reason="shape-invalid: body is not an object", status=status)
+    # ONE implementation of the body contract, shared with the tests. Two copies of a rule this subtle is
+    # two chances to get it wrong, and the tests would then be exercising the copy production does not use.
+    return fetch_from_payload(data, status=status)
+
+
+def fetch_from_payload(data, status=200):
+    """Build a Poll from an already-decoded body. The validation path fetch() uses, exposed so tests can
+    exercise the CONTRACT (absent vs null vs malformed continuation) rather than construct Polls by hand -
+    a hand-built Poll bypasses exactly the checks under test."""
+    items = data.get("result")
+    if not isinstance(items, list):
+        return Poll(False, reason="shape-invalid: result is not a list", status=status)
+    seen_ids = set()
+    for m in items:
+        if not isinstance(m, dict) or not _is_int(m.get("id")):
+            # `bool` is a subclass of int, so an id of True would otherwise pass and then compare as 1.
+            return Poll(False, reason="shape-invalid: row missing integer id", status=status)
+        if m["id"] in seen_ids:
+            # A page cannot legitimately carry the same id twice, and the cursor logic dedupes only
+            # against what it has ALREADY delivered - so a repeat inside one window is emitted twice.
+            return Poll(False, reason="shape-invalid: duplicate id %s in one page" % m["id"], status=status)
+        seen_ids.add(m["id"])
+    n, exact = _declared_omissions(data)
+    nb_raw = data.get("next_before_id", _MISSING)
+    if nb_raw is None:
+        nb, nb_ok = None, True
+    elif isinstance(nb_raw, int) and not isinstance(nb_raw, bool) and nb_raw >= 0:
+        nb, nb_ok = nb_raw, True
+    else:
+        nb, nb_ok = None, False
+    # THE OMISSION DECLARATION AND THE CONTINUATION ARE TWO HALVES OF ONE STATEMENT, and the server emits
+    # them from a SINGLE expression - `next_before_id = oldest_row if (has_more or size_dropped) else None`
+    # (Kijito web_api.py, commented "present exactly when mail was withheld"). So a window withheld rows IF
+    # AND ONLY IF it hands back a continuation, and either half contradicting the other is a contract
+    # violation, not a quirk to interpret:
+    #   withheld AND terminal      -> "I hid rows" + "there is nothing older"
+    #   withheld NOTHING AND more  -> "I hid nothing" + "there is more"
+    # The second is not merely the theoretical twin of the first; it follows from how the window is BUILT.
+    # A page returns every older row that FIT, so if it withheld nothing there is nothing older left for a
+    # continuation to point at. Believing the "I hid nothing" half advances the cursor over whatever the
+    # other half says is still there, which is the silent-loss direction.
+    # VERIFIED against the live API across 14 pages, including the case that could have made this rule
+    # pin production forever: a page returning EXACTLY `limit` rows with more behind it declares
+    # truncated=True (limit=4 -> next_before_id=1032), while one that exactly exhausts the mailbox
+    # declares nothing and terminates (limit=5 -> next_before_id=null). The server never leaves a
+    # complete window pointing onward, so this check cannot fire on healthy traffic.
+    consistent = True
+    if nb_ok:
+        if n and nb is None:
+            consistent = False
+        elif not n and nb is not None:
+            consistent = False
+    uns = data.get("unread_not_shown")
+    # A non-int (absent, null, a string, a float) means the server made NO statement. Coercing that to 0
+    # would manufacture a "nothing is hidden" assertion out of silence - the exact inversion this field
+    # exists to avoid. Negative is nonsense from a count, so it is also treated as no statement.
+    return Poll(True, items=items, status=status, omitted=n, omitted_exact=exact,
+                next_before_id=nb, continuation_ok=nb_ok, consistent=consistent,
+                unread_not_shown=uns if isinstance(uns, int) and not isinstance(uns, bool) and uns >= 0
+                else None)
+
+
+def _declared_omissions(data):
+    """How many messages the server says it left out of this window (0 if it says none).
+
+    Returns (count, exact). `exact` is False when the server signalled a truncation WITHOUT saying how
+    many rows it withheld - then `count` is only a LOWER BOUND, and no amount of recovered mail can prove
+    the span empty, because there is no number to reach. A gap with an inexact count must stay pinned
+    until an authoritative backward read can walk it; counting rows against a lower bound would let one
+    recovered message "close" an unbounded hole.
+
+    An alarm that invents losses is as corrosive as one that hides them, so this must not round in
+    either direction. THREE DISTINCT SIGNALS, and conflating them is wrong BOTH ways:
+      truncated=True                    -> rows withheld by the COUNT limit, quantity NOT stated -> inexact.
+      size_dropped=N                    -> exactly N rows withheld by the content budget -> exact.
+      size_truncated=True, size_dropped=0 -> a lone oversized message had its BODY clipped. No row was
+                                           withheld, so this contributes NOTHING. Verified live: a
+                                           limit=3 request returns truncated=True with size_dropped=0
+                                           and rows genuinely missing, while an oversized single message
+                                           reports size_truncated with nothing dropped.
+    """
+    n, exact = 0, True
+    trunc = data.get("truncated", _MISSING)
+    if trunc is True:
+        n, exact = n + 1, False        # count-limit truncation never states a quantity
+    elif trunc is not _MISSING and trunc is not False:
+        # A truncation flag that is neither true nor false is UNINTERPRETABLE, and reading it as "no
+        # omission" is the one direction that loses mail. Treat it as an unquantified withholding.
+        n, exact = max(n, 1), False
+    dropped = data.get("size_dropped")
+    if _is_int(dropped):
+        n += max(dropped, 0)
+    else:
+        st = data.get("size_truncated", _MISSING)
+        if st is True:
+            n, exact = max(n, 1), False    # size truncation with no number at all
+        elif st is not _MISSING and st is not False:
+            n, exact = max(n, 1), False    # same rule: an uninterpretable flag is not a denial
+    return (n, exact)
+
+
+# Memory count per persona, refreshed on every directory fetch. Used by the stranded-mail check to ask
+# "does anyone actually OWN this inbox", which survives a directory that lists every registered recipient.
+# None (not 0) means the server did not report a count, so the check must not infer anything from it.
+_PERSONA_MEMORY_COUNTS = {}
+
+# Read count per persona (mail_total - unread), refreshed on every directory fetch. This is the REAL
+# "is anyone consuming this inbox" signal, replacing the memory-count proxy for in-directory inboxes:
+# ownership (ever authored one memory) is MONOTONIC and permanently immunises an inbox, so a typo-variant
+# that ever received one memory (e.g. 'aclie', a variant of 'alice') became invisible even while it held
+# unread mail nobody reads. read==0 says the inbox has never been consumed - exact, no threshold.
+# None means the server did not report both fields, so the check degrades to the memory-count signal
+# rather than reading an unknown as zero.
+_PERSONA_READ_COUNTS = {}
+
+# Declared `retired` flag per persona from /api/personas. It is the DECLARED classification that separates
+# clearable debris from a real-but-dormant inbox among inboxes that read==0: retired => loud debris,
+# not-retired (or undeclared) => quiet dormant. None means the server did not report it → treated as
+# not-retired (quiet), because loudly declaring an inbox clearable on absent data is the dangerous
+# direction. A boolean, never a threshold.
+_PERSONA_RETIRED = {}
+
+# Declared `write_only` flag per persona from /api/personas. TRUE = an inbox that is undrained BY DESIGN:
+# a real member whose mail is consumed through another surface (a human reading sessions/digests, never
+# the box itself - the account owner's own inbox is the live case), so read==0 is expected forever and must NEVER alarm. This
+# is a FACT the API declares, not a policy: the classifier derives the alarm tier from it (write_only =>
+# quiet), so if alarm policy ever changes the fact stays true. It is INDEPENDENT of `retired` - a
+# write_only inbox is live, the opposite of clearable debris. None/absent => treated as not-write-only,
+# so the producer can ship before the API populates the field with zero behaviour change. A boolean.
+_PERSONA_WRITE_ONLY = {}
+
+# Declared `reserved` flag per persona from /api/personas.
+# TRUE = a legacy row named after the hive-wide BROADCAST name ('all'): it can no longer be created, but
+# an account that minted one before the guard existed still holds it, and it is an ordinary inbox that
+# NOBODY works as. The server calls it debris and names the remedy (retire it). For alarm purposes it is
+# therefore treated exactly like a declared-`retired` row: see _is_debris. Its mail is still READ and
+# still counted - only the alarms change. Same tri-state discipline: absent/non-bool => undeclared.
+_PERSONA_RESERVED = {}
+
+
+def _row_memory_count(row):
+    """Memories owned by this persona, or None if the server did not say.
+
+    Prefers the top-level `memory_count`. Deliberately does NOT fall back to summing `projects[].count`:
+    project counts exclude GLOBAL-scoped memories, so a persona whose memories are all global sums to
+    zero and looks unowned. Measured live: one persona summed to 0 across projects but owned 61 memories; the
+    same gap existed for seven more personas on that account. Summing the wrong
+    field would have made the alarm cry wolf about half the account.
+    """
+    n = row.get("memory_count")
+    return n if isinstance(n, int) and n >= 0 else None
+
+
+def _row_read_count(row):
+    """Messages this persona has READ (mail_total - unread), or None if the server did not report both.
+
+    Same tri-state discipline as _row_memory_count: an UNKNOWN read count (either field missing/uninteger)
+    is None, never 0 - the stranded check must degrade to the memory-count signal instead of reading an
+    unknown as "never consumed". bool is excluded explicitly (isinstance(True, int) is True in Python), and
+    a negative result (unread somehow exceeding mail_total) is treated as unknown rather than trusted.
+    """
+    total = row.get("mail_total")
+    unread = row.get("unread")
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        return None
+    if isinstance(unread, bool) or not isinstance(unread, int) or unread < 0:
+        return None
+    read = total - unread
+    return read if read >= 0 else None
+
+
+def _row_retired(row):
+    """The persona's declared `retired` flag as a strict bool, or None if the server did not report it.
+
+    Only a genuine bool counts; anything else (absent, null, a string) is None = no declaration, which the
+    stranded partition treats as NOT retired (quiet/dormant). Declaring an inbox clearable debris - the
+    LOUD tier - must rest on a positive declaration, never on the absence of one.
+    """
+    r = row.get("retired")
+    return r if isinstance(r, bool) else None
+
+
+def _row_write_only(row):
+    """The persona's declared `write_only` flag as a strict bool, or None if the server did not report it.
+
+    Same tri-state discipline as _row_retired: only a genuine bool is a declaration; absent/null/a string
+    is None = undeclared, which the partition treats as NOT write-only (no suppression). Quieting an inbox
+    that holds unread mail must rest on a POSITIVE declaration that it is undrained by design, never on the
+    absence of one - the mirror of the retired rule, so an absent field can never silence a real backlog.
+    """
+    w = row.get("write_only")
+    return w if isinstance(w, bool) else None
+
+
+def _row_reserved(row):
+    """The persona's declared `reserved` flag as a strict bool, or None if the server did not report it.
+
+    Same tri-state discipline as _row_retired: only a genuine bool is a declaration. A server that
+    predates the field reports nothing, and the producer then behaves exactly as it did before (the producer
+    can ship ahead of, or behind, the server with zero behaviour change).
+    """
+    r = row.get("reserved")
+    return r if isinstance(r, bool) else None
+
+
+def _is_debris(persona):
+    """True when the directory DECLARES that nobody works as this persona: `retired`, or `reserved`
+    (the legacy broadcast-name row). A positive declaration only (`is True`); an undeclared
+    flag is never debris. Debris is classified as clearable in the stranded tier and never fires the
+    urgent-unanswered alarm - there is no member there to be unresponsive."""
+    return _PERSONA_RETIRED.get(persona) is True or _PERSONA_RESERVED.get(persona) is True
+
+
+def fetch_personas(opener, headers):
+    """Fetch the account persona directory for default/explicit all-persona mode."""
+    req = urllib.request.Request(PERSONAS_URL, headers=headers, method="GET")
+    try:
+        with opener.open(req, timeout=HTTP_TIMEOUT) as resp:
+            if not (200 <= resp.status < 300):
+                raise FatalConfig("/api/personas returned http %d" % resp.status)
+            data = json.loads(resp.read())
+    except FatalConfig:
+        raise
+    except Exception as e:
+        raise FatalConfig("cannot fetch /api/personas for --all-personas: %s" % e)
+    rows = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        raise FatalConfig("/api/personas shape-invalid: result is not a list")
+    personas = []
+    for row in rows:
+        if isinstance(row, dict) and isinstance(row.get("persona"), str) and row["persona"]:
+            personas.append(row["persona"])
+            _PERSONA_MEMORY_COUNTS[row["persona"]] = _row_memory_count(row)
+            _PERSONA_READ_COUNTS[row["persona"]] = _row_read_count(row)
+            _PERSONA_RETIRED[row["persona"]] = _row_retired(row)
+            _PERSONA_WRITE_ONLY[row["persona"]] = _row_write_only(row)
+            _PERSONA_RESERVED[row["persona"]] = _row_reserved(row)
+    if not personas:
+        raise FatalConfig("/api/personas returned no personas")
+    return personas
+
+
+# Urgent unread per persona, from the SAME row the unread count comes from - no extra request. Kept
+# separately from `counts` so the fast-path arithmetic is untouched. A sender marking a message urgent is
+# the closest thing the hive has to a declared expectation of attention, which makes it the one signal
+# that can distinguish "idle by design" from "nobody is coming" without asking the silent party.
+_URGENT_UNREAD = {}
+# persona -> the server's `newest_unread_id` (the max unread message id, or None when nothing is unread), as
+# stated by the LAST good /api/notify/pending response. Rebuilt on every good response, so a persona the
+# server made no statement about this tick is simply absent. Older servers never send
+# the field; the table then stays empty and the fast path keys on the count alone, as before.
+_NEWEST_UNREAD = {}
+_NO_STATEMENT = object()
+
+
+def _newest_unread(persona):
+    return _NEWEST_UNREAD.get(persona, _NO_STATEMENT)
+
+
+def _parse_unread_rows(data):
+    """Parse a /api/notify/pending body into {persona: unread}, or None if the shape is invalid.
+    A persona with zero unread is ABSENT from the list → callers treat absent as 0.
+
+    Also records `unread_urgent` into _URGENT_UNREAD as a side table. The endpoint hands it over on every
+    tick and it was previously discarded; a signal you already receive and throw away is the cheapest kind
+    of blindness.
+    """
+    rows = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return None
+    counts = {}
+    newest = {}
+    for row in rows:
+        if isinstance(row, dict) and isinstance(row.get("persona"), str):
+            u = row.get("unread")
+            counts[row["persona"]] = u if isinstance(u, int) else 0
+            # Present and null = "nothing unread"; present and a non-negative int = the newest unread id.
+            # Absent, or any other value, is NO STATEMENT (never a fabricated None).
+            if "newest_unread_id" in row:
+                nid = row["newest_unread_id"]
+                if nid is None or (isinstance(nid, int) and not isinstance(nid, bool) and nid >= 0):
+                    newest[row["persona"]] = nid
+            ug = row.get("unread_urgent")
+            # Absent (an older server) means NO STATEMENT, not zero - the same tri-state discipline as
+            # elsewhere. Recording a 0 we were never told would assert "nothing is escalated" on no evidence.
+            if isinstance(ug, int) and not isinstance(ug, bool) and ug >= 0:
+                _URGENT_UNREAD[row["persona"]] = ug
+    _NEWEST_UNREAD.clear()
+    _NEWEST_UNREAD.update(newest)
+    return counts
+
+
+def fetch_unread_counts(opener, count_url, headers):
+    """Fast-path pre-check: GET /api/notify/pending once and fan the counts out in-process.
+
+    Returns (available, {persona: unread_count}). available=False if the endpoint is absent / non-2xx / bad shape →
+    callers fall back to the full inbox-list poll. Response: {"result":[{persona,unread,unread_urgent}]}.
+    """
+    req = urllib.request.Request(count_url, headers=headers, method="GET")
+    try:
+        with opener.open(req, timeout=HTTP_TIMEOUT) as resp:
+            if not (200 <= resp.status < 300):
+                return (False, {})
+            data = json.loads(resp.read())
+    except Exception:
+        return (False, {})
+    counts = _parse_unread_rows(data)
+    if counts is None:
+        return (False, {})
+    return (True, counts)
+
+
+def next_longpoll_backoff(previous, hint):
+    """Seconds to wait before retrying a FAILED long-poll: exponential from 1 s, capped at
+    LONGPOLL_BACKOFF_CAP, and never shorter than the server's own Retry-After hint (already clamped)."""
+    backoff = min((previous * 2) or 1, LONGPOLL_BACKOFF_CAP)
+    if hint is not None:
+        backoff = max(backoff, hint)
+    return backoff
+
+
+# The retry hint of the LAST fetch_unread_counts_longpoll call: seconds (int) the server asked us to wait, or
+# None. A side channel rather than a fourth return value so the function's contract (and every caller and
+# test double of it) is unchanged; the main loop resets it before each call and reads it on failure.
+_RETRY_HINT = {"seconds": None}
+
+
+def _retry_after_seconds(headers, body=None):
+    """The server's own retry hint on a FAILED response, in whole seconds, or None when it gave none.
+
+    Two carriers, header first: `Retry-After` (delta-seconds, or an HTTP-date) and a JSON body field
+    `retry_after_seconds` (the edge's restart page carries both). A hint only ever LENGTHENS the wait
+    before the next retry - it is pacing, never a reason to alert - and it is clamped to
+    [0, RETRY_AFTER_CAP] so a hostile or mistaken value cannot park the producer.
+    """
+    secs = None
+    raw = None
+    try:
+        raw = headers.get("Retry-After") if headers is not None else None
+    except Exception:
+        raw = None
+    if isinstance(raw, str) and raw.strip():
+        raw = raw.strip()
+        if raw.isdigit():
+            secs = int(raw)
+        else:
+            try:
+                when = email.utils.parsedate_to_datetime(raw)
+                now = datetime.datetime.now(datetime.timezone.utc)
+                secs = int(math.ceil((when - now).total_seconds()))
+            except (TypeError, ValueError, IndexError, OverflowError):
+                secs = None
+    if secs is None and body:
+        try:
+            data = json.loads(body)
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            data = None
+        v = data.get("retry_after_seconds") if isinstance(data, dict) else None
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v):
+            secs = int(math.ceil(v))
+    if secs is None:
+        return None
+    return max(0, min(secs, RETRY_AFTER_CAP))
+
+
+def fetch_unread_counts_longpoll(opener, headers, wait, cursor):
+    """Long-poll variant of the fast-path. GET /api/notify/pending?wait=<sec>[&cursor=<opaque>].
+
+    The server holds the request up to `wait` seconds, returning the instant the account's mail-state advances
+    beyond `cursor` (else on timeout). Returns (available, {persona: unread}, cursor):
+    - `cursor` is the server's OPAQUE token to echo on the next call - NEVER parse it.
+    - available=False on any connection error / non-2xx / bad shape → the caller falls back to the full inbox poll
+      and RECONNECTS WITH THE SAME cursor (lossless resume across a wifi/NAT/Cloudflare/server-restart drop).
+    - cursor is None when the server did NOT long-poll (no `cursor` field): the endpoint predates long-poll, so the
+      caller interval-polls. This makes the client safe to ship BEFORE the server supports it - it interval-polls
+      today and auto-upgrades to instant the moment a cursor starts coming back, no redeploy.
+    The client socket timeout is wait+LONGPOLL_SLACK so a half-open held connection is detected, never hung.
+    """
+    q = {"wait": str(wait)}
+    if cursor is not None:
+        q["cursor"] = cursor
+    url = NOTIFY_PENDING_URL + "?" + urllib.parse.urlencode(q)
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    _RETRY_HINT["seconds"] = None
+    try:
+        with opener.open(req, timeout=wait + LONGPOLL_SLACK) as resp:
+            if not (200 <= resp.status < 300):
+                _RETRY_HINT["seconds"] = _retry_after_seconds(getattr(resp, "headers", None))
+                return (False, {}, cursor)
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        # A 502/503 during a server restart. Read the edge's own "retry in N s" so the next attempt is
+        # paced by it; a bounded read, because this body is an error page, not data.
+        try:
+            body = e.read(4096)
+        except Exception:
+            body = None
+        _RETRY_HINT["seconds"] = _retry_after_seconds(e.headers, body)
+        return (False, {}, cursor)
+    except Exception:
+        return (False, {}, cursor)  # keep the old cursor → next attempt resumes losslessly
+    counts = _parse_unread_rows(data)
+    if counts is None:
+        return (False, {}, cursor)
+    new_cursor = data.get("cursor")
+    if not isinstance(new_cursor, str) or not new_cursor:
+        new_cursor = None  # server didn't long-poll → caller interval-polls (forward/back-compat)
+    return (True, counts, new_cursor)
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# Emit
+# --------------------------------------------------------------------------------------------------------------------
+def _now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _safe_text(s):
+    """Return `s` in a form that can ALWAYS be written to a UTF-8 file and put in a child's environment.
+
+    A CONTENT BYTE MUST NEVER BECOME A DELIVERY FAILURE. Two shapes arrive from real message bodies and
+    neither is our bug to have opinions about:
+      · a NUL, which cannot appear in an environment value at all (subprocess raises ValueError);
+      · a lone surrogate, which cannot be encoded to UTF-8 (json.dumps(ensure_ascii=False) passes it
+        straight through, and the file write then raises UnicodeEncodeError).
+    They would matter less if emit failures were swallowed. Because delivery gates the cursor they
+    matter enormously: the exec path would report a permanent non-delivery and WEDGE THE WATERMARK
+    on that one message forever, and the file path would raise straight out of poll_once and crash the
+    producer - which under a KeepAlive supervisor is a crash LOOP, since the same message is refetched
+    every time. Trading a silent skip for a permanent stall is a recurring failure shape
+    (see the corruption pin), so the fix is to make the event REPRESENTABLE rather than to fail on it.
+    """
+    try:
+        s.encode("utf-8")
+    except UnicodeEncodeError:
+        s = s.encode("utf-8", "replace").decode("utf-8")
+    return s.replace("\x00", "") if "\x00" in s else s
+
+
+class RotatingFileSink:
+    """Owns the events-log fd and rotates it by size IN-PROCESS, so the writer reopens after its OWN rename.
+
+    Why this exists: a launchd StandardOutPath fd is NEVER reopened by launchd when an external rotator
+    (newsyslog) renames the file - the producer would keep appending to the orphaned inode while a `tail -F`
+    consumer follows the new empty file → SILENT blinding (the exact failure class this tool fights). Owning
+    the fd here and reopening after our OWN rename closes that hole with no external dependency and no sudo;
+    consumers just tail -F by name. max_bytes <= 0 disables rotation (unbounded)."""
+    def __init__(self, path, max_bytes, keep):
+        self.path = path
+        self.max_bytes = max_bytes
+        self.keep = max(1, keep)
+        self._fh = None
+        self._pending = False      # bytes written that are not known to be on stable storage yet
+        self._sync_failed = False  # an fsync we can never retry (the fd was rotated away) failed
+        self._dir_pending = False  # a directory ENTRY changed (create/rotate) and is not durable yet
+        self._broken = None        # non-None => the sink is unusable; write() reports a FAILED delivery
+        self._open()
+
+    def _open(self):
+        # Never abandon a live handle: any path that reopens without closing first leaks an fd per
+        # rotation, which in a long-lived producer is unbounded. Defensive rather than reactive - the
+        # callers currently all close first, and this makes that non-load-bearing.
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except OSError:
+                pass
+            self._fh = None
+        dirn = os.path.dirname(os.path.abspath(self.path)) or "."
+        _makedirs_private(dirn)
+        existed = os.path.lexists(self.path)   # lexists: a dangling SYMLINK counts as present, and must
+        self._fh = _open_private(self.path, "a", encoding="utf-8")
+        # EVERY persisted artifact, not just the one we opened: rotated archives
+        # written by an older version keep their 0644 forever otherwise, because they are never reopened.
+        # THE RANGE COMES FROM THE DIRECTORY, NOT FROM `keep`. A bound derived from
+        # CURRENT retention cannot reach an artifact left by a LARGER FORMER retention - shrinking keep
+        # from 10 to 5 would strand .7 at 0644 permanently - and an increment-until-absent scan would stop at
+        # the first hole a hand-deleted archive leaves. Listing is the only bound config cannot outlive.
+        # ★ THE VERDICT IS DELIBERATELY IGNORED HERE. It is
+        # consumed by _repair_mode itself, which warns per file. Escalating would be wrong in both
+        # directions: these are ARCHIVES, not the live sink, so refusing to open the events file because a
+        # months-old archive is unreadable converts a stale-permission leak into a total delivery outage.
+        for archive in self._archive_paths():
+            _repair_mode(archive)
+        if not existed:
+            # A NEW FILE NEEDS ITS DIRECTORY ENTRY SYNCED, NOT JUST ITS BYTES.
+            # fsync on the fd makes the CONTENT durable; the NAME lives in the directory. Deferred to
+            # sync() so it lands before the cursor that acknowledges these events is persisted.
+            self._dir_pending = True
+
+    def _archive_paths(self):
+        """Every rotated archive of this sink that EXISTS RIGHT NOW, found by listing the directory.
+
+        Deliberately not `range(1, keep + 2)`: that bound is CURRENT config, and the artifacts most likely
+        to be left at a permissive mode are exactly the ones a FORMER, larger retention wrote.
+        Matches `<basename>.<digits>` only, so the `.lock` sidecar is never touched.
+        """
+        d = os.path.dirname(os.path.abspath(self.path)) or "."
+        base = os.path.basename(self.path)
+        try:
+            names = os.listdir(d)
+        except OSError:
+            return []          # unreadable directory: nothing to enumerate, and _open still has to proceed
+        return sorted(os.path.join(d, n) for n in names
+                      if n.startswith(base + ".") and n[len(base) + 1:].isdigit())
+
+    def _reopen_or_break(self):
+        """Reopen after a rotation. A failure here must NOT escape the poll loop:
+        an exception out of write() unwinds through poll_once and, under a KeepAlive supervisor,
+        is a crash loop. It becomes a broken sink instead, which write() reports as a failed delivery, so
+        the cursor holds and the mail is re-delivered when the sink recovers."""
+        try:
+            self._open()
+            self._broken = None
+        except OSError as e:
+            self._broken = str(e)
+            self._fh = None
+            sys.stderr.write("kijito-inbox-monitor: WARNING events sink %s is unusable (%s); holding the "
+                             "cursor until it recovers\n" % (self.path, e))
+
+    def write(self, line):
+        """Append one event line. Returns True IFF the line reached the file.
+
+        A FAILED write must never be reported as a delivery. The cursor that acknowledges an event is
+        persisted from the same poll, so swallowing an OSError here would advance the watermark over a
+        message nobody received - the exact silent loss this tool exists to prevent, arriving through
+        the emit path instead of the fetch path.
+        """
+        if self._broken is not None or self._fh is None:
+            self._reopen_or_break()                     # try to recover, silently on success
+            if self._broken is not None or self._fh is None:
+                return False
+        try:
+            self._fh.write(line)
+            self._fh.flush()
+        except (OSError, UnicodeError, ValueError) as e:
+            # UnicodeError/ValueError are belt-and-braces behind _safe_text(): an event that still cannot
+            # be encoded must be a FAILED DELIVERY (loud, retried, visible on stderr) and never an
+            # exception escaping poll_once, which under a KeepAlive supervisor is a silent crash loop.
+            sys.stderr.write("kijito-inbox-monitor: WARNING event write FAILED, holding the cursor: %s\n" % e)
+            return False
+        self._pending = True
+        self._maybe_rotate()
+        return True
+
+    def sync(self):
+        """Force written events onto stable storage. Returns True IFF they are durable.
+
+        THE DURABILITY BARRIER. flush() only moves bytes from Python's buffer
+        into the kernel's; a power loss between the flush and the writeback loses them. The state file
+        IS fsynced, so without this the CURSOR can outlive the EVENT it acknowledges - the watcher comes
+        back believing it delivered mail that no consumer ever saw, and never fetches it again. Ordering,
+        not just syncing, is what matters: event durable BEFORE cursor durable.
+        """
+        failed_earlier, self._sync_failed = self._sync_failed, False
+        ok = True
+        if self._dir_pending:
+            # THE NAME AS WELL AS THE BYTES. Syncing only the fd leaves a cursor that can outlive the
+            # PATHNAME of the events it acknowledges - and the state file may live in a DIFFERENT
+            # directory (--state-file and --events-file-template are independent), so syncing the state
+            # directory proves nothing about this one.
+            if _fsync_dir(os.path.dirname(os.path.abspath(self.path)) or "."):
+                self._dir_pending = False
+            else:
+                sys.stderr.write("kijito-inbox-monitor: WARNING could not fsync the events directory; "
+                                 "holding the cursor\n")
+                ok = False
+        if self._pending:
+            try:
+                self._fh.flush()
+                os.fsync(self._fh.fileno())
+                self._pending = False
+            except OSError as e:
+                sys.stderr.write("kijito-inbox-monitor: WARNING event fsync FAILED, holding the cursor: %s\n" % e)
+                ok = False
+        return ok and not failed_earlier
+
+    def _maybe_rotate(self):
+        if self.max_bytes <= 0:
+            return
+        try:
+            size = os.fstat(self._fh.fileno()).st_size
+        except OSError:
+            return
+        if size < self.max_bytes:
+            return
+        # Sync BEFORE the rename: after os.replace this fd names the archive, so a later sync() cannot
+        # make these bytes durable. If it fails, remember it - the next sync() must report non-durable
+        # once (holding the cursor for one poll) rather than silently losing the signal.
+        if not self.sync():
+            self._sync_failed = True
+        try:
+            try:
+                self._fh.close()
+            except OSError as e:   # a close() failure is a real error, not a reason to unwind the poll
+                sys.stderr.write("kijito-inbox-monitor: WARNING closing %s during rotation failed: %s\n"
+                                 % (self.path, e))
+            oldest = "%s.%d" % (self.path, self.keep)
+            if os.path.exists(oldest):
+                os.remove(oldest)
+            for i in range(self.keep - 1, 0, -1):
+                src = "%s.%d" % (self.path, i)
+                if os.path.exists(src):
+                    os.replace(src, "%s.%d" % (self.path, i + 1))
+            if os.path.exists(self.path):
+                os.replace(self.path, "%s.1" % self.path)
+        except OSError as e:
+            sys.stderr.write("kijito-inbox-monitor: WARNING log rotation failed (non-fatal): %s\n" % e)
+        finally:
+            # Every rename above rewrote directory ENTRIES; none of them is durable until the directory
+            # itself is synced.
+            self._dir_pending = True
+            self._reopen_or_break()  # reopen by NAME - a tail -F consumer follows us onto the fresh file
+
+    def close(self):
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except OSError as e:
+                sys.stderr.write("kijito-inbox-monitor: WARNING closing %s failed: %s\n" % (self.path, e))
+            finally:
+                self._fh = None
+
+
+_BROKEN_SINK = object()   # a sink that exists in config but cannot be written to SAFELY
+
+_BASE62 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+
+def _wake_nonce(event_id):
+    """The wake nonce: 11 base62 characters DERIVED from the event_id, never minted beside it.
+
+    WHY DERIVED, AND WHY THIS IS THE LOAD-BEARING DECISION.
+    The consumer-side wake ledger needs a nonce with "recompute-asserted uniqueness". The obvious
+    reading -- mint a fresh random one per emission -- silently introduces a SECOND identity that
+    CONTRADICTS the one this emitter already has. `_event_id` deliberately gives a `new` event the
+    same id across a restart, a re-delivery after state loss, and two watchers of the same inbox,
+    because a duplicated MESSAGE is duplicated WORK. A per-emission random nonce would call those
+    two different wakes; the consumer would find no queue entry containing the second one, score it
+    LOST, and PAGE -- on precisely the recovery path this producer exists to survive.
+
+    ⚠️ A CAVEAT ON "a re-delivery after state loss" ABOVE.
+    That phrase names an EMITTER capability and a WATCHER trigger as if they were one thing; they
+    live in different components. The emitter does handle a re-delivery correctly when one occurs.
+    But the WATCHER does not produce one by losing its state file: an absent state file BASELINES to
+    the newest visible id (see poll_once's absent-state branch), so the backlog is skipped, not
+    re-emitted. Wiping the state file was MEASURED not to re-deliver. The path that does reach it is
+    an UNACKNOWLEDGED delivery -- a refused sink, a non-zero --exec -- where the cursor is held below
+    the message and the next poll re-delivers it. Do not cite the state-loss case as evidence that
+    re-delivery works: it is the one case that cannot reach it.
+
+    ⇒ Deriving from the event_id makes the nonce stable exactly where the event_id is stable and
+    distinct exactly where it is distinct. Signal events already get a per-emission-unique id
+    (`<persona>:<event>:<run>-<seq>`, 64 bits of per-run entropy), so ONE rule serves both families
+    and neither family's meaning changes. "Recompute-asserted" also becomes literally true: anyone
+    can recompute this from the event_id in the same row.
+
+    ★ THE STRONGEST REASON: random DESTROYS information at the producer -- "this is
+    the same work re-delivered" becomes unrecoverable downstream because the identity that would
+    have said so was never minted. Derived merely DEFERS a decision to the consumer, where a missing
+    outcome column can supply it. Between two schemes that each have a false-page mode, take the one
+    whose defect is repairable.
+
+    ⚠️ 11 IS FORCED, NOT CHOSEN: the spec wants >=64 bits in <=11 base62 chars. 10 chars = 59.54 bits
+    (fails the floor), 11 = 65.50 (fits), 12 breaks the ceiling. There is no slack in either direction.
+
+    ⛔ THIS IS AN ATTRIBUTION LABEL, NOT A CAPABILITY. It is deterministic and therefore GUESSABLE by
+    anyone who knows the event_id. Nothing may treat nonce-presence as evidence of authenticity; a
+    forger able to write transcript rows already has what it needs and gains nothing from this value.
+    If a consumer ever requires an UNGUESSABLE nonce, this derivation is wrong for it and the choice
+    must be revisited rather than patched.
+
+    ⚠️ IDENTIFIES A WAKE, NOT A DELIVERY. Two different panes delivered the same message carry the
+    SAME nonce -- correctly, it is the same work. Consumer ledgers must therefore key rows on
+    (nonce, session_id), never on the nonce alone, or two panes' deliveries collide into one row.
+    """
+    v = int.from_bytes(hashlib.sha256(event_id.encode("utf-8")).digest(), "big")
+    out = []
+    for _ in range(11):
+        out.append(_BASE62[v % 62])
+        v //= 62
+    return "".join(out)
+
+
+def _clock_map():
+    """Map our two SEMANTICS onto this platform's constants. Returns {key: (semantic_name, const)}.
+
+    ⛔⛔ THE KEYS NAME SEMANTICS, NOT OS CONSTANTS, AND THE TWO DISAGREE ACROSS PLATFORMS.
+        monotonic := DOES NOT advance while the machine is not executing, and NEVER steps
+        boottime  := DOES advance while the machine is not executing, and NEVER steps
+
+    On Linux those are CLOCK_MONOTONIC and CLOCK_BOOTTIME, and the names coincide with the meanings.
+    ON DARWIN THEY DO NOT, AND THERE ARE TWO SEPARATE TRAPS, BOTH SILENT:
+
+        CLOCK_UPTIME_RAW    EXCLUDES sleep, raw  -> carries Linux CLOCK_MONOTONIC's semantic
+        CLOCK_MONOTONIC_RAW INCLUDES sleep, raw  -> carries Linux CLOCK_BOOTTIME's semantic
+        CLOCK_MONOTONIC     INCLUDES sleep BUT IS CALENDAR-DERIVED: measured, it read
+                            EXACTLY wall - kern.boottime (201341.498, to 3 decimals), so it absorbs
+                            NTP adjustments to the wall clock -- it can sit BELOW CLOCK_UPTIME_RAW
+        CLOCK_BOOTTIME      does not exist
+
+    Measured on a real Mac: the sleep-including clocks ran 18.20 h ahead of
+    CLOCK_UPTIME_RAW -- a difference that IS the accumulated sleep, matching an independent
+    kern.boottime derivation to two decimals.
+
+    An earlier version of this function read CLOCK_MONOTONIC on every platform and omitted boottime
+    where the constant was missing. On a Mac that emits the SLEEP-INCLUDING clock under the key
+    `monotonic`, and drops the sleep-excluding quantity entirely -- so a consumer differencing
+    wall against `monotonic` measures ~0 freeze forever, on every Mac-emitted row, with nothing
+    raising. The bug is invisible to a Linux test suite by construction: there, the names are honest.
+
+    The NEXT version sourced Darwin's boottime from CLOCK_MONOTONIC -- right direction, wrong clock:
+    on a fresh-uptime Mac whose wall clock NTP-stepped back ~8.3 s after boot, it emitted
+    boottime 4957.865 < monotonic 4966.194, violating the definitional
+    invariant boottime >= monotonic that consumers difference against. The never-steps half of each
+    semantic is as load-bearing as the sleep half, so BOTH must come from RAW clocks:
+    CLOCK_MONOTONIC_RAW and CLOCK_UPTIME_RAW share one tick source (mach_continuous_time vs
+    mach_absolute_time), so boottime >= monotonic holds by construction.
+
+    ⇒ Dispatch on the SEMANTIC and record which constant supplied it (see _emission_stamps), so the
+    mapping is auditable from the row instead of being a property of the reader's assumptions.
+    """
+    m = {}
+    if hasattr(time, "CLOCK_UPTIME_RAW"):          # Darwin: the sleep-EXCLUDING raw clock
+        m["monotonic"] = ("CLOCK_UPTIME_RAW", time.CLOCK_UPTIME_RAW)
+    elif hasattr(time, "CLOCK_MONOTONIC"):          # Linux: names and meanings coincide
+        m["monotonic"] = ("CLOCK_MONOTONIC", time.CLOCK_MONOTONIC)
+    if hasattr(time, "CLOCK_BOOTTIME"):             # Linux: the sleep-INCLUDING clock
+        m["boottime"] = ("CLOCK_BOOTTIME", time.CLOCK_BOOTTIME)
+    elif hasattr(time, "CLOCK_UPTIME_RAW") and hasattr(time, "CLOCK_MONOTONIC_RAW"):
+        # Darwin: the sleep-INCLUDING raw clock. NOT CLOCK_MONOTONIC -- that one is
+        # calendar-derived and absorbs NTP steps (see above). Gate on UPTIME_RAW's presence:
+        # it identifies the platform as Darwin, where MONOTONIC_RAW includes sleep, rather than
+        # a Linux box, where CLOCK_MONOTONIC_RAW EXCLUDES suspend and would be the wrong clock.
+        m["boottime"] = ("CLOCK_MONOTONIC_RAW", time.CLOCK_MONOTONIC_RAW)
+    return m
+
+
+def _quarantine_inverted_stamps(stamps, src):
+    """The emission-chokepoint canary: quarantine a (monotonic, boottime) pair that reads inverted.
+
+    boottime >= monotonic is definitional -- boottime is monotonic plus the time the machine did
+    not execute. A pair that reads inverted means the platform mapping above is WRONG (the defect
+    this module actually shipped: Darwin boottime from calendar-derived CLOCK_MONOTONIC read 8.3 s
+    below monotonic at fresh uptime), and the boottime value is then a NON-measurement of its
+    semantic. Publishing it would poison every consumer that differences boottime against
+    monotonic to measure dwell -- so the pair is split at the chokepoint: boottime is REMOVED from
+    the stamp set (omitted, never faked -- absence stays legible as absence) and the rejected
+    reading is preserved LOUDLY under `clock_defect`, so the row itself reports the broken mapping
+    instead of feeding it to consumers as data. Mutates stamps/src in place; returns stamps.
+    """
+    if "monotonic" in stamps and "boottime" in stamps and stamps["boottime"] < stamps["monotonic"]:
+        stamps["clock_defect"] = {
+            "kind": "boottime_below_monotonic",
+            "boottime": stamps.pop("boottime"),
+            "boottime_src": src.pop("boottime", None),
+            "monotonic": stamps["monotonic"],
+        }
+    return stamps
+
+
+def _emission_stamps():
+    """The producer-emission stamp: a coherent set of clocks read at one instant.
+
+    Three readings because none answers alone:
+      wall      - comparable across hosts and to every other timestamp in the system, but it STEPS
+                  (NTP, hypervisor time sync), so a wall delta is not an elapsed time.
+      monotonic - never steps, but STOPS while the machine is not executing.
+      boottime  - like monotonic, except it keeps counting while the machine is not executing.
+
+    Differencing them across two events is what makes dwell measurable rather than assumed:
+    (wall delta - monotonic delta) over an interval is the time the machine DID NOT EXECUTE, which is
+    the difference between "this wake sat in a queue for three hours" and "the host was frozen".
+    Measured on one host, the two are routinely confused: 72.79 h of hypervisor freeze presented as
+    ordinary elapsed wall time, with BOOTTIME - MONOTONIC reading exactly 0.00 s throughout, because a
+    hypervisor pause stops the guest's clocks TOGETHER and the guest is not running to notice.
+
+    `src` records which OS constant supplied each semantic, so a consumer can AUDIT the mapping from
+    the row rather than assuming the platform's names mean what they say -- see _clock_map(), where
+    Darwin's do not. A key is OMITTED, never faked, where its semantic is genuinely unavailable: a
+    fabricated value is indistinguishable from a real zero-freeze reading, which is the exact failure
+    these fields exist to detect. The same rule governs a pair the platform hands us inverted --
+    _quarantine_inverted_stamps drops the boottime reading and reports the defect on the row.
+    """
+    stamps = {"wall": _now_iso()}
+    src = {}
+    for key, (const_name, const) in _clock_map().items():
+        stamps[key] = round(time.clock_gettime(const), 6)
+        src[key] = const_name
+    _quarantine_inverted_stamps(stamps, src)
+    if src:
+        stamps["src"] = src
+    return stamps
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# WAKE CLASS - so a consumer's filter stops having to learn every new event name
+# ----------------------------------------------------------------------------------------------------------------
+# THE DEFECT THIS CLOSES. A typical consumer filters on a NAME ALLOWLIST -
+# `"event": ?"(new|alert|recovered)"`. So every diagnostic this module added to kill a silent failure
+# was ITSELF silent: state_corrupt, baseline_skipped, seed_ahead, replay_capped and persona_added
+# matched nobody's filter, and a running `grep` never re-reads its argv, so they stayed invisible even
+# after the docs were fixed. One statement of it: "a diagnostic added to kill a silent failure is
+# itself silent unless the consumer's filter learned its name."
+#
+# THE FIX IS A CLASS THE CONSUMER MATCHES STRUCTURALLY, so a new kind is covered the day it is added
+# rather than the day every consumer is updated. Three rules make it structural rather than cosmetic:
+#
+#   1. AN UNCLASSIFIED KIND WAKES. The default is `diagnostic`, NOT `liveness` - a kind whose author
+#      forgot to classify it wakes people, so the omission is visible immediately instead of silently
+#      muting a channel. You cannot FALL INTO the suppressing value; it must be typed deliberately.
+#   2. `liveness` IS A CLOSED SET, ASSERTED BY A TEST. Its exclusion is load-bearing: `heartbeat` fires
+#      every 900 s, and `armed`'s exclusion is why "I was not woken" does not mean "nothing arrived".
+#      A small, deliberately-frozen suppression set is the one place an allowlist is correct.
+#   3. ONE TABLE, NEXT TO THE CHOKEPOINT. Not a classification scattered across construction sites -
+#      that is precisely how the consumer-side allowlist rotted in the first place.
+#
+# ⚠️ ADDITIVE. The producer stamps; `event` is UNTOUCHED, so every existing filter keeps working
+# byte-for-byte and there is no flag day. Consumers switch to `wake_class` at their own pace, and a
+# name allowlist can be retired only once nothing matches on `event`.
+# ⛔ A consumer that matches `wake_class` against a producer that does not emit it matches NOTHING -
+# a wake outage delivered by the fix for a wake outage. Hence upgrade the producer FIRST, always.
+WAKE_CLASS_MAIL = "mail"              # a real inbox message
+WAKE_CLASS_DIAGNOSTIC = "diagnostic"  # the producer is reporting something wrong or surprising
+WAKE_CLASS_LIVENESS = "liveness"      # routine "I am alive" ticks - the ONLY suppressing value
+
+# The suppression set, closed and frozen. Adding a member here silently mutes a channel, so a test
+# asserts this exact membership and a third member fails the suite.
+_LIVENESS_KINDS = frozenset({"heartbeat", "armed"})
+
+# Every kind this module can emit. `new` is the only mail; everything that is not mail and not
+# liveness is a diagnostic, INCLUDING kinds absent from this table (see _wake_class).
+_WAKE_CLASS_BY_KIND = {
+    "new":              WAKE_CLASS_MAIL,
+    # A reminder ABOUT mail (already-notified messages still unread past the threshold), not a
+    # message itself - one event names several ids and carries no body, so it is NOT `mail` (`new` stays
+    # the only mail, pinned by a test). As a diagnostic it WAKES, which is its whole job. Bounded by
+    # construction; see WatchTarget._resurface_still_unread.
+    "still_unread":     WAKE_CLASS_DIAGNOSTIC,
+    "alert":            WAKE_CLASS_DIAGNOSTIC,
+    "recovered":        WAKE_CLASS_DIAGNOSTIC,
+    "state_corrupt":    WAKE_CLASS_DIAGNOSTIC,
+    "baseline_skipped": WAKE_CLASS_DIAGNOSTIC,
+    "seed_ahead":       WAKE_CLASS_DIAGNOSTIC,
+    "replay_capped":    WAKE_CLASS_DIAGNOSTIC,
+    # persona_added is listed EXPLICITLY rather than left to the default. It would reach the right
+    # answer either way, and that is the problem: correct-by-accident is not correct. The catch-all
+    # exists for kinds nobody has thought of, not for kinds we know about and did not write down.
+    "persona_added":    WAKE_CLASS_DIAGNOSTIC,
+    "heartbeat":        WAKE_CLASS_LIVENESS,
+    "armed":            WAKE_CLASS_LIVENESS,
+}
+
+
+def _wake_class(kind):
+    """Classify an event kind. An UNKNOWN kind is a `diagnostic`, which means it WAKES.
+
+    Fail toward visible noise, never toward a silently muted channel: a kind added without a
+    classification is a mistake, and the failure mode of a mistake should be "someone got woken and
+    asked why", not "a channel went quiet and nobody noticed for a month". That direction is the whole
+    reason this field is worth having, so it is asserted by a test that CONSTRUCTS an unknown kind
+    rather than by reading this line - a default that is never exercised is a default nobody tested.
+    """
+    return _WAKE_CLASS_BY_KIND.get(kind, WAKE_CLASS_DIAGNOSTIC)
+
+
+class Emitter:
+    def __init__(self, mode, exec_cmd, content_chars, no_content, sink=None, suppress_authors=None,
+                 sink_template=None, max_bytes=0, keep=5):
+        self.mode = mode
+        self.exec_cmd = exec_cmd
+        self.content_chars = content_chars
+        self.no_content = no_content
+        self.sink = sink  # single shared RotatingFileSink (--events-file), else None (→ stdout)
+        self.suppress_authors = set(suppress_authors or [])  # drop self-echo 'new' events from these authors
+        # --events-file-template: one OWNED RotatingFileSink PER PERSONA, so a session subscribes to ONLY its
+        # own mail by `tail -F events.<persona>.ndjson` - no shared-file grep to invent.
+        self.sink_template = sink_template
+        self._max_bytes = max_bytes
+        self._keep = keep
+        self._sinks_by_persona = {}
+        # key -> monotonic deadline before which we will not retry. NOT a set:
+        # membership alone has no release condition, so removing a hostile symlink would never recover without
+        # a restart. WHAT CLEARS THIS: the deadline expiring and the reopen SUCCEEDING (see _sink_for).
+        self._broken_sinks = {}
+        # event-id namespace. A BARE counter would restart at 1 on every process start and hand
+        # old ids to new events - a consumer that had already seen them would drop live mail, which is
+        # worse than the duplicate it was meant to prevent. Namespacing the counter with a per-run token
+        # makes ids unique across restarts by construction; 8 random bytes keep that true even for a
+        # supervisor restarting the producer thousands of times.
+        self._run = "%016x" % int.from_bytes(os.urandom(8), "big")
+        self._seq = 0
+
+    def _sink_for(self, persona):
+        """Route an event to its persona's sink (template mode), the single shared sink, or stdout (None).
+
+        A sink we cannot create SAFELY returns the BROKEN sentinel, never None: None means "no sink
+        configured, write to stdout", and falling through to stdout because a path looked like a symlink
+        would print the mail we just refused to file. One persona's bad path must also not take the
+        others down, so it is contained here rather than raised.
+        """
+        if self.sink_template is None:
+            return self.sink
+        key = persona or "_all"  # events with no persona (e.g. a bare --url target) land in one _all file
+        s = self._sinks_by_persona.get(key)
+        if s is None:
+            # A REFUSAL IS A COOLDOWN, NOT A VERDICT. Caching the refusal with no
+            # release would leave a persona whose path was briefly hostile undeliverable for the life of
+            # the process: the operator removes the symlink, the fault is gone, and mail keeps being held
+            # with nothing left to fix. A permanent fail-closed is the same bug as a fail-open, facing the
+            # other way (every pin must be dischargeable).
+            retry_at = self._broken_sinks.get(key)
+            if retry_at is not None and _monotonic() < retry_at:
+                return _BROKEN_SINK
+            path = self.sink_template.replace("{persona}", _state_safe_persona(key))
+            try:
+                s = RotatingFileSink(path, self._max_bytes, self._keep)
+            except OSError as e:
+                self._broken_sinks[key] = _monotonic() + BROKEN_SINK_RETRY_S
+                _warn_persona_once(key, "cannot open an events sink for %r safely (%s); its mail will be "
+                                        "held, not written elsewhere" % (key, e))
+                return _BROKEN_SINK
+            if self._broken_sinks.pop(key, None) is not None:
+                # Re-arm the suppressed warning so a LATER break is reported instead of silently
+                # inheriting this one's suppression, and say so - a recovery nobody can see is the same
+                # invisibility this tool exists to remove.
+                _clear_persona_warning(key)
+                sys.stderr.write("kijito-inbox-monitor: events sink for persona %r recovered; its held "
+                                 "mail will be delivered\n" % key)
+            self._sinks_by_persona[key] = s
+        return s
+
+    def close(self):
+        if self.sink is not None:
+            self.sink.close()
+        for s in self._sinks_by_persona.values():
+            s.close()
+
+    def sync(self, persona=None):
+        """Make THIS persona's written events durable. Returns True IFF they are on stable storage.
+
+        Called by the watcher BEFORE it persists a cursor that acknowledges those events. exec-per-event
+        has no sink of ours to sync (the consumer owns its own durability, and its exit status is the
+        acknowledgement), and a stdout stream is a pipe we do not own - both answer True.
+
+        SCOPED TO ONE PERSONA on purpose. The Emitter is shared by every watch target, so syncing all
+        sinks would let ONE persona's failing sink retract every OTHER persona's deliveries - a full
+        directory's worth of duplicate storms caused by a stream nobody was reading. In template mode
+        each persona owns its sink; in single-file mode there is one shared sink and syncing it is
+        correct for whichever target asks.
+        """
+        ok = True
+        if self.sink is not None:
+            ok = self.sink.sync() and ok
+        if self.sink_template is not None:
+            if (persona or "_all") in self._broken_sinks:
+                return False       # nothing was written, so nothing is durable; hold the cursor
+            s = self._sinks_by_persona.get(persona or "_all")
+            if s is not None:
+                ok = s.sync() and ok
+        return ok
+
+    def _clip(self, content):
+        if self.no_content:
+            return None
+        s = "" if content is None else str(content)
+        return s[: self.content_chars]
+
+    def _event_id(self, event):
+        """A producer-owned identity for this event. Never derived from the serialised bytes.
+
+        TWO KINDS OF IDENTITY, because `new` and the signals need opposite things:
+
+        · `new` carries the MESSAGE's identity - persona plus the server's message id. The same message
+          therefore always gets the same event id: across a restart, across a re-delivery after state
+          loss, and across two watchers of the same inbox. That is what makes exactly-once processing
+          possible on the consumer side, and it is the case that matters, because a duplicated message
+          is duplicated WORK while a duplicated signal is only noise.
+
+        · everything else is a SIGNAL, and gets an id unique to this emission. A recurrence is a
+          genuinely different event - a second outage is a second thing you want to see - so signals
+          must NOT collapse into their earlier selves. Repeated announcements of an UNCHANGED condition
+          are suppressed at the source instead (the alarms are edge-triggered and self-clearing), which
+          is where that belongs.
+
+        Deliberately not a hash of the emitted line: byte-hashing couples the consumer to our
+        formatting, so a change to key order, spacing or content clipping silently changes the dedupe
+        key and re-delivers old events.
+        """
+        persona = event.get("persona") or "_"
+        if event.get("event") == "new" and isinstance(event.get("id"), int):
+            return "%s:new:%d" % (persona, event["id"])
+        self._seq += 1
+        return "%s:%s:%s-%d" % (persona, event.get("event") or "_", self._run, self._seq)
+
+    def emit(self, event):
+        """Deliver one event. Returns True IFF delivery was ACKNOWLEDGED.
+
+        DELIVERY IS ACKNOWLEDGED, NOT ASSUMED. The return value is what lets
+        the watcher hold its cursor below a message it could not hand over. If emit() swallowed
+        every failure and the cursor advanced regardless, a consumer whose --exec exited non-zero -
+        the wake hook that is the entire point of exec mode - would never see that message again, and the
+        watcher would report success. Anything other than True here means "not acknowledged": the message
+        will be re-delivered rather than dropped, because a duplicate is recoverable and a skip is not.
+
+        `event` is a dict already containing event/source/ts and type-specific fields.
+        """
+        # Stamped HERE, the single chokepoint every event passes through, rather than in the
+        # convenience constructors: a future event kind added elsewhere cannot forget to carry one.
+        event["event_id"] = self._event_id(event)
+        # The nonce is DERIVED from the event_id, never minted beside it - so it must be computed
+        # after it, and it inherits its identity semantics exactly. See _wake_nonce().
+        event["nonce"] = _wake_nonce(event["event_id"])
+        # Stamp 1 of the three-stamp wake ledger, all three clocks read together so they are a
+        # COHERENT triple. `ts` is deliberately left alone: it is stamped in the convenience
+        # constructors, microseconds earlier, and consumers already depend on it.
+        event["emitted"] = _emission_stamps()
+        # Classified HERE for the same reason event_id is: a future kind added at some other
+        # construction site cannot forget to carry one, because it does not get a choice. `event`
+        # itself is untouched, so every filter that matches on the NAME keeps working unchanged -
+        # which is what makes it safe to adopt without coordinating a single consumer.
+        event["wake_class"] = _wake_class(event.get("event"))
+        if self.mode == "stdout-jsonl":
+            # Sanitised at the SERIALISED line, so one call covers every field an event can carry -
+            # content, `from`, an alarm `reason` built from server data - rather than each of them.
+            line = _safe_text(json.dumps(event, ensure_ascii=False)) + "\n"
+            sink = self._sink_for(event.get("persona"))
+            if sink is _BROKEN_SINK:
+                return False           # a failed delivery: hold the cursor, never divert the mail
+            if sink is not None:
+                return sink.write(line)
+            try:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+            except OSError as e:
+                sys.stderr.write("kijito-inbox-monitor: WARNING stdout write FAILED, holding the cursor: %s\n" % e)
+                return False
+            return True
+        else:  # exec-per-event
+            env = dict(os.environ)
+            env["KIJITOMON_EVENT"] = str(event.get("event", ""))
+            env["KIJITOMON_SOURCE"] = str(event.get("source", ""))
+            env["KIJITOMON_TS"] = str(event.get("ts", ""))
+            env["KIJITOMON_EVENT_ID"] = str(event.get("event_id", ""))
+            # TRANSMITTED, NEVER RE-DERIVED. The nonce is stamped in emit() and reaches the ndjson wire;
+            # without this line it would never reach the exec env - so the ONE channel the docs point
+            # consumers at first could not see the identity that says "this is the same work re-delivered".
+            # It is derivable from KIJITOMON_EVENT_ID, and that is exactly the
+            # hazard: re-derivation is a SECOND IMPLEMENTATION of sha256 + base62 + a pinned alphabet + an
+            # 11-char truncation, and two implementations diverge. An unpinned alphabet alone is enough to
+            # manufacture a false integrity alarm against correct data. Worse, the divergence surfaces
+            # in SOMEBODY ELSE'S detector: a consumer whose derivation is slightly off splices a token that
+            # matches no enqueue row, and its detector pages a delivery pathology that does not exist.
+            # ⇒ DUPLICATE INSTRUMENTS, TRANSMIT DATA. For an instrument, divergence is a safety property;
+            #   for a shared identifier, divergence IS the defect. The discriminator is whether the thing
+            #   is a MEASUREMENT or a VALUE. This is a value: it must be IDENTICAL in two processes.
+            # No capability is disclosed by passing it - the nonce is an attribution label, deterministic
+            # and therefore already guessable from the event_id sitting beside it.
+            env["KIJITOMON_NONCE"] = str(event.get("nonce", ""))
+            keymap = {
+                "id": "KIJITOMON_ID", "from": "KIJITOMON_FROM", "content": "KIJITOMON_CONTENT",
+                "created": "KIJITOMON_CREATED", "cursor": "KIJITOMON_CURSOR",
+                "persona": "KIJITOMON_PERSONA", "api_base": "KIJITOMON_API_BASE",
+                "reason": "KIJITOMON_REASON", "consecutive_failures": "KIJITOMON_FAILURES",
+                 "seconds": "KIJITOMON_SECONDS", "floor_seconds": "KIJITOMON_FLOOR_SECONDS",
+                "seeded": "KIJITOMON_SEEDED", "current_max": "KIJITOMON_CURRENT_MAX",
+                "capped_to": "KIJITOMON_CAPPED_TO", "dropped": "KIJITOMON_DROPPED",
+                "stranded_inboxes": "KIJITOMON_STRANDED",
+                "dormant_inboxes": "KIJITOMON_DORMANT",
+                "ids": "KIJITOMON_IDS", "oldest_age_seconds": "KIJITOMON_OLDEST_AGE",
+            }
+            for k, envname in keymap.items():
+                if k in event and event[k] is not None:
+                    v = event[k]
+                    # A list is comma-joined, not str()'d: a Python repr ("['a', 'b']") is unusable from a
+                    # shell consumer, and exec-per-event is the portable primitive people reach for first.
+                    env[envname] = _safe_text(",".join(str(x) for x in v) if isinstance(v, list) else str(v))
+            try:
+                r = subprocess.run(self.exec_cmd, shell=True, env=env, timeout=EXEC_TIMEOUT, check=False)
+            except subprocess.TimeoutExpired:
+                # A timeout is NOT a delivery. The command may well have run - so the consumer must be
+                # idempotent - but we have no acknowledgement, and inventing one is how mail disappears.
+                sys.stderr.write("kijito-inbox-monitor: exec TIMED OUT, holding the cursor: %s\n" % self.exec_cmd)
+                return False
+            except Exception as e:
+                sys.stderr.write("kijito-inbox-monitor: exec FAILED to run, holding the cursor: %s\n" % e)
+                return False
+            if r.returncode != 0:
+                sys.stderr.write("kijito-inbox-monitor: exec exited %d, holding the cursor (the event will be "
+                                 "re-delivered): %s\n" % (r.returncode, self.exec_cmd))
+                return False
+            return True
+
+    # convenience constructors (carry the canonical fields; ts stamped at emit time)
+    def new(self, m):
+        """Emit one `new` event. Returns True IFF the message is ACKNOWLEDGED (see emit())."""
+        if self.suppress_authors and m.get("from") in self.suppress_authors:
+            # --suppress-author: don't wake on an event WE authored (self-echo noise). This is a
+            # deliberate POLICY drop, so it counts as acknowledged - the cursor must still advance, or
+            # suppressing an author would pin the watermark forever on that author's next message.
+            return True
+        ev = {"event": "new", "source": SOURCE, "ts": _now_iso(), "id": m.get("id"),
+              "from": m.get("from"), "created": m.get("created")}
+        if m.get("_persona"):
+            ev["persona"] = m.get("_persona")
+        c = self._clip(m.get("content"))
+        if c is not None:
+            ev["content"] = c
+        return self.emit(ev)
+
+    def lifecycle(self, event, **fields):
+        ev = {"event": event, "source": SOURCE, "ts": _now_iso()}
+        ev.update(fields)
+        return self.emit(ev)
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# State file (canonical identity + flock + atomic write + resume)
+# --------------------------------------------------------------------------------------------------------------------
+# A state file that EXISTS but cannot be trusted. Distinct from None (genuinely absent) because the two
+# demand opposite behaviour: absent means baseline, corrupt means fail closed and re-emit.
+CORRUPT_STATE = object()
+
+
+PRIVATE_FILE_MODE = 0o600   # event streams and lock sidecars carry/guard message content
+PRIVATE_DIR_MODE = 0o700
+
+
+class InsecureFile(OSError):
+    """A path we were about to write MAIL into is not something we are willing to write mail into."""
+
+
+def _assert_private_fd(fd, path):
+    """Fail CLOSED unless this fd is a REGULAR file, owned by US, at exactly 0600.
+
+    A best-effort repair - warn on failure and write anyway - rests on the reasoning that "a
+    file we do not own must not crash the watcher". That reasoning is exactly backwards for a file we are
+    about to append PRIVATE MAIL to: it would leave a pre-existing 0666 file at 0666 and deliver mail
+    into it. Refusing to write is the only safe answer, and the caller turns that into a FAILED DELIVERY,
+    so the cursor holds and nothing is lost.
+    """
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise InsecureFile("%s is not a regular file" % path)
+    if not IS_POSIX:
+        # WINDOWS HAS NO POSIX OWNER OR MODE BITS TO CHECK (os.geteuid
+        # does not exist there, so this line would crash the producer at startup). Access there is an ACL, and a
+        # file created under the user's profile inherits a user-only ACL; st_mode reports a synthetic
+        # 0666/0444 that says nothing about who can read it. The regular-file check above still holds.
+        return
+    if st.st_uid != os.geteuid():
+        raise InsecureFile("%s is owned by uid %d, not by us (uid %d)" % (path, st.st_uid, os.geteuid()))
+    cur = st.st_mode & 0o777
+    if cur != PRIVATE_FILE_MODE:
+        # EXACTLY 0600, not merely "no group/other bits" - a 0700 event file would keep its execute bit under
+        # a `st_mode & 0o077` test, which is a mode nothing here should ever have.
+        try:
+            os.fchmod(fd, PRIVATE_FILE_MODE)
+        except OSError as e:
+            # Typed, so a caller reading the log can tell "we refused this path" from "the disk broke".
+            raise InsecureFile("%s is %o and cannot be tightened to 0600: %s" % (path, cur, e))
+        again = os.fstat(fd).st_mode & 0o777
+        if again != PRIVATE_FILE_MODE:
+            raise InsecureFile("%s is %o and could not be tightened to 0600 (now %o)" % (path, cur, again))
+        sys.stderr.write("kijito-inbox-monitor: tightened %s from %o to 0600 (it carries message content "
+                         "and was reachable by other local users)\n" % (path, cur))
+
+
+def _open_private(path, mode="a", encoding=None):
+    """Open a file that must never be readable by anyone else, refusing anything suspicious.
+
+    THE EVENT STREAM CARRIES MESSAGE BODIES. A plain open() takes the process umask (022 by default), so
+    every events.<persona>.ndjson would be created 0644 - world-readable private hive mail. A naive
+    repair is worse than the leak it fixes: if it FOLLOWS SYMLINKS, it chmods and appends mail to whatever
+    a link points at, and a DANGLING link creates its target in another directory entirely - a passive
+    disclosure turned into an active write primitive.
+      · O_NOFOLLOW - the final component must not be a symlink. (No TOCTOU window: the check is the open.)
+      · owner + regular-file, checked on the FD we already hold, never by a second path lookup.
+      · fail CLOSED - callers convert InsecureFile into a failed delivery, never a crash and never a write.
+    """
+    # O_NONBLOCK matters as much as O_NOFOLLOW here: opening a FIFO for writing BLOCKS until a reader
+    # appears, so a FIFO planted at the events path would HANG the watcher forever - silently, with no
+    # crash to notice and no events to miss noticing.
+    # On a regular file O_NONBLOCK is a no-op, so it costs nothing on the path we actually take.
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_APPEND
+             | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    try:
+        fd = os.open(path, flags, PRIVATE_FILE_MODE)
+    except OSError as e:
+        # ELOOP here means the path IS a symlink - report it as what it is, not as a generic open failure.
+        raise InsecureFile("refusing to open %s: %s" % (path, e))
+    try:
+        _assert_private_fd(fd, path)
+    except OSError:
+        os.close(fd)
+        raise
+    return os.fdopen(fd, mode, encoding=encoding) if encoding else os.fdopen(fd, mode)
+
+
+def _repair_mode(path):
+    """Tighten an EXISTING artifact to 0600 in place. Returns True if it is now safe.
+
+    Repairing only the file we happen to open leaves every OTHER persisted artifact exactly as it was -
+    pre-existing rotated archives written by an older version would stay at 0644. Opened
+    O_NOFOLLOW and validated on the fd, for the same reason as _open_private.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except FileNotFoundError:
+        return True                      # nothing there is nothing to leak
+    except OSError as e:
+        sys.stderr.write("kijito-inbox-monitor: WARNING refusing to repair %s: %s\n" % (path, e))
+        return False
+    try:
+        _assert_private_fd(fd, path)
+        return True
+    except OSError as e:
+        sys.stderr.write("kijito-inbox-monitor: WARNING %s may be readable by other local users: %s\n"
+                         % (path, e))
+        return False
+    finally:
+        os.close(fd)
+
+
+def _makedirs_private(path):
+    """Create EVERY missing level 0700, and warn about an existing level anyone else can write.
+
+    os.makedirs(mode=...) applies the mode to the LEAF only; intermediate directories get the umask
+    default, so a nested path would leave its parents 0755. An EXISTING directory is
+    still not re-permissioned - silently changing a path the operator already owns is not ours to do - but
+    a group/world-WRITABLE one is reported, because that is the condition under which someone else can
+    swap a file for a symlink underneath us. (_open_private then refuses it, which is the real defence;
+    this is the warning that tells you why events stopped.)
+    """
+    path = os.path.abspath(path)
+    missing = []
+    cur = path
+    while not os.path.isdir(cur):
+        missing.append(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    for d in reversed(missing):
+        try:
+            os.mkdir(d, PRIVATE_DIR_MODE)
+        except FileExistsError:
+            pass
+    # Check the WHOLE ancestor chain, not only the levels we created - otherwise an EXISTING
+    # directory is never validated, and an existing one is exactly where a hostile path would already be.
+    # A sticky directory (/tmp, mode 1777) is excluded: the sticky bit is precisely what makes a shared
+    # writable directory safe, and warning about it would train the reader to ignore this line.
+    # POSIX only: Windows reports every directory as 0777 (access is an ACL), so the warning would fire on
+    # every level of every path and say nothing true.
+    if not IS_POSIX:
+        return
+    seen = path
+    while True:
+        try:
+            st = os.stat(seen)
+        except OSError:
+            break
+        if (st.st_mode & 0o022) and not (st.st_mode & stat.S_ISVTX):
+            sys.stderr.write("kijito-inbox-monitor: WARNING directory %s is writable by other local users "
+                             "(mode %o); files there can be swapped for symlinks underneath us\n"
+                             % (seen, st.st_mode & 0o777))
+        parent = os.path.dirname(seen)
+        if parent == seen:
+            break
+        seen = parent
+
+
+def _fsync_dir(path):
+    """fsync a DIRECTORY so a rename inside it is durable. Returns True on success.
+
+    os.replace is atomic for a concurrent READER, but atomicity is not durability: after a power loss
+    the new file's contents can be on disk while the directory entry still names the old inode - i.e. a
+    silently OLDER cursor. Syncing the file alone does not cover the rename.
+
+    Windows cannot open a directory for fsync at all, so this always failed there and the events sink held
+    its cursor forever on a new file. NTFS journals directory metadata itself, so there is nothing further
+    to do: report success.
+    """
+    if not IS_POSIX:
+        return True
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        os.fsync(fd)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def identity_migratable(stored, current):
+    """True iff a persisted identity differs from the current one ONLY BY THE CASE OF A QUERY VALUE.
+
+    THE CASE-ONLY MIGRATION. The state PATH casefolds the persona
+    (_state_safe_persona - the local filesystem is case-insensitive, so it must), while the IDENTITY
+    embeds the persona with its original case, straight from the directory. So one file, written when
+    the directory spelled the persona `Maple`, is reloaded by a run that discovered `maple` - the identity
+    compares UNEQUAL, load() reports ABSENT, and absent BASELINES to the newest visible id, skipping
+    everything since the lost cursor. A cursor destroyed by a spelling change is exactly the silent skip
+    the state file exists to prevent.
+
+    ★ THIS IS A THIRD LAYER, NOT A HARMONISATION OF THE OTHER TWO (see CaseAsymmetryInvariantTest, and
+    do not "simplify" it into them). The SERVER's inbox namespace stays case-SENSITIVE - `Maple` and
+    `maple` remain distinct inboxes and a variant holding mail is still alarmed on as stranded. What this
+    says is narrower and follows from the path layer: because the path already collapses the variants,
+    ONE state file can only ever describe ONE of them, so a casefold-equal identity in THAT file is the
+    same watched source spelled differently - a migration to accept and rewrite, not a different source
+    to baseline over.
+
+    Deliberately strict about WHAT may differ: scheme, host, port and path must match EXACTLY, and so
+    must every query KEY. Only the query VALUE is compared case-insensitively. Nothing here invents
+    case-insensitivity for a URL path or for a host we did not already lowercase.
+    """
+    if not (isinstance(stored, list) and len(stored) == 5 and isinstance(current, list) and len(current) == 5):
+        return False
+    if stored[:4] != current[:4]:
+        return False
+    sq, cq = stored[4], current[4]
+    if not (isinstance(sq, list) and isinstance(cq, list)) or len(sq) != len(cq):
+        return False
+    for s, c in zip(sq, cq):
+        if not (isinstance(s, (list, tuple)) and len(s) == 2):
+            return False
+        if str(s[0]) != str(c[0]) or str(s[1]).casefold() != str(c[1]).casefold():
+            return False
+    return True
+
+
+class StateFile:
+    def __init__(self, path, identity):
+        self.path = path
+        self.identity = identity
+        self._lockf = None
+        # Set by lock() when the state file could not be PROVEN private, and consumed by load(), which
+        # then fails closed. WHAT CLEARS THIS: nothing within the process - the condition is a property of
+        # the path on disk, re-evaluated from scratch on the next start. Recorded explicitly because "no
+        # release condition" is only acceptable when it is the ANSWER, not when it is an oversight.
+        self.unsafe = False
+
+    def lock(self):
+        if not IS_POSIX or fcntl is None:
+            # WINDOWS: the same single-writer guarantee through msvcrt, on the same .lock sidecar. This used
+            # to be a bare return ("run a single instance"), so two producers on one state file both ran,
+            # each emitting every message. msvcrt.locking locks a BYTE RANGE, so pin it: byte 0 of the
+            # sidecar, taken non-blocking. The OS releases it when the handle closes or the process dies.
+            if msvcrt is None:
+                return
+            _makedirs_private(os.path.dirname(os.path.abspath(self.path)) or ".")
+            self._lockf = _open_private(self.path + ".lock", "a+")
+            try:
+                self._lockf.seek(0)
+                msvcrt.locking(self._lockf.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                self.unlock()
+                raise FatalConfig("state-file in use (another watcher holds the lock): %s" % self.path)
+            return
+        dirn = os.path.dirname(os.path.abspath(self.path)) or "."
+        _makedirs_private(dirn)
+        # Lock a DEDICATED .lock SIDECAR, never the state-file itself: save() replaces the state-file's inode
+        # (mkstemp + os.replace) on every poll, which would orphan a flock held on it and let a second watcher
+        # lock the new inode freely. The sidecar is never replaced, so the flock persists for the process
+        # lifetime. flock is advisory + auto-released by the OS on exit (no stale lockfile to clean).
+        if not _repair_mode(self.path):  # the state file itself, if an older version left it permissive
+            # CONSUME THE VERDICT. As a bare statement, a state file we
+            # could not prove private would then be trusted anyway. It is the highest-value file here to
+            # subvert: whoever controls the CURSOR controls which mail counts as already delivered, and a
+            # cursor moved FORWARD is silent, permanent mail loss - the single failure this tool exists to
+            # prevent. Deliberately NOT fatal: one persona's hostile path must not take the whole producer
+            # down (the same reasoning as _sink_for). load() fails closed on it instead, which routes into
+            # the existing, tested "present but untrustworthy" path rather than inventing a new one.
+            self.unsafe = True
+        self._lockf = _open_private(self.path + ".lock", "a+")
+        try:
+            fcntl.flock(self._lockf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # Close the sidecar we just opened before failing. Leaving it open leaks an fd per refused
+            # lock - and persona rediscovery runs every tick, so a persona whose file is held by another
+            # watcher would leak one fd per attempt for the life of the process.
+            self.unlock()
+            raise FatalConfig("state-file in use (another watcher holds the lock): %s" % self.path)
+
+    def load(self):
+        """Return the resumed state on a VALID identity-matching file; None if genuinely ABSENT.
+
+        Raises FatalConfig on a present-but-unreadable path, and returns the CORRUPT sentinel on a file
+        that EXISTS but cannot be trusted.
+
+        ABSENT AND CORRUPT ARE NOT THE SAME ANSWER. If both returned None,
+        a garbled state file would be indistinguishable from a first launch - and a first launch BASELINES to
+        the newest visible id, silently skipping every message between the lost cursor and now. That is a
+        permanent, invisible loss produced by the one event most likely to accompany a crash. A file that
+        is present but unparseable is EVIDENCE THAT A CURSOR EXISTED, so it must fail closed and re-emit
+        rather than fail open and skip. Duplicates are recoverable; skips are not.
+        """
+        if self.unsafe:
+            # The verdict lock() computed and used to discard. Present-but-not-provably-ours is exactly
+            # the "evidence a cursor existed, but not one we can trust" case: fail closed, re-emit.
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file %s could not be proven private; "
+                             "refusing to trust its cursor and failing closed\n" % self.path)
+            return CORRUPT_STATE
+        # LET THE O_NOFOLLOW OPEN BE THE EXISTENCE TEST. The WRITE path opens O_NOFOLLOW; a READ path
+        # without it would follow a symlink planted at the state path and read its target as our own
+        # state. os.path.exists() follows symlinks too, so it would answer for the TARGET rather than the
+        # link - and being a second path lookup it would open a TOCTOU window between the check and the
+        # open. One syscall settles both questions.
+        try:
+            fd = os.open(self.path,
+                         os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        except FileNotFoundError:
+            return None                  # genuinely ABSENT - the one case that may baseline
+        except OSError as e:
+            # PRESENT, but not something we are willing to read: a symlink (ELOOP), a FIFO, a directory.
+            # Still EVIDENCE THAT A CURSOR EXISTED, so it takes the same fail-closed answer as an
+            # unparseable file. Reading it would be worse than not resuming; baselining would be worst.
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file %s exists but is not a file we will "
+                             "read (%s); failing closed and re-emitting rather than baselining\n"
+                             % (self.path, e))
+            return CORRUPT_STATE
+        try:
+            f = os.fdopen(fd, "r")
+        except OSError as e:
+            os.close(fd)                 # never leak the descriptor we just took
+            raise FatalConfig("state-file unreadable: %s" % e)
+        with f:
+            try:
+                raw = f.read()
+            except OSError as e:
+                raise FatalConfig("state-file unreadable: %s" % e)
+        if not raw.strip():
+            # PRESENT BUT EMPTY IS NOT ABSENT. A zero-byte file is still
+            # evidence that a cursor existed here; treating it as a first launch baselines over
+            # everything since. Same fail-open shape as an unparseable file, same answer.
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file is present but EMPTY; refusing to "
+                             "baseline over it: %s\n" % self.path)
+            return CORRUPT_STATE
+        try:
+            d = json.loads(raw)
+            cursor = d["cursor"]
+            state = d["state"]
+            failures = d["consecutive_failures"]
+            ident = d["identity"]
+        except (ValueError, KeyError, TypeError):
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file is present but unparseable; refusing to "
+                             "baseline over it (that would silently skip everything since the lost cursor): "
+                             "%s\n" % self.path)
+            return CORRUPT_STATE
+        if not ((cursor is None or _is_int(cursor)) and state in ("UP", "DOWN")
+                and _is_int(failures) and failures >= 0):   # a failure COUNT is never negative
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file has a valid envelope but invalid "
+                             "fields; refusing to baseline over it: %s\n" % self.path)
+            return CORRUPT_STATE
+        if ident != self.identity:
+            if identity_migratable(ident, self.identity):
+                # CASE-ONLY MIGRATION, not a different source - see identity_migratable(). Resume the
+                # cursor; the next save() rewrites the file with the current spelling, so this converges
+                # after one poll instead of re-warning forever.
+                sys.stderr.write("kijito-inbox-monitor: state-file identity differs only by case (%r -> %r); "
+                                 "MIGRATING it rather than re-baselining (re-baselining would skip every "
+                                 "message since the stored cursor): %s\n" % (ident, self.identity, self.path))
+            else:
+                sys.stderr.write("kijito-inbox-monitor: WARNING state-file identity mismatch (%r != %r) - NOT "
+                                 "resuming its cursor; re-baselining to avoid a silently-blind watcher.\n"
+                                 % (ident, self.identity))
+                return None
+        # EVERY PERSISTED FIELD IS READ STRICTLY, AND ANYTHING UNRECOGNISED FAILS CLOSED. Reading the
+        # pin's own flags with `d.get(k) is True` would let a JSON `1` - the shape a
+        # hand-edit, a jq one-liner or another language's serialiser produces - normalise to False and
+        # SILENTLY UNPIN the watermark, letting the replay cap cross the very span the pin was
+        # protecting. `pin_evidence_intact` has the mirror hazard (`is False`, so `0` reads as intact), and
+        # ints-that-are-bools would be accepted as row ids and as gap_alerted. A malformed field is EVIDENCE
+        # THE FILE CANNOT BE TRUSTED, so the honest answer is CORRUPT_STATE - which arms below the visible
+        # window and re-emits it - never a quietly permissive default.
+        strict_ok = True
+
+        def _flag(key):
+            """Strict tri-state read of a persisted boolean: (value, ok)."""
+            nonlocal strict_ok
+            v = d.get(key, _MISSING)
+            if v is _MISSING or v is None:
+                return False
+            if v is True or v is False:
+                return v
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file field %r is not a boolean (%r); refusing "
+                             "to interpret it: %s\n" % (key, v, self.path))
+            strict_ok = False
+            return False
+
+        # Ids already emitted ABOVE a pinned watermark. Absent in files written by older versions, which is
+        # exactly the forward-compat case: an empty set just means "nothing pinned", the pre-pinning behaviour.
+        alerted = d.get("gap_alerted", _MISSING)
+        if alerted is _MISSING or alerted is None:
+            alerted = None
+        elif _is_int(alerted):
+            pass
+        else:
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file 'gap_alerted' is not an integer (%r); "
+                             "refusing to interpret it: %s\n" % (alerted, self.path))
+            alerted, strict_ok = None, False
+        release_at = d.get("pin_release_at", _MISSING)
+        if release_at is _MISSING or release_at is None:
+            release_at = None
+        elif _is_int(release_at):
+            pass
+        else:
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file 'pin_release_at' is not an integer (%r); "
+                             "refusing to interpret it: %s\n" % (release_at, self.path))
+            release_at, strict_ok = None, False
+        # wall-clock stamp of the first failure of a DOWN run. Absent in older files. Read strictly:
+        # a bool is not a timestamp (the same `1`/`true` confusion as the pin flags above).
+        down_since = d.get("down_since", _MISSING)
+        if down_since is _MISSING or down_since is None:
+            down_since = None
+        else:
+            # json.loads accepts `-Infinity`/`NaN`, turns 1e400 into inf, and hands back a Python int for a
+            # 400-digit literal - on which math.isfinite ITSELF raises OverflowError. Any of those escaping
+            # load() is a traceback at startup or at the alert edge; under a supervisor that is a crash loop
+            # fed by the file it re-reads on every restart. So: normalise through float() with the overflow
+            # caught, then require finite and positive. A stamp is a finite positive epoch or it is nothing.
+            fv = None
+            if isinstance(down_since, (int, float)) and not isinstance(down_since, bool):
+                try:
+                    fv = float(down_since)
+                except OverflowError:
+                    fv = None
+            if fv is not None and math.isfinite(fv) and fv > 0:
+                down_since = fv
+            else:
+                sys.stderr.write("kijito-inbox-monitor: WARNING state-file 'down_since' is not a finite positive "
+                                 "number (%r); refusing to interpret it: %s\n" % (down_since, self.path))
+                down_since, strict_ok = None, False
+        raw = d.get("emitted_above")
+        if raw is None:
+            emitted, intact = set(), True          # no pin was in force; the ordinary case
+        elif isinstance(raw, list) and all(_is_int(i) for i in raw):
+            # _is_int, not isinstance(i, int): `true` in this list would otherwise become the id 1 and
+            # suppress a real message 1 for the life of the pin.
+            emitted, intact = set(raw), True
+        else:
+            # CORRUPT PIN STATE MUST FAIL CLOSED. Loading it as an empty set silently UNPINS: the watcher
+            # would then think nothing was outstanding, let the replay cap jump the cursor over the very
+            # span the pin was protecting, and lose it. We cannot know which ids were delivered, so we
+            # keep the pin (empty tracking) and mark the evidence unusable - the gap can then only be
+            # closed by an authoritative read, never by counting.
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file 'emitted_above' is malformed; "
+                             "keeping the watermark PINNED with no delivery tracking rather than "
+                             "silently unpinning: %s\n" % self.path)
+            emitted, intact = set(), False
+        # A recorded gap alert with no pin tracking is itself inconsistent: something was pinned when the
+        # file was written. Treat it the same way - hold the pin rather than assume it resolved.
+        if alerted is not None and not emitted and intact and raw is None:
+            intact = False
+        # THE PIN'S OWN STATE IS PERSISTED. It used to be inferred from
+        # `emitted_above`, which is empty in exactly the case that matters - a corrupt-state pin, where
+        # nothing has been tracked yet. So a restart lost the pin, the replay cap was free again, and the
+        # very span the pin was protecting got crossed on the first poll. A pin that does not survive a
+        # restart is not a pin; the crash is when you need it.
+        # Read strictly: `0` used to slip past `is False` and leave the evidence marked INTACT, which is
+        # the fail-OPEN direction on the one field that says "stop trusting your own view of this span".
+        if d.get("pin_evidence_intact", _MISSING) is not _MISSING and not _flag("pin_evidence_intact"):
+            intact = False
+        pin_forced = _flag("pin_forced")
+        state_corrupt = _flag("state_corrupt")
+        if not strict_ok:
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file has malformed pin fields; treating the "
+                             "whole file as CORRUPT (fail closed) rather than resuming a state we cannot "
+                             "read: %s\n" % self.path)
+            return CORRUPT_STATE
+        # Whether the unread-not-shown alarm is currently ANNOUNCED. Absent (older file) reads as False:
+        # a re-announce after an upgrade costs one event and is honest about the current condition,
+        # whereas defaulting to True would silence a live condition for the rest of the run.
+        hidden = d.get("unread_hidden") is True
+        # `unread` is read as strictly as every other field: a count that is not a non-negative
+        # integer is evidence the file was not written by us, and the answer to that is the same fail-closed
+        # one. Absent (an older file, or a poll with no count) is fine and means unknown.
+        unread = d.get("unread")
+        if unread is not None and not (_is_int(unread) and unread >= 0):
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file 'unread' is not a non-negative integer "
+                             "(%r); treating the whole file as CORRUPT (fail closed): %s\n" % (unread, self.path))
+            return CORRUPT_STATE
+        return {"cursor": cursor, "state": state, "failures": failures, "emitted_above": emitted,
+                "gap_alerted": alerted, "pin_evidence_intact": intact,
+                "pin_forced": pin_forced, "pin_release_at": release_at,
+                "state_corrupt": state_corrupt, "unread_hidden": hidden, "unread": unread,
+                "down_since": down_since}
+
+    def unlock(self):
+        """Release the single-writer flock and close the sidecar fd.
+
+        The OS drops an flock when the process exits, so this is hygiene rather than correctness - but an
+        fd held for a target that is torn down is a genuine leak in a long-lived process, and it is what
+        surfaces as ResourceWarnings in the test suite.
+        """
+        if self._lockf is not None:
+            try:
+                self._lockf.close()
+            finally:
+                self._lockf = None
+
+    def save(self, cursor, state, failures, emitted_above=None, gap_alerted=None,
+             pin_forced=False, pin_evidence_intact=True, state_corrupt=False, pin_release_at=None,
+             unread_hidden=False, unread=None, down_since=None):
+        """Persist the cursor. Returns True IFF the write is DURABLE.
+
+        The directory fsync used to be called and its answer thrown away, so a failure returned success
+        with no diagnostic: the cursor was written and its durability merely assumed. The failure
+        direction is re-delivery rather than loss - a reverted state file replays mail - but a watcher
+        that cannot tell you it failed to persist will keep not telling you, and a disk failing this way
+        is exactly the condition nobody notices.
+        """
+        # ⛔ NO WINDOWS EARLY-RETURN HERE. This method used to open with `if not IS_POSIX: return True`, so on
+        # Windows the cursor was never written while every caller was told it had been. Each supervisor
+        # restart then found no state file, BASELINED to the newest id, and any mail that arrived while the
+        # producer was down never raised a `new` - the permanent, silent skip load() exists to prevent.
+        # Everything below is portable: mkstemp, fsync and os.replace
+        # work on Windows, and _fsync_dir answers True there.
+        d = {"identity": self.identity, "cursor": cursor, "state": state, "consecutive_failures": failures}
+        # Persisted so a RESTART cannot re-emit what we already delivered above a pinned watermark.
+        # Without this, failing closed would trade silent loss for a duplicate storm on every restart.
+        if emitted_above:
+            d["emitted_above"] = sorted(emitted_above)
+        # Persisted too, so a restart does not re-announce a gap it already announced.
+        if gap_alerted is not None:
+            d["gap_alerted"] = gap_alerted
+        # The pin's own state, persisted rather than inferred. `emitted_above` is EMPTY for a
+        # corrupt-state pin, so inferring from it silently dropped exactly the pin that matters.
+        if pin_forced:
+            d["pin_forced"] = True
+        if not pin_evidence_intact:
+            d["pin_evidence_intact"] = False
+        if state_corrupt:
+            d["state_corrupt"] = True
+        # The floor that RELEASES a corruption pin. Persisted with the pin itself: a pin whose release
+        # condition does not survive a restart is a pin that can never clear.
+        if pin_release_at is not None:
+            d["pin_release_at"] = pin_release_at
+        # Same reason, for the unread-not-shown alarm: KeepAlive restarts a crashing producer, and an
+        # un-persisted suppression would turn a crash loop into a wake storm on a condition nobody can
+        # act on any faster for being told twice.
+        if unread_hidden:
+            d["unread_hidden"] = True
+        # The persona's unread count as of this poll - the one LOCAL place a status line or a
+        # health check can read it. INFORMATIONAL: nothing here reads it back to decide what to emit.
+        # Omitted when this poll had no count, so its absence means "unknown", never "zero".
+        if unread is not None:
+            d["unread"] = unread
+        # the wall-clock stamp of the first failure of the current DOWN run, so a supervisor restart
+        # mid-outage resumes the measured span instead of restarting the floor from zero.
+        if down_since is not None:
+            d["down_since"] = down_since
+        dirn = os.path.dirname(os.path.abspath(self.path)) or "."
+        # BOTH OF THESE ARE INSIDE THE GUARD, and they did not used to be.
+        # This function builds a careful "written but not provably durable" path - _fsync_dir fails ->
+        # return False -> _state_not_durable() announces -> the producer keeps running on the in-memory
+        # cursor. But `_makedirs_private` and `mkstemp` sat OUTSIDE the try, so the MOST ORDINARY way a
+        # state write actually fails - an unwritable state DIRECTORY - raised EACCES before any of that,
+        # escaped save() entirely, and reached only the last-resort top-level handler: exit 2.
+        # ⇒ THE CONSEQUENCE WAS A WHOLE CATEGORY WORSE THAN THE ONE THIS CODE PREPARED FOR. Supervisors
+        #   restart us (launchd KeepAlive; systemd Restart=always, RestartSec=15), and a producer that
+        #   dies before persisting its cursor re-delivers the same mail on every respawn. Measured on a
+        #   test install: 4 wakes/min for ONE message, forever, cursor frozen - a duplicate storm
+        #   arriving through the very path built to prevent one.
+        # ★ A LAST-RESORT HANDLER PLUS SUPERVISED AUTO-RESTART CONVERTS ANY UNGUARDED FAULT INTO A
+        #   PERIODIC STORM. Spend the guard budget per-fault; do not delegate it to the supervisor.
+        #   The top handler's own comment already said reaching it means a guard is missing.
+        try:
+            _makedirs_private(dirn)
+            fd, tmp = tempfile.mkstemp(dir=dirn, prefix=".kijmon-", suffix=".tmp")
+        except OSError as e:
+            sys.stderr.write("kijito-inbox-monitor: WARNING cannot create a temp file in the state "
+                             "directory %s (%s); the cursor is NOT being persisted, so a restart will "
+                             "replay mail from an older cursor. Continuing on the in-memory cursor "
+                             "rather than exiting - a crash here is restarted into a re-delivery "
+                             "loop\n" % (dirn, e))
+            return False
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(d, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+            # The rename needs its own sync - see _fsync_dir(). Without it the cursor's DURABILITY story
+            # stops one level short of the thing that makes it visible. ITS ANSWER IS RETURNED, not
+            # discarded: a check whose result nobody reads is not a check.
+            if not _fsync_dir(dirn):
+                sys.stderr.write("kijito-inbox-monitor: WARNING state-file directory fsync FAILED for %s; "
+                                 "the cursor is written but its durability is UNPROVEN (a crash may replay "
+                                 "mail from an older cursor)\n" % dirn)
+                return False
+            return True
+        except OSError as e:
+            sys.stderr.write("kijito-inbox-monitor: WARNING state-file write failed (non-fatal): %s\n" % e)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return False
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# SIGUSR1 self-pipe (POSIX) + clean shutdown
+# --------------------------------------------------------------------------------------------------------------------
+class WakeSeam:
+    def __init__(self):
+        self.r = self.w = None
+        self.stop = False
+
+    def install(self):
+        if not IS_POSIX:
+            return
+        self.r, self.w = socket.socketpair()
+        self.r.setblocking(False)
+        self.w.setblocking(False)
+        signal.set_wakeup_fd(self.w.fileno())
+        # a real (no-op) handler must be installed or the default disposition terminates the process
+        signal.signal(signal.SIGUSR1, lambda *_: None)
+        # clean shutdown: flip stop flag and let select wake (set_wakeup_fd writes the byte)
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, self._on_stop)
+
+    def _on_stop(self, *_):
+        self.stop = True
+
+    def drain(self):
+        if self.r is None:
+            return
+        try:
+            while True:
+                if not self.r.recv(4096):
+                    break
+        except (BlockingIOError, OSError):
+            pass
+
+    def wait(self, timeout):
+        """Block up to timeout, returning early if a signal byte arrives. Drain happens at the next poll start."""
+        if self.r is None:
+            # Windows / no seam: plain sleep, but stay interruptible-ish via short slices
+            end = _monotonic() + timeout
+            while _monotonic() < end and not self.stop:
+                time_sleep(min(0.5, end - _monotonic()))
+            return
+        try:
+            select.select([self.r], [], [], timeout)
+        except (InterruptedError, OSError):
+            pass
+
+
+def alert_floor_seconds(args):
+    """The MEASURED span a failing run must reach before the dead-man `alert` fires.
+
+    `--alert-floor-seconds` when given; otherwise `(--alert-after - 1) * --poll-seconds`, which is exactly
+    how long `--alert-after` consecutive failed polls take at the configured interval - so plain interval
+    polling still alerts on the N-th failure, while long-poll mode (which retries after 1/2/4 s on a
+    failure) can no longer reach the edge in ~3 s. Before this, the count-only edge fired on every
+    routine server restart, 11 s windows included.
+    """
+    if args.alert_floor_seconds is not None:
+        return args.alert_floor_seconds
+    return (args.alert_after - 1) * args.poll_seconds
+
+
+def _monotonic():
+    import time as _t
+    return _t.monotonic()
+
+
+def time_sleep(s):
+    import time as _t
+    _t.sleep(max(0.0, s))
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# Core watcher
+# --------------------------------------------------------------------------------------------------------------------
+def build_headers(args):
+    """Resolve the required Kijito API token. --token-file wins over $KIJITOMON_TOKEN; missing token is fatal.
+
+    Every request carries a named User-Agent - the Kijito API WAF rejects the default Python-urllib UA with 403.
+    """
+    headers = {"User-Agent": USER_AGENT}
+    token = None
+    if args.token_file:  # --token-file wins over env
+        try:
+            with open(args.token_file) as f:
+                token = f.read().strip()
+        except OSError as e:
+            raise FatalConfig("--token-file unreadable: %s" % e)
+    elif os.environ.get("KIJITOMON_TOKEN"):
+        token = os.environ["KIJITOMON_TOKEN"].strip()
+    if not token:
+        raise FatalConfig("no Kijito API token - set $KIJITOMON_TOKEN or pass --token-file (get a token from "
+                          "your Kijito account)")
+    if args.auth_header:
+        headers[args.auth_header] = token
+    else:
+        headers["Authorization"] = "Bearer %s" % token
+    return headers
+
+
+def persona_url(persona):
+    return "%s?persona=%s&mark_read=false" % (INBOX_URL, urllib.parse.quote(persona))
+
+
+def pin_for(url):
+    """The addresses a connection to `url` may use: resolved once, and for plain http ONLY loopback ones.
+
+    The http allowance (normalize_api_base) is granted to the NAMES localhost / 127.0.0.1 / ::1, but what is
+    connected to is whatever the resolver returned. A host with no hosts-file entry for localhost
+    can fall through to DNS and get a remote address, and the token would then cross the network in the clear.
+    So for http the resolution itself must be loopback; if nothing loopback remains, refuse to start.
+    """
+    p = urllib.parse.urlsplit(url)
+    host = p.hostname or ""
+    port = p.port or (443 if p.scheme == "https" else 80)
+    pinned = resolve_and_pin(host, port)
+    if p.scheme == "http":
+        loopback = tuple(a for a in pinned if _is_loopback_address(a))
+        if not loopback:
+            raise FatalConfig("refusing plain http to %r: it resolved to %s, which is not this machine - the API "
+                              "token would cross the network unencrypted" % (host, ", ".join(pinned) or "nothing"))
+        pinned = loopback
+    return pinned
+
+
+def _is_loopback_address(addr):
+    try:
+        return ipaddress.ip_address(addr.split("%", 1)[0]).is_loopback
+    except ValueError:
+        return False
+
+
+def make_opener_for(url):
+    return build_opener(pin_for(url))
+
+
+def _persona_path(template, persona):
+    """Fill a `{persona}` path template with the producer's OWN filename component for PERSONA.
+
+    Every per-persona path a supervisor needs - events, state, token - goes through here, so the unit file
+    (systemd `%i`, a plist, a shell script) never spells a filename itself. `%i` is systemd's ESCAPED
+    instance name and passes a persona's raw case through, so a unit that interpolated it disagreed with
+    the producer for any name that is not already a safe component ('Maple', 'name (purpose)', 'Ωmega').
+    """
+    return template.replace("{persona}", _state_safe_persona(persona))
+
+
+def _state_path_from_args(args, persona):
+    """THE state file a persona's watch target opens: the `{persona}` template when given, else the
+    per-persona derivation of the `--state-file` base. One function, so a supervisor template, the docs and a
+    test can ask the producer which file it will write instead of re-deriving the name and drifting."""
+    if getattr(args, "state_file_template", None):
+        return _persona_path(args.state_file_template, persona)
+    return _state_path_for_persona(getattr(args, "state_file", None), persona)
+
+
+def _created_epoch(created):
+    """A message's `created` as epoch seconds, or None if it cannot be read. The server writes naive UTC
+    ('2026-09-24 21:34:24.943580'); an explicit offset or 'Z' is honoured when present."""
+    if not isinstance(created, str) or not created:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(created.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.timestamp()
+
+
+def _state_path_for_persona(base_path, persona):
+    if not base_path or not persona:
+        return base_path
+    root, ext = os.path.splitext(base_path)
+    safe = _state_safe_persona(persona)
+    base = os.path.basename(root).casefold()
+    if base == safe or base.endswith("." + safe):
+        return base_path
+    return root + "." + safe + (ext or ".json")
+
+
+def _state_safe_persona(persona):
+    """Map a persona to a filename component - CASEFOLDED, deliberately.
+
+    macOS (APFS) and Windows are case-INSENSITIVE, so 'Cobalt-chat' and 'cobalt-chat' name the SAME
+    file. Deriving the path from the raw name made the producer block on its OWN flock every tick for
+    a case-variant persona, and left that persona with no event stream at all - a SILENT wake gap,
+    which is the exact failure this tool exists to prevent. Matching case-insensitively here is the
+    filesystem half of the fix; the persona's ORIGINAL case is preserved for the API (persona_url),
+    i.e. case-insensitive match, case-preserving display.
+    """
+    return "".join(c if (c.isalnum() or c in "._-") else "_" for c in persona.casefold())
+
+
+_WARNED_PERSONAS = set()
+
+
+def _warn_persona_once(persona, text):
+    """Emit a per-persona warning at most ONCE per process.
+
+    Persona discovery runs every tick, so a condition that cannot resolve itself (a state file held by
+    another watcher, an unusable path) otherwise grows stderr without bound: one observed 3-day run had
+    20,079 of 20,129 stderr lines from a single repeated warning, which buries every other diagnostic.
+    """
+    key = persona.casefold()
+    if key in _WARNED_PERSONAS:
+        return
+    _WARNED_PERSONAS.add(key)
+    sys.stderr.write("kijito-inbox-monitor: WARNING %s (further warnings for %r suppressed)\n"
+                     % (text, persona))
+
+
+def _clear_persona_warning(persona):
+    """WHAT CLEARS THIS: the condition the warning described actually recovering.
+
+    Without a release, suppress-once is itself an instance of the defect class - a state set and never
+    cleared - and it fails in the dangerous direction: a persona whose sink broke, recovered, then broke
+    AGAIN would be silently suppressed forever, so the second outage arrives with no diagnostic at all.
+    Called from the recovery path, never on a timer: the warning is suppressed exactly as long as the
+    condition it reported is still true.
+    """
+    _WARNED_PERSONAS.discard(persona.casefold())
+
+
+def requested_personas(args, opener, headers):
+    # ⚠️ CASE-INSENSITIVE DEDUPE, THE SAME RULE AS new_personas(). This used to be an
+    # EXACT `p not in personas`, so `--persona Maple --persona maple` survived as two entries - but
+    # _state_safe_persona() CASEFOLDS the state path, so both resolve to ONE state file. The second
+    # flock then raises FatalConfig("state-file in use") out of the UNCAUGHT list comprehension in
+    # run(), and the producer refuses to start FOR EVERY PERSONA. That breaks the containment rule this
+    # file states twice ("one persona's hostile path must not take the whole producer down"), and the
+    # error blamed "another watcher" when the collision was with itself.
+    # Keeps the FIRST spelling seen, exactly like new_personas(), so nothing about the normal path moves.
+    personas = []
+    seen = set()
+
+    def add(p):
+        key = p.casefold()
+        if p and key not in seen:
+            seen.add(key)
+            personas.append(p)
+
+    for p in (p.strip() for p in args.persona or []):
+        add(p)
+    for group in args.personas or []:
+        for p in (part.strip() for part in group.split(",")):
+            add(p)
+    if args.all_personas or not personas:
+        for p in fetch_personas(opener, headers):
+            add(p)
+    return personas
+
+
+def watches_all_personas(args):
+    return args.all_personas or not (args.persona or args.personas)
+
+
+def new_personas(existing, discovered):
+    # Case-INSENSITIVE: a case-variant of a persona we already watch is the SAME inbox and (on a
+    # case-insensitive filesystem) the same state file - adopting it again self-deadlocks. Also
+    # collapses variants within `discovered`, keeping the first spelling seen.
+    seen = {p.casefold() for p in existing}
+    out = []
+    for p in discovered:
+        key = p.casefold()
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
+
+
+class WatchTarget:
+    last_newest = _NO_STATEMENT   # class default, so a target built without __init__ reads "no statement"
+
+    def __init__(self, persona, url, opener, headers, args, emitter):
+        self.persona = persona
+        self.url = url
+        self.opener = opener
+        self.headers = headers
+        self.args = args
+        self.emitter = emitter
+        self.identity = canonical_identity(url)
+        self.state_file = None
+        self.cursor = None
+        self.fsm_state = "UP"
+        self.failures = 0
+        self.down_since = None   # (monotonic, wall) of the FIRST failure of the current run; None while healthy
+        self.armed = False
+        self.fast_path = False
+        self.last_unread = None
+        self.last_newest = _NO_STATEMENT   # the server's newest_unread_id at the last trigger check
+        # What THIS poll learned about the persona's unread count, for the state file. Kept apart
+        # from `last_unread`, which is the fast-path's wake TRIGGER and only exists while the fast path is on:
+        # reusing it would publish nothing under --no-fast-path, and a status line would read that as zero.
+        self.observed_unread = None
+        self.skips = 0
+        self.first_poll = True
+        self.last_heartbeat = _monotonic()
+        # FAIL-CLOSED state. `cursor` is a CONFIRMED-CONTIGUOUS watermark: everything at or below it is
+        # known delivered. When the server admits it hid messages above the cursor, the watermark PINS
+        # rather than stepping over them, and ids emitted above the pin are remembered here so liveness
+        # (delivering what we can see) does not cost us duplicates. Both are persisted.
+        self.emitted_above = set()
+        self.gap_alerted = None   # the pinned watermark we have already alerted on, so pinning does not spam
+        # False once we can no longer reason about the pinned span - tracking overflowed, or the persisted
+        # pin state was corrupt. A gap can then only be closed by an authoritative read, never by counting.
+        self.pin_evidence_intact = True
+        self.pin_forced = False   # hold a pin whose tracking we lost, so nothing can jump the watermark
+        self.state_corrupt = False  # a state file was PRESENT but unusable: arm fail-closed, and say so
+        # The floor at which a corruption pin may RELEASE. A corrupt-state arm parks the watermark one
+        # BELOW the window it re-emits, so the ordinary release test (a complete window reaching back to
+        # at-or-below the watermark) is unsatisfiable by construction - the pin carries the floor that
+        # discharges it instead. Persisted, because a release condition that dies on restart is not one.
+        self.pin_release_at = None
+        self.delivery_blocked = False  # an emit failed; the cursor is held below it until it succeeds
+        self.state_not_durable = False  # the last cursor write could not be proven durable
+        # Is the unread-not-shown alarm currently ANNOUNCED? Keyed on the CONDITION, so it self-clears
+        # One flag per target, so the key is per-inbox and EXACT - a case-variant persona is a
+        # different WatchTarget with a different flag, and cannot hold this one's alarm down.
+        self.unread_hidden = False
+        # Does the persona DIRECTORY know this inbox? Optimistic by default: see poll_once() for why this
+        # alarm fails OPEN where the stranded-mail alarm fails closed.
+        self.directory_backed = True
+
+        self.count_url = NOTIFY_PENDING_URL
+        cp = urllib.parse.urlsplit(url)
+        self.unread_persona = dict(urllib.parse.parse_qsl(cp.query)).get("persona") or persona
+
+        state_path = _state_path_from_args(args, persona)
+        if state_path:
+            self.state_file = StateFile(state_path, self.identity)
+            if not args.self_test:
+                self.state_file.lock()
+                loaded = self.state_file.load()
+                if loaded is CORRUPT_STATE:
+                    # A file that EXISTS but cannot be parsed is EVIDENCE A CURSOR EXISTED. Baselining
+                    # here would step over every message between that lost cursor and now, invisibly.
+                    # So fail closed: keep no cursor, force the pin so the watermark cannot jump, and
+                    # mark the evidence unusable. The first poll then emits everything visible (the
+                    # replay cap is bypassed while pinned) and the gap is announced rather than buried.
+                    self.state_corrupt = True
+                    self.pin_forced = True
+                    self.pin_evidence_intact = False
+                elif loaded is not None:
+                    self.cursor = loaded["cursor"]
+                    self.fsm_state, self.failures = loaded["state"], loaded["failures"]
+                    # the measured floor survives a restart mid-outage: the persisted wall-clock stamp of
+                    # the first failure supplies the span already elapsed. Absent (a file written by an older
+                    # version) the run is measured from now - the conservative direction (later alert, never
+                    # a spurious one).
+                    self.down_since = None
+                    if self.failures:
+                        wall = loaded.get("down_since")
+                        elapsed = max(0.0, time.time() - wall) if wall is not None else 0.0
+                        self.down_since = (_monotonic() - elapsed, wall if wall is not None else time.time())
+                    self.emitted_above = loaded["emitted_above"]
+                    self.gap_alerted = loaded["gap_alerted"]
+                    self.pin_evidence_intact = loaded["pin_evidence_intact"]
+                    self.state_corrupt = loaded["state_corrupt"]
+                    self.pin_release_at = loaded["pin_release_at"]
+                    # A persisted forced pin is authoritative; the inference from missing tracking is only
+                    # a fallback for files written before the flag existed.
+                    self.pin_forced = loaded["pin_forced"] or not loaded["pin_evidence_intact"]
+                    self.unread_hidden = loaded["unread_hidden"]
+        if args.seed_at is not None:
+            self.cursor = args.seed_at
+
+    def self_test(self):
+        poll = fetch(self.opener, self.url, self.headers)
+        reach_ok = poll.ok
+        label = self.persona or self.url
+        sys.stderr.write("self-test[%s]: source %s (%s)\n" % (
+            label, "REACHABLE+healthy" if reach_ok else "UNHEALTHY", poll.reason or "ok"
+        ))
+        # CONSUME THE EMITTER'S ANSWER. emit() reports a failed delivery by RETURNING False, which is its
+        # documented, non-exceptional path (a refused sink, a failed write, a non-zero --exec). Treating
+        # only an EXCEPTION as failure would make a self-test against a sink that had just refused the
+        # write print emit=OK - and the one surface whose entire job is to tell an operator "this works
+        # before you trust it" must not itself hide a failed delivery.
+        try:
+            emit_ok = bool(self.emitter.new({"id": 0, "from": "self-test", "content": "synthetic emit OK",
+                                             "created": _now_iso(), "_persona": self.persona}))
+        except Exception as e:
+            emit_ok = False
+            sys.stderr.write("self-test[%s]: emit FAILED: %s\n" % (label, e))
+        sys.stderr.write("self-test[%s]: emit=%s reachable=%s\n" % (
+            label, "OK" if emit_ok else "FAIL", reach_ok
+        ))
+        return reach_ok and emit_ok
+
+    def lifecycle(self, event, **fields):
+        """Emit a lifecycle event. RETURNS whether it was delivered.
+
+        This used to drop `Emitter.lifecycle`'s bool on the floor, which made every caller structurally
+        unable to know whether the thing it had just recorded as announced was in fact announced.
+        """
+        if self.persona:
+            fields["persona"] = self.persona
+        return self.emitter.lifecycle(event, **fields)
+
+    def _alarm(self, event, log_text, **fields):
+        """Emit an edge event and GUARANTEE it reaches a human, returning whether it was DELIVERED.
+
+        `log_text` is the stderr wording ONLY; it is deliberately NOT injected into the event, so this
+        adds no field to any event's schema. Callers that want `reason` on the wire pass it in
+        **fields like any other field.
+
+        THE DEFECT THIS CLOSES: an alarm that commits its "already alarmed" state BEFORE emitting and
+        discards the emit's answer is never re-raised if it was never delivered - not after the channel
+        recovers, and not after a restart, because `gap_alerted` is PERSISTED. Mail is never at risk
+        (the cursor holds correctly throughout); it is the ALARMS that would vanish, which is worse than
+        it sounds because the tool's headline promise is that it pins LOUDLY rather than in silence.
+
+        The fallback is stderr, NOT a retry down the event channel - that channel is the thing that
+        just failed, and reporting a fault through the faulty channel is how the fault stays invisible
+        (the same reasoning as _delivery_failed). Deliberately does NOT gate the cursor on a lifecycle
+        event: lifecycle events are not acknowledged and not gated, and that stays true. "Do not gate
+        the watermark on it" and "do not record that you alarmed when you did not" are different
+        propositions.
+        """
+        delivered = self.lifecycle(event, **fields)
+        if not delivered:
+            sys.stderr.write("kijito-inbox-monitor: %s EVENT UNDELIVERED (persona %r): %s\n"
+                             % (event.upper(), self.persona, log_text))
+        return delivered
+
+    def _pin_release_floor(self):
+        """The reach a COMPLETE window must achieve to discharge a pin.
+
+        Normally the watermark itself: a window reaching back to at-or-below the cursor visibly spans
+        everything we have not confirmed. A CORRUPTION pin is the exception - it parks the watermark one
+        below the window it re-emits, so that window's own floor is always cursor+1 and the ordinary test
+        can never be met by it (without a recorded floor the pin would never clear, the cursor would never
+        move, and the window would be re-delivered on every poll for the life of the process AND across
+        restarts).
+        Taking the MAX keeps the ordinary rule exactly as strict as it was - a recorded floor can only
+        ever be the span we re-emitted, never something below the watermark.
+        """
+        floor = self.cursor or 0
+        if self.pin_release_at is not None:
+            floor = max(floor, self.pin_release_at)
+        return floor
+
+    def _release_pin(self):
+        """Discharge a forced pin AND everything that was holding it up.
+
+        ONE implementation, because there are TWO authoritative proofs (a completed backward walk, and a
+        complete window reaching the release floor) and they must leave identical state. A path that
+        cleared only `pin_forced` would leave a released corruption pin persisting `state_corrupt: true`
+        and its `pin_release_at` for the life of the file - a state file still describing a corruption
+        that had been fully recovered.
+        """
+        self.pin_forced = False
+        self.pin_release_at = None
+        self.state_corrupt = False
+
+    def _state_not_durable(self):
+        if self.state_not_durable:
+            return
+        self.state_not_durable = True
+        sys.stderr.write("kijito-inbox-monitor: WARNING the cursor for persona %r was written but its "
+                         "durability is UNPROVEN; a crash may replay mail from an older cursor (further "
+                         "reports suppressed until it persists cleanly)\n" % self.persona)
+
+    def _state_durable_again(self):
+        if not self.state_not_durable:
+            return
+        self.state_not_durable = False
+        sys.stderr.write("kijito-inbox-monitor: cursor persistence for persona %r recovered\n" % self.persona)
+
+    def _delivery_failed(self, mid):
+        """Report a failed hand-off ONCE, and say what the watcher is doing about it.
+
+        Deliberately stderr and NOT an `alert` event: the event channel is the thing that just failed, so
+        an alarm about it would be routed through the broken pipe (exec mode re-runs the same failing
+        command; sink mode writes to the file that just refused a write). Reporting a fault down the
+        faulty channel is how the fault stays invisible. Keyed on the condition and self-clearing, like
+        every other alarm here.
+        """
+        if self.delivery_blocked:
+            return
+        self.delivery_blocked = True
+        sys.stderr.write("kijito-inbox-monitor: WARNING delivery of message %s to persona %r FAILED; HOLDING the "
+                         "cursor below it so it is re-delivered rather than skipped (further reports "
+                         "suppressed until delivery recovers)\n" % (mid, self.persona))
+
+    def _resurface_still_unread(self, items, now=None):
+        """BACKSTOP: re-surface mail that was notified once and then left UNREAD.
+
+        The producer is edge-triggered per id - it emits `new` exactly once per message - so a message the
+        agent peeked at (mark_read=false), acted on or meant to, and never consumed sits unread and INERT:
+        never notified again, visible only to a staleness alarm. The ROOT fix is the consumer's (read
+        what you handled with mark_read=true); this is the
+        bounded backstop for what still slips through, and it is built so it cannot become a storm:
+          * only for ids AT OR BELOW the cursor (already notified) whose server `read` flag is False and
+            whose `created` is at least --still-unread-after seconds old;
+          * at most once per id per window (--still-unread-after), and at most --still-unread-max times per
+            id in this process - deliberately deferred mail is reminded a few times, not forever;
+          * ONE summarising `still_unread` event per poll however many ids are due (one wake, not N);
+          * never for debris (retired/reserved) or a write_only inbox;
+          * the FIRST full poll of a process only notes what is already aged and emits nothing, so every
+            restart (a deploy, a reboot) does not replay a burst of reminders.
+        The ledger is per process: a restart can remind again, at most --still-unread-max times per id.
+        It never touches the cursor - a reminder is not a delivery, and failing to emit one loses nothing.
+        """
+        after = getattr(self.args, "still_unread_after", 0) or 0
+        if after <= 0 or _is_debris(self.persona) or _PERSONA_WRITE_ONLY.get(self.persona) is True:
+            return []
+        cap = max(1, getattr(self.args, "still_unread_max", 3) or 1)
+        now = time.time() if now is None else now
+        ledger = self.__dict__.setdefault("still_unread_seen", {})     # id -> (times reminded, last at)
+        primed = self.__dict__.get("still_unread_primed", False)
+        cursor = self.cursor if isinstance(self.cursor, int) else -1
+        due, visible = [], set()
+        for m in items:
+            mid = m.get("id")
+            if not isinstance(mid, int) or isinstance(mid, bool) or mid > cursor or m.get("read") is not False:
+                continue
+            visible.add(mid)
+            born = _created_epoch(m.get("created"))
+            if born is None or now - born < after:
+                continue
+            n, last = ledger.get(mid, (0, None))
+            if not primed:
+                ledger[mid] = (n, now)          # restart: note it, remind one full window from now
+                continue
+            if n >= cap or (last is not None and now - last < after):
+                continue
+            due.append((mid, m, now - born, n))
+        for mid in list(ledger):                # read, or gone from the window: forget it
+            if mid not in visible:
+                del ledger[mid]
+        self.still_unread_primed = True
+        if not due:
+            return []
+        oldest = max(age for _, _, age, _ in due)
+        ok = self.emitter.lifecycle(
+            "still_unread", persona=self.persona,
+            ids=[mid for mid, _, _, _ in due],
+            senders=sorted({m.get("from") for _, m, _, _ in due if m.get("from")}),
+            oldest_age_seconds=int(oldest), after_seconds=int(after),
+            reason=("still-unread: %d message(s) in this inbox were notified and are still UNREAD after "
+                    "%ds or more (oldest %ds). Read what you have handled with mark_read=true; this "
+                    "reminder repeats at most %d time(s) per message." % (len(due), after, int(oldest), cap)))
+        if ok is True:
+            for mid, _, _, n in due:
+                ledger[mid] = (n + 1, now)
+        return [mid for mid, _, _, _ in due]
+
+    def _delivery_recovered(self):
+        if not self.delivery_blocked:
+            return
+        self.delivery_blocked = False
+        sys.stderr.write("kijito-inbox-monitor: delivery to persona %r recovered; the cursor is advancing "
+                         "again\n" % self.persona)
+
+    def _uncovered_gap(self, poll, items):
+        """(cursor, window_floor, omitted) iff omitted mail may sit ABOVE the cursor, else None.
+
+        THE DISCRIMINATOR, and it is the whole reason this is not a permanent alarm:
+          window_floor <= cursor  -> the window reaches back PAST what we already emitted, so every
+                                     omitted message is BELOW the cursor and was already delivered. Safe.
+          window_floor >  cursor  -> the window starts above the cursor while the server says it dropped
+                                     things, so the uncovered span (cursor, window_floor) may hold mail
+                                     we have never emitted. Unsafe.
+        In steady state the long-poll keeps the backlog to a message or two, so the window always reaches
+        back and this returns None - no behaviour change. It fires after an outage or a burst, which is
+        exactly when a bounded window starts hiding things.
+        """
+        declared, exact = poll.omitted, poll.omitted_exact
+        if not poll.continuation_ok:
+            # SILENCE IS NOT AN ANSWER HERE EITHER. A window whose `next_before_id` is ABSENT or
+            # MALFORMED has told us nothing about whether it withheld rows, so its "I omitted nothing"
+            # cannot be taken as an assertion - the two fields are one statement and half of it is
+            # unreadable. The WALK refuses to read that silence as exhaustion, and the gap check needs
+            # the same rule: otherwise a server that garbled the field while declaring no omission would
+            # advance the watermark over anything it was hiding, silently and with no alert. Same defect,
+            # one layer over.
+            declared, exact = max(declared, 1), False
+        if not poll.consistent:
+            # A SELF-CONTRADICTORY WINDOW IS AN OMISSION WE CANNOT COUNT. This
+            # check used to read `poll.omitted` alone and never looked at the continuation at all, so a
+            # window declaring "I withheld nothing" while handing back a cursor for older mail was taken
+            # at its word - and the watermark stepped over whatever the continuation was pointing at.
+            # There is no number to reach here, so it enters as an UNQUANTIFIED withholding: closable
+            # only by a backward walk that exhausts the span, never by arithmetic.
+            declared, exact = max(declared, 1), False
+        if not declared or self.cursor is None or not self.armed or not items:
+            return None
+        floor = min(m["id"] for m in items)
+        if floor <= self.cursor:
+            return None
+        return (self.cursor, floor, declared, exact)
+
+    def _hidden_unread(self, poll):
+        """Does the server hold unread mail this window did not show us? True / False / None (NO CLAIM).
+
+        A CHEAP ALARM SIGNAL - deliberately NOT a coverage mechanism. `unread_not_shown` is a COUNT
+        with no cursor of its own, so it can say THAT something is out of view but never WHICH rows;
+        coverage stays with the backward walk, which terminates. This answers only the alarm
+        question "is there unread mail I cannot see", where a superset is the right answer because you
+        want to know regardless of WHY the mail is absent.
+
+        THE TRAP, AND IT INVERTS THE OBVIOUS READING OF A ZERO. The server computes this field ONLY
+        when it withheld something; otherwise it is 0 BY CONSTRUCTION. So `== 0` does NOT assert "no
+        unread mail exists". VERIFIED LIVE against api.kijito.ai on a real inbox holding 4 unread:
+            newest page      next_before_id=1179  unread_not_shown=0   <- computed, and truly nothing hidden
+            walk page        next_before_id=1145  unread_not_shown=4   <- the whole inbox's unread, not this window's
+            terminal page    next_before_id=null  unread_not_shown=0   <- 0 WITH 4 UNREAD SITTING ABOVE IT
+        Reading that last 0 as "clear" is the false-negative this method exists to refuse. A FALSE
+        assertion is therefore only avoidable by requiring POSITIVE evidence for the negative answer,
+        never by trusting the number - which is why the two False branches below are justified by
+        DIFFERENT facts and are not the redundancy they look like.
+
+        EVALUATE ONLY ON THE NEWEST-PAGE POLL. On a backward-walk page `next_before_id is None` means
+        merely "nothing OLDER than this page", not "nothing outside this window" - the terminal-page row
+        above is exactly that case. poll_once() calls this with the un-cursored poll only, so the walk
+        pages structurally cannot reach it.
+        """
+        n = poll.unread_not_shown
+        if n is None:
+            return None          # server made no statement (older API) -> assert nothing in either direction
+        if n > 0:
+            return True          # unread mail exists that this response did not include
+        if poll.next_before_id is not None:
+            return False         # the 0 was genuinely COMPUTED against a withheld remainder
+        if poll.omitted == 0:
+            return False         # complete window: nothing older exists and nothing was withheld
+        # Contradictory: rows were declared omitted, yet no cursor leads to them. The 0 is unexplained,
+        # so make no claim rather than report a clear we cannot justify.
+        return None
+
+    def _walk_back(self, from_id, stop_at):
+        """Page BACKWARD over (stop_at, from_id) and return (rows, covered).
+
+        This is the AUTHORITATIVE way to read an omitted span, and it replaces the unread_only
+        heuristic entirely. Two properties the heuristic never had:
+          · it reaches messages someone has already READ - the exact rows unread_only structurally
+            cannot see, and the ones most likely to be hidden in an old span;
+          · it TERMINATES, so the span can be declared covered by exhaustion rather than by counting
+            recovered rows against a number the server may never have stated.
+        That is what makes an INEXACT omission count closable at all.
+
+        Contract: pass the OLDEST id you were returned as `before_id` and
+        repeat until the page is empty or `next_before_id` is null. OMIT the parameter for the newest
+        page - 0 is a REAL cursor, not "no cursor". A malformed cursor is a hard 400, so a bug here
+        fails loudly instead of silently re-serving the newest page.
+
+        `covered` is True only if the walk reached stop_at or ran out of older messages. A walk cut
+        short by the page budget returns False, and the caller must keep the watermark pinned: a
+        partial walk proves nothing, and claiming otherwise is the very failure this replaced.
+
+        THE CHAIN IS VALIDATED STRICTLY, NOT ASSUMED. Coverage-by-exhaustion
+        is only as good as the chain being a real chain, so every link is checked before it is trusted:
+          · the continuation must BE AN ANSWER. A missing or malformed `next_before_id` is not an
+            end-of-chain, it is silence, and reading silence as "nothing older" hands back coverage the
+            server never asserted.
+          · the continuation must EQUAL THE OLDEST ROW WE WERE HANDED. The contract is "pass the oldest
+            id you were returned"; a server whose continuation points BELOW that is skipping the rows in
+            between, and following it walks straight over them while reporting success.
+        Neither check can be satisfied by accident, and both fail to PIN, which is the safe direction.
+        """
+        sep = "&" if "?" in self.url else "?"
+        rows, cursor, pages = [], from_id, 0
+        while pages < WALK_BACK_MAX_PAGES:
+            pages += 1
+            poll = fetch(self.opener, "%s%sbefore_id=%d" % (self.url, sep, cursor), self.headers)
+            if not poll.ok:
+                return (rows, False)          # transient failure: no claim either way
+            if not poll.continuation_ok:
+                # Absent or malformed continuation: the server did not answer. NOT exhaustion.
+                return (rows, False)
+            batch = poll.items or []
+            rows.extend(batch)
+            # VALIDATE THE PAGE BEFORE TAKING ANY COVERAGE FROM IT. Every check below rejects a page
+            # whose own account of itself does not hold together; a page that fails one of them cannot
+            # be trusted to have handed back the rows it appears to contain, so it may not close a span
+            # even when it seems to reach the watermark.
+            if not poll.consistent:
+                # SELF-CONTRADICTORY PAGE, IN EITHER DIRECTION. Withheld-rows + "nothing older"
+                # and withheld-nothing + "there is more"
+                # are the same defect facing opposite ways: the two halves of the page's declaration
+                # disagree, so believing EITHER half steps over what the other one just asserted.
+                return (rows, False)
+            if not batch:
+                if poll.next_before_id is not None:
+                    # EMPTY PAGE CLAIMING THERE IS MORE. It returned nothing
+                    # while pointing further back, so the range it covered is unobserved - and because
+                    # the oldest-row check has no row to check, following the pointer walks straight
+                    # over that range and still reports the span covered.
+                    return (rows, False)
+                return (rows, True)           # empty AND affirmed terminal: the chain genuinely ends
+            oldest = min(m["id"] for m in batch)
+            if poll.next_before_id is not None and poll.next_before_id != oldest:
+                # The chain skips rows between `oldest` and the continuation. Following it would
+                # walk over them and still report the span covered.
+                # Checked BEFORE the reach-back return below: a page that reaches the watermark while
+                # skipping rows is still a page whose row set we cannot stand behind, and taking coverage
+                # from it would be trusting the one page we just caught misdescribing itself.
+                return (rows, False)
+            if oldest <= stop_at:
+                return (rows, True)           # walked back past the watermark: span fully seen
+            if poll.next_before_id is None:
+                return (rows, True)           # server AFFIRMS there is nothing older
+            if poll.next_before_id >= cursor:
+                return (rows, False)          # cursor not advancing; refuse to spin
+            cursor = poll.next_before_id
+        return (rows, False)                  # budget exhausted before reaching the watermark
+
+    def poll_once(self, counts_available=False, unread_counts=None):
+        args = self.args
+        unread_counts = unread_counts or {}
+        # A count the server did NOT give us this tick is UNKNOWN, never zero: the state file then carries no
+        # `unread` at all, so a reader shows nothing rather than a stale or invented figure. A persona missing
+        # from a GOOD response is a real zero - /api/notify/pending omits personas with nothing pending.
+        self.observed_unread = (unread_counts.get(self.unread_persona, 0)
+                                if counts_available and self.unread_persona else None)
+
+        skip_full = False
+        if self.armed and self.fast_path and not args.no_fast_path and self.unread_persona:
+            if counts_available:
+                unread = unread_counts.get(self.unread_persona, 0)
+                # ANY CHANGE, NOT ONLY AN INCREASE. If the agent reads its N held
+                # messages and one new message lands within the same tick, the count goes N -> 1: a
+                # DECREASE that hides an arrival, so keying on `>` left that mail unannounced until the
+                # --resync-every floor (~8 min at the defaults). A pure read-down now costs one extra inbox
+                # fetch.
+                # AND THE NEWEST UNREAD ID, WHERE THE SERVER STATES IT. Reads and
+                # arrivals that cancel exactly in one tick (N -> N) leave the count unchanged, so a count alone
+                # could only catch them at the floor; the newest unread id moves whenever a message arrives.
+                # An older server never sends it: both sides then read "no statement" and this is the count
+                # check it always was.
+                newest = _newest_unread(self.unread_persona)
+                changed = ((unread, newest) != (self.last_unread, self.last_newest)
+                           if self.last_unread is not None else True)
+                self.last_unread = unread
+                self.last_newest = newest
+                if not changed and self.skips < args.resync_every:
+                    skip_full = True
+                    self.skips += 1
+            # unavailable (transient) → fall through to the full inbox-list poll (the baseline)
+
+        if skip_full:
+            # count endpoint reachable + no unread increase = a HEALTHY poll with no new items
+            if self.fsm_state == "DOWN":
+                # THE RECOVERY EDGE IS THE SAME DEFECT FACING THE OTHER WAY. Committing "UP" and
+                # discarding the emit would mean a consumer that saw the DOWN alert never learns the source came back: it is left
+                # holding an alarm it can NEVER clear, because this edge is crossed exactly once.
+                # The transition must commit (it is the FSM); the announcement gets stderr.
+                self.fsm_state = "UP"
+                self._alarm("recovered", "source recovered", cursor=self.cursor)
+            self.failures = 0
+            self.down_since = None
+        else:
+            self.skips = 0
+            poll = fetch(self.opener, self.url, self.headers)
+
+            if poll.status == 404 and (self.first_poll or args.self_test):
+                raise FatalConfig("inbox endpoint 404 (hive disabled?) - fatal at startup")
+            if poll.status == 401 and (self.first_poll or args.self_test):
+                raise FatalConfig("inbox endpoint 401 (bad or missing token) - fatal at startup")
+
+            if poll.ok:
+                recovered = False
+                if self.fsm_state == "DOWN":
+                    self.fsm_state = "UP"
+                    recovered = True
+                self.failures = 0
+                self.down_since = None
+
+                items = poll.items
+                # Record who AUTHORED what, from the window we already have. Done before any cursor
+                # or dedup logic: authorship is evidence about the SENDER and is worth collecting whether
+                # or not the message is new to US - a message we have already delivered still proves its
+                # author was alive when they sent it.
+                note_authorship(items)
+                note_observation_floor(self.persona, items)
+                diag = None
+                new_items = []
+                do_arm = not self.armed
+
+                if do_arm:
+                    if self.cursor is None and self.state_corrupt:
+                        # Fail CLOSED: arm BELOW everything visible and EMIT the whole window, rather than
+                        # baselining to the newest id and skipping the lost span in silence. The replay cap
+                        # is deliberately not applied - it exists to stop a huge first-run backlog, and
+                        # here every visible message is one we may already owe someone.
+                        self.cursor = min((m["id"] for m in items), default=0) - 1
+                        new_items = sorted(items, key=lambda m: m["id"])
+                        # THE PIN CARRIES ITS OWN RELEASE FLOOR - see
+                        # _pin_release_floor(). Set here, and again below if this first window was empty.
+                        diag = ("state_corrupt", {"armed_at": self.cursor,
+                                                  "reason": "state file present but unusable; re-emitting the "
+                                                            "visible window instead of baselining over it"})
+                    elif self.cursor is None:
+                        # An EMPTY first window baselines BELOW id 0, not AT it. Message ids start at 0
+                        # on a new account, and every emission test is `id > cursor`, so a cursor of 0
+                        # on an empty inbox swallowed the account's very first message forever - the
+                        # producer only ever logged it as a quiet "dormant inbox (1 unread)". -1 is the
+                        # value the fail-closed branch above already produces for an empty window, so it
+                        # is a value every later comparison already tolerates. A NON-empty first window
+                        # still baselines to its newest id (never flood a new agent with history).
+                        self.cursor = max((m["id"] for m in items), default=-1)
+                        # ⛔ AN ABSENT STATE FILE MEANS TWO THINGS THAT DEMAND OPPOSITE BEHAVIOUR, AND
+                        # NOTHING HERE CAN TELL THEM APART. A genuine first launch must baseline - never
+                        # flood a new agent with inbox history. A LOST state file must not: everything
+                        # since the vanished cursor is owed to someone. The branch above distinguishes
+                        # exists-but-corrupt, because a file that is present is EVIDENCE a cursor existed.
+                        # Absence leaves no such evidence, so the baseline stands - but it no longer
+                        # happens QUIETLY. (A wiped state file would otherwise skip an unread message
+                        # with no bounce and no record. The rule is "fail open HONESTLY, never
+                        # silently".)
+                        #
+                        # ⚠️ NOT re-emitting: the anti-flood behaviour is deliberate and unchanged. This
+                        # only converts a silent skip into an announced one.
+                        #
+                        # The unread COUNT is per-persona and comes from a different endpoint; items carry
+                        # no per-message unread flag, so this cannot say WHICH of the skipped messages are
+                        # unread - only how many the persona holds. Stated, not glossed.
+                        if items:
+                            # Keyed on unread_persona, NOT persona: it honours an explicit ?persona=
+                            # in the watch URL and falls back to persona otherwise, and it is
+                            # what both existing count consumers use. Keying this one
+                            # differently would diverge exactly when a watch URL carries the override
+                            # - rare, and therefore the kind of divergence that survives a long time.
+                            u = unread_counts.get(self.unread_persona) if counts_available else None
+                            # An UNKNOWN unread count must not be read as zero - that assumption is the
+                            # whole defect, one level up. Silent only when the count is KNOWN to be 0.
+                            if u != 0:
+                                diag = ("baseline_skipped", {
+                                    "armed_at": self.cursor,
+                                    "skipped": len(items),
+                                    "id_range": [min(m["id"] for m in items), max(m["id"] for m in items)],
+                                    "unread_held": u if u is not None else "unknown",
+                                    "reason": "no state file: baselined to the newest visible id rather than "
+                                              "re-emitting. If this was a LOST state file rather than a first "
+                                              "launch, these messages will never raise a wake - they remain "
+                                              "unread and readable in the inbox, but nothing will announce them",
+                                })
+                    else:
+                        current_max = max((m["id"] for m in items), default=0)
+                        # A RESTORED PIN SURVIVES ARMING. `emitted_above` is only ever non-empty when a
+                        # previous run pinned the watermark below an unresolved gap, so both branches below
+                        # must respect it: the replay cap would otherwise jump the cursor straight over the
+                        # gap on the first poll after a restart, silently erasing it, and the replay count
+                        # would double-count mail we already delivered.
+                        # `pin_forced` covers the case where the pin is real but its tracking was lost,
+                        # so an empty emitted_above must NOT read as "nothing was pinned".
+                        pinned_on_load = bool(self.emitted_above) or self.pin_forced
+                        n = sum(1 for m in items if m["id"] > self.cursor)
+                        if self.cursor > current_max:
+                            diag = ("seed_ahead", {"seeded": self.cursor, "current_max": current_max})
+                        elif n > args.max_replay and not pinned_on_load:
+                            diag = ("replay_capped", {"capped_to": current_max, "dropped": n})
+                            self.cursor = current_max
+                            self.emitted_above = set()
+                        else:
+                            new_items = sorted((m for m in items
+                                                if m["id"] > self.cursor
+                                                and m["id"] not in self.emitted_above),
+                                               key=lambda m: m["id"])
+                    self.armed = True
+                else:
+                    # `emitted_above` is normally empty. It is non-empty only while the watermark is PINNED
+                    # below an unresolved gap, and it is what lets us keep delivering visible mail without
+                    # re-delivering it on every subsequent poll.
+                    new_items = sorted((m for m in items
+                                        if m["id"] > self.cursor and m["id"] not in self.emitted_above),
+                                       key=lambda m: m["id"])
+
+                # THE CORRUPTION PIN'S RELEASE FLOOR, in ONE place so the arming poll and a later one
+                # cannot disagree. A corrupt arm parks the watermark at
+                # min(visible)-1 so it can re-emit the whole window; that makes the ordinary release test
+                # - a complete window reaching back to at-or-below the watermark - unsatisfiable by
+                # construction, because the reach IS min(visible) and min(visible) > min(visible)-1. So
+                # the pin recorded the floor it must reach back to instead. Also set on a LATER poll when
+                # the arming window was EMPTY: there was no floor to record then, and leaving it unset
+                # would freeze the watermark exactly as before, one poll further on.
+                if self.pin_forced and self.state_corrupt and self.pin_release_at is None and items:
+                    self.pin_release_at = min(m["id"] for m in items)
+                if recovered:
+                    # Same recovery edge as the fast path above; the commit is 60+ lines earlier
+                    # (`fsm_state = "UP"; recovered = True`).
+                    self._alarm("recovered", "source recovered", cursor=self.cursor)
+                if diag:
+                    self.lifecycle(diag[0], **diag[1])
+                if do_arm:
+                    self.lifecycle("armed", cursor=self.cursor, api_base=KIJITO_BASE)
+                # A BOUNDED WINDOW MUST NOT SILENTLY SWALLOW MAIL.
+                # The server returns the NEWEST messages that fit, and declares what it left out. If it
+                # omitted anything AND the window does not reach back to our cursor, un-emitted mail can
+                # be sitting in the uncovered gap - and advancing the cursor past it loses it forever.
+                window_cursor = self.cursor   # the watermark AS THIS WINDOW SAW IT, before any advance
+                gap = self._uncovered_gap(poll, items)
+                pinned = False
+                release_earned = False
+                if gap is not None:
+                    cursor_at, window_floor, omitted, omitted_exact = gap
+                    visible = {m["id"] for m in items}
+                    # Count ONLY rows the visible window did not already contain and that sit above the
+                    # watermark. Counting every returned row lets a retry that echoes the same suffix be
+                    # reported as a recovery that never happened - a false success, worse than a loud failure.
+                    # Walk the span BACKWARD from the window floor down to the watermark. Coverage is
+                    # proven by exhausting the chain, not by counting rows against a number - which is
+                    # why this closes an INEXACT omission count that no amount of counting could.
+                    walked, covered = self._walk_back(window_floor, cursor_at)
+                    unseen = [m for m in walked
+                              if m["id"] > (self.cursor or 0) and m["id"] not in visible
+                              and m["id"] not in self.emitted_above]
+                    gap_recovered = [m for m in unseen if cursor_at < m["id"] < window_floor]
+                    known = {m["id"] for m in new_items}
+                    for m in unseen:
+                        if m["id"] not in known:
+                            new_items.append(m)
+                            known.add(m["id"])
+                    new_items.sort(key=lambda m: m["id"])
+
+                    # FAIL CLOSED unless there is POSITIVE evidence the span is accounted for. Recovery here
+                    # is a heuristic (unread_only), not an authoritative backward page, so silence from it
+                    # proves nothing. Treat the gap as closed only when the reconciling window was itself
+                    # COMPLETE (it declared no omissions of its own) and it yielded at least as many
+                    # previously-unseen rows as the server said it withheld. Anything less pins the
+                    # watermark: stepping over would make the next poll see floor<=cursor, declare itself
+                    # safe, and bury the omission permanently.
+                    # CLOSURE BY EXHAUSTION, not by arithmetic. A completed backward walk has SEEN the
+                    # whole span, so the omission count - exact or not - stops mattering. A walk cut
+                    # short proves nothing and keeps the watermark pinned.
+                    # `pin_evidence_intact` still gates: once tracking has overflowed we cannot tell a
+                    # recovered row from one we delivered and forgot, so we do not trust our own view of
+                    # what is new until the walk itself re-establishes it.
+                    closed = covered and (self.pin_evidence_intact or bool(walked))
+                    if closed and not self.pin_evidence_intact:
+                        # An authoritative read re-establishes ground truth, so the span is knowable again.
+                        self.pin_evidence_intact = True
+                    # RELEASE THE FORCED PIN - but not here, and not yet. A
+                    # forced pin was held because tracking was lost, and a COMPLETED walk is the
+                    # authoritative evidence that replaces it; leaving it set froze the watermark
+                    # permanently. The DECISION is made here, where the evidence is; the ACT is deferred
+                    # until after delivery, because a pin must not be discharged on a poll that failed to
+                    # hand over what it was holding (see the release site below).
+                    release_earned = closed
+                    pinned = not closed
+                    # Alert identity is the PINNED WATERMARK, not the window floor. The floor drifts upward
+                    # as new mail arrives, so keying on it re-fires for what is the same unresolved span;
+                    # the watermark is stable for exactly as long as the gap is unresolved. Persisted, so a
+                    # restart does not re-announce it either.
+                    if pinned and self.gap_alerted != cursor_at:
+                        # ★ LATCH ONLY ON DELIVERY. `gap_alerted` is a PURE
+                        # ANNOUNCEMENT MARKER - it drives no behaviour, it only records "this span was
+                        # announced" - and it is PERSISTED, so committing it before the emit would
+                        # suppress an undelivered alarm for the life of the span AND across restarts.
+                        # The gap condition is re-derived every poll, so re-raising costs nothing and
+                        # self-clears the moment it is genuinely delivered.
+                        gap_reason = ("bounded-window: server omitted %d message(s) and the window "
+                                      "started at id %s above cursor %s; a backward walk recovered %d "
+                                      "from inside the span but did not reach the watermark, so "
+                                      "it stays PINNED at %s"
+                                      % (omitted, window_floor, cursor_at, len(gap_recovered), cursor_at))
+                        if self._alarm("alert", gap_reason,
+                                       reason=gap_reason,
+                                       omitted=omitted, window_floor=window_floor, cursor_at=cursor_at,
+                                       reconciled=len(gap_recovered), pinned=True):
+                            self.gap_alerted = cursor_at
+
+                # DELIVERY IS ACKNOWLEDGED, NOT ASSUMED. The cursor IS the
+                # acknowledgement - once it advances past an id, that message is never fetched again - so
+                # it may only advance over messages the emitter actually DELIVERED. An --exec that exits
+                # non-zero, times out, or cannot be spawned used to advance it anyway: the wake hook that
+                # is the entire point of exec mode failed, the message was never retried, and the watcher
+                # reported success. Delivery stops at the FIRST failure so a consumer never sees message
+                # N+1 before a retried N; the guarantee is at-least-once IN ORDER, because a duplicate is
+                # recoverable and a skip is not.
+                delivered, blocked_at = set(), None
+                for m in new_items:
+                    if blocked_at is not None:
+                        break
+                    row = dict(m)
+                    row["_persona"] = self.persona
+                    if self.emitter.new(row) is True:
+                        delivered.add(m["id"])
+                    else:
+                        blocked_at = m["id"]
+                        self._delivery_failed(m["id"])
+                # THE DURABILITY BARRIER: the event must be on stable storage
+                # BEFORE the cursor that acknowledges it. If the sink cannot be synced, NOTHING emitted
+                # this poll counts as delivered - the acknowledgement is retracted wholesale rather than
+                # left half-true.
+                if delivered and not self.emitter.sync(self.persona):
+                    blocked_at = min(delivered) if blocked_at is None else min(blocked_at, min(delivered))
+                    delivered = set()
+                if blocked_at is None:
+                    self._delivery_recovered()
+                self._resurface_still_unread(items)
+
+                # UNREAD MAIL WE CANNOT SEE. Fires on the FALSE->TRUE edge and releases itself when
+                # the condition clears, so it needs no ack: an ack would let someone silence "there is
+                # mail you are not being shown" while it was still true.
+                hidden = self._hidden_unread(poll)
+                if hidden is True:
+                    # Routed like the stranded-mail alarm, but failing the OPPOSITE way on purpose. That
+                    # one withholds when the directory is unknown because alarming would flag EVERY
+                    # persona; this one concerns the target's OWN inbox, so the worst case of firing is a
+                    # line in a stream nobody reads, while the worst case of withholding is the silent
+                    # wake gap this whole tool exists to prevent. Suppressed only for an inbox the
+                    # directory positively does not know - and the flag is then left UNSET so the alarm
+                    # can still announce itself if that inbox later becomes directory-backed.
+                    if not self.unread_hidden and self.directory_backed:
+                        floor = min((m["id"] for m in items), default=None)
+                        unread_reason = (
+                            "unread-not-shown: the server reports %d unread message(s) in this "
+                            "inbox that this window did not include. OBSERVATION, NOT A "
+                            "DIAGNOSIS: the count covers unread mail ANYWHERE in the inbox, "
+                            "including messages already delivered to this stream that the agent "
+                            "has not read, so it is not by itself evidence of missed mail. "
+                            "Coverage of an un-emitted span is proven by the backward walk, "
+                            "never by this count." % poll.unread_not_shown)
+                        # ★ LATCH ONLY ON DELIVERY, and go through _alarm for the stderr fallback.
+                        # `unread_hidden` is a PURE ANNOUNCEMENT
+                        # LATCH: it drives no behaviour, it only records "this condition was announced",
+                        # and it is PERSISTED - so committing it before the emit would suppress an
+                        # UNDELIVERED alarm for the life of the condition AND across restarts. The
+                        # condition is re-derived every poll, so re-raising costs nothing and self-clears
+                        # the moment it is genuinely delivered. THE DISCRIMINATING QUESTION: does
+                        # this state DRIVE behaviour, or does it only RECORD that something was
+                        # announced? Behavioural state must commit either way; a pure announcement
+                        # latch must commit only on delivery. They take opposite answers.
+                        if self._alarm("alert", unread_reason,
+                                       reason=unread_reason,
+                                       unread_not_shown=poll.unread_not_shown,
+                                       window_floor=floor, cursor_at=window_cursor,
+                                       # The discriminating FACT, left for the reader to interpret: when
+                                       # the window reaches back past the watermark, everything above it
+                                       # is visible, so the unseen unread can only be mail already
+                                       # delivered.
+                                       above_watermark=(None if floor is None or window_cursor is None
+                                                        else floor > window_cursor)):
+                            self.unread_hidden = True
+                elif hidden is False:
+                    self.unread_hidden = False   # condition cleared -> re-arm, so a recurrence is announced
+                # hidden is None -> the server made no statement; hold the current state and claim nothing
+
+                # ★ A PIN IS NOT DISCHARGED ON A POLL THAT COULD NOT DELIVER. Both proofs answer "did the SERVER
+                # withhold anything" - neither says a word about whether WE handed the window over. On a
+                # corrupt-state arm the watermark sits at min(visible)-1, so releasing while delivery is
+                # blocked would throw away the release floor AND the state_corrupt flag while the cursor is
+                # still parked below the whole mailbox. A restart would then re-force the pin from the
+                # surviving pin_evidence_intact=False - now with NO floor - and `reach <= cursor` is
+                # unsatisfiable when the cursor sits below the oldest message that exists. Measured: the
+                # watermark froze at 99 forever and correctness fell back entirely onto emitted_above
+                # growing without bound. Holding the pin one more poll costs nothing; the delivery gate
+                # already holds the cursor, and the pin self-clears the moment delivery recovers.
+                if release_earned and blocked_at is None:
+                    self._release_pin()
+
+                if not pinned:
+                    # A COMPLETE window that reaches back past the watermark proves everything above it is
+                    # visible, so a leftover pin can be released even when there is nothing NEW to emit.
+                    # Gating this on `new_items` left a restored pin stuck forever whenever the window
+                    # contained only ids we had already delivered - the exact state a restart lands in.
+                    reach = min((m["id"] for m in items), default=None)
+                    # `continuation_ok` belongs here for the same reason it belongs in the gap check:
+                    # a window that did not answer "is there more?" cannot be the PROOF that there is not.
+                    complete = (poll.omitted == 0 and poll.consistent and poll.continuation_ok
+                                and reach is not None and reach <= self._pin_release_floor())
+                    if self.pin_forced and complete and blocked_at is None:
+                        # The other authoritative proof: nothing was withheld AND the window reaches back
+                        # past the watermark, so there is no span left to be uncertain about. Without this
+                        # a forced pin that never sees a gap again could never clear, and the watermark
+                        # would stay frozen for the life of the process.
+                        self._release_pin()
+                    if self.pin_forced:
+                        high = None           # still forced: the watermark holds
+                    else:
+                        high = max(sorted(delivered)
+                                   + ([max(m["id"] for m in items)] if complete else []), default=None)
+                    if blocked_at is not None and high is not None:
+                        # THE GATE ITSELF: never acknowledge past a message we could not hand over, not
+                        # even via a complete window. `complete` proves the SERVER hid nothing; it says
+                        # nothing about whether WE delivered what it showed us.
+                        high = min(high, blocked_at - 1)
+                    if high is not None and high > (self.cursor or 0):
+                        self.cursor = high
+                        # Watermark moved, so anything at or below it is confirmed and needs no tracking.
+                        self.emitted_above = {i for i in self.emitted_above if i > self.cursor}
+                        if not self.emitted_above:
+                            self.gap_alerted = None
+                            self.pin_evidence_intact = True
+
+                # EVERY DELIVERED ID THE WATERMARK DOES NOT COVER IS REMEMBERED, whatever left it
+                # uncovered. This used to live inside the `pinned` branch
+                # alone, so the OTHER ways of not advancing - a forced pin with no gap in sight, a
+                # delivery that failed further up the batch - delivered mail and then forgot they had.
+                # The corruption pin hit exactly that: it could not advance and it recorded nothing, so
+                # it re-emitted its entire window on every poll and every restart, forever.
+                uncovered = {i for i in delivered if i > (self.cursor or 0)}
+                if uncovered:
+                    self.emitted_above.update(uncovered)
+                    if len(self.emitted_above) > PIN_TRACKING_CAP:
+                        # A pin that cannot clear would otherwise grow this set - and the state file -
+                        # without bound. Keep the NEWEST ids (the ones a future window can still show us,
+                        # and therefore the ones that could be re-emitted) and drop the oldest.
+                        keep = sorted(self.emitted_above)[-PIN_TRACKING_CAP:]
+                        dropped = len(self.emitted_above) - len(keep)
+                        self.emitted_above = set(keep)
+                        # ONCE WE HAVE FORGOTTEN A DELIVERED ID, WE CAN NO LONGER REASON ABOUT THIS SPAN.
+                        # A forgotten id reappearing in a reconcile looks "previously unseen", so it would
+                        # both re-emit AND be counted as recovery - manufacturing evidence out of our own
+                        # amnesia. From here the gap can only be closed by an authoritative read.
+                        if self.pin_evidence_intact:
+                            # ⚠️ THIS COMMIT IS NOT AN ANNOUNCEMENT LATCH - it is a CORRECTNESS state that
+                            # governs how the span may ever be closed, so it MUST be committed whether or
+                            # not the alarm is delivered. Only the ANNOUNCEMENT needs the second channel,
+                            # which _alarm provides. Getting this backwards - refusing to
+                            # record evidence loss because a sink was broken - would trade a lost alarm for
+                            # a lost invariant.
+                            self.pin_evidence_intact = False
+                            # A durable event, not just stderr: this is a correctness degradation somebody
+                            # has to act on, and stderr is not something a consumer watches. _alarm still
+                            # falls back to stderr, so an undelivered one is not silent.
+                            pin_reason = ("bounded-window: pin at cursor %s outlived its tracking "
+                                          "budget and forgot %d delivered id(s). Some mail may be "
+                                          "re-emitted, and this span can no longer be closed by "
+                                          "reconciliation - it needs an authoritative backward read"
+                                          % (self.cursor, dropped))
+                            self._alarm("alert", pin_reason, reason=pin_reason,
+                                        cursor_at=self.cursor, forgot=dropped,
+                                        pinned=True, evidence_lost=True)
+
+            else:
+                if self.failures == 0 or self.down_since is None:
+                    # First failure of this run: stamp it. Everything the floor measures starts here.
+                    self.down_since = (_monotonic(), time.time())
+                self.failures += 1
+                span = _monotonic() - self.down_since[0]
+                floor = alert_floor_seconds(args)
+                if self.failures >= args.alert_after and span >= floor and self.fsm_state == "UP":
+                    # THE DEAD-MAN'S SWITCH. The FSM transition MUST commit (it drives the whole
+                    # liveness model; the `fsm_state == "UP"` guard is what makes the edge cross exactly
+                    # once, so a reverted transition would never re-fire). So the state commits and the
+                    # ANNOUNCEMENT gets the guaranteed second channel. Without it,
+                    # a broken sink would mean the source could go down and NOTHING was ever emitted or
+                    # logged - the one event README sells as the dead-man's switch, silently absent.
+                    # the edge needs BOTH the count and the MEASURED span (`>=`, not `==`: in
+                    # long-poll mode the count is reached in ~3 s and the floor is what waits). `seconds`
+                    # is now that measured span - it used to be the nominal failures * poll_seconds and
+                    # read 90 against outages of 11 s.
+                    self.fsm_state = "DOWN"
+                    down_reason = poll.reason or "unreachable"
+                    self._alarm("alert", "source is DOWN: %s" % down_reason,
+                                reason=down_reason,
+                                consecutive_failures=self.failures,
+                                seconds=int(round(span)),
+                                floor_seconds=int(floor))
+
+        if self.state_file is not None:
+            durable = self.state_file.save(self.cursor, self.fsm_state, self.failures,
+                                 self.emitted_above, self.gap_alerted,
+                                 pin_forced=self.pin_forced,
+                                 pin_evidence_intact=self.pin_evidence_intact,
+                                 state_corrupt=self.state_corrupt,
+                                 pin_release_at=self.pin_release_at,
+                                 unread_hidden=self.unread_hidden,
+                                 unread=self.observed_unread,
+                                 down_since=(self.down_since[1] if self.down_since else None))
+            # ★ CONSUME THE ANSWER. save() RETURNS a durability status, and discarding it at the call
+            # site would be the same defect one layer out. A cursor whose
+            # persistence is unproven means a crash may replay mail, and the harm is the SILENCE.
+            if durable is False:
+                self._state_not_durable()
+            else:
+                self._state_durable_again()
+
+        # enable the fast-path once - on the first healthy poll where the count endpoint is available.
+        # (Single enable point; the max-id cursor stays the source of truth for WHAT to emit, unread is only
+        # the wake TRIGGER, so a late/again enable is harmless.)
+        if self.armed and not self.fast_path and not args.no_fast_path and self.unread_persona and counts_available:
+            self.fast_path = True
+            self.last_unread = unread_counts.get(self.unread_persona, 0)
+            self.last_newest = _newest_unread(self.unread_persona)
+
+        if args.heartbeat and (_monotonic() - self.last_heartbeat) >= args.heartbeat:
+            self.lifecycle("heartbeat", cursor=self.cursor, api_base=KIJITO_BASE)
+            self.last_heartbeat = _monotonic()
+
+        self.first_poll = False
+
+
+def build_persona_target(persona, opener_by_origin, headers, args, emitter):
+    url = persona_url(persona)
+    origin = urllib.parse.urlsplit(url).netloc
+    opener = opener_by_origin.get(origin)
+    if opener is None:
+        opener = make_opener_for(url)
+        opener_by_origin[origin] = opener
+    return WatchTarget(persona, url, opener, headers, args, emitter)
+
+
+def discover_persona_targets(args, headers, emitter, targets, opener_by_origin, directory_opener):
+    current = [t.persona for t in targets if t.persona]
+    discovered = fetch_personas(directory_opener, headers)
+    added = []
+    # `discovered` is returned as well as used: it is the DIRECTORY namespace, which the stranded-mail
+    # check diffs the inbox namespace against. Fetched here already, so the check costs no extra request.
+    for persona in new_personas(current, discovered):
+        try:
+            target = build_persona_target(persona, opener_by_origin, headers, args, emitter)
+        except (FatalConfig, OSError) as e:
+            # ★ THE CATCH'S TYPE MUST COVER THE THROW, not merely exist.
+            # A FatalConfig-only arm reads as containment and is not: `build_persona_target` reaches
+            # `StateFile.lock()` -> `_open_private(path + ".lock")`, which raises `InsecureFile` - and
+            # `InsecureFile` subclasses **OSError, not FatalConfig** (deliberately, so the SINK path can
+            # turn it into a failed delivery instead of a crash). So ONE persona with a hostile or
+            # un-tightenable lock sidecar would escape it and kill the whole producer. `InsecureFile`
+            # is raised by security code and SOUNDS like a config fatality, which is exactly why
+            # "FatalConfig covers it" was the natural and wrong assumption. A guard naming the wrong
+            # exception type is indistinguishable at a glance from one that works.
+            _warn_persona_once(persona, "cannot add persona %r: %s" % (persona, e))
+            continue
+        targets.append(target)
+        added.append(persona)
+        target.lifecycle("persona_added")
+    return added, discovered
+
+
+def discover_from_counts(args, counts, targets, opener_by_origin, headers, emitter):
+    """Add a watch target for any persona that appears in the notify counts (i.e. has mail) but isn't watched yet.
+
+    This is how a NEW persona is picked up within one tick of receiving mail - for free from the long-poll / fast-path
+    counts we already fetch - instead of waiting for the periodic /api/personas rescan. Only auto-adds in all-personas
+    mode; an explicit --persona/--personas subset stays fixed."""
+    if not watches_all_personas(args):
+        return []
+    # Case-INSENSITIVE membership: see new_personas(). The counts come from the INBOX namespace, which
+    # can legitimately hold a name the persona DIRECTORY does not (that divergence is what stranded mail
+    # in the first place), so this is the path where case-variants actually show up.
+    current = {t.persona.casefold() for t in targets if t.persona}
+    added = []
+    for persona in counts:
+        if persona and persona.casefold() not in current:
+            try:
+                target = build_persona_target(persona, opener_by_origin, headers, args, emitter)
+            except (FatalConfig, OSError) as e:
+                # Same widening, same reason as discover_persona_targets: `InsecureFile` is an OSError,
+                # so a FatalConfig-only arm never contained it. This is the LATE-ADD path a
+                # brand-new persona arrives on, so it is reached by anyone who can get a name into the
+                # inbox counts - the containment matters more here, not less.
+                _warn_persona_once(persona, "cannot add persona %r from counts: %s" % (persona, e))
+                continue
+            targets.append(target)
+            added.append(persona)
+            current.add(persona.casefold())
+            target.lifecycle("persona_added")
+    return added
+
+
+def refresh_directory_backing(args, directory, targets):
+    """Mark each target with whether the persona DIRECTORY knows its inbox (alarm routing).
+
+    Refreshed EVERY tick rather than stamped when a target is built, because a brand-new persona's first
+    mail arrives through discover_from_counts BEFORE the periodic /api/personas rescan sees it: a
+    creation-time flag would brand a perfectly real persona as unbacked and then never revisit it, since
+    rediscovery skips personas already watched.
+
+    Compared EXACTLY, never casefolded - the same asymmetry as stranded_inboxes(). The server's inbox
+    namespace is case-SENSITIVE, so a case-variant is a DIFFERENT inbox and must not inherit the real
+    one's backing.
+
+    Two no-ops, both deliberate: an explicit --persona/--personas subset was hand-picked by an operator
+    who is by definition consuming those streams, and an EMPTY directory is missing data rather than
+    evidence of absence. In both cases the existing (optimistic) value stands.
+    """
+    if not watches_all_personas(args) or not directory:
+        return
+    known = {p for p in directory if p}
+    for target in targets:
+        if target.persona:
+            target.directory_backed = target.persona in known
+
+
+# Attributable authorship, observed for free. Every inbox window the watcher already fetches carries a
+# `from` on every row, so watching all personas means seeing who AUTHORED what without a single extra request.
+# {persona: (highest message id it authored, that message's created stamp)}.
+_LAST_AUTHORED = {}
+
+
+def note_authorship(items):
+    """Record the newest message id seen from each AUTHOR.
+
+    Attributable in the way inbox-read and `/api/presence` are not: only B produces B's outbound, and no
+    third party can manufacture or erase it by reading something. That is the whole reason this signal is
+    worth collecting - a liveness check built on a bit any observer can flip is not a check.
+
+    Keyed EXACTLY, never casefolded: the server's persona namespace is case-SENSITIVE, so `Maple` and `maple`
+    are different identities and must not merge (the identity half of the case asymmetry).
+
+    Only the newest window is needed. Backward-walk rows are always OLDER than the window floor they were
+    reached from, so they cannot raise a maximum; skipping them costs no evidence.
+    """
+    for m in items or []:
+        who = m.get("from")
+        mid = m.get("id")
+        if not isinstance(who, str) or not who or not isinstance(mid, int):
+            continue
+        prev = _LAST_AUTHORED.get(who)
+        # Compare by `id`, NEVER by `created`: timestamps are stamped pre-lock while ids are assigned under
+        # it, so two concurrent senders can carry timestamps in the opposite order from their ids.
+        if prev is None or mid > prev[0]:
+            _LAST_AUTHORED[who] = (mid, m.get("created"))
+
+
+# Set once, when the watch loop starts. Everything before it is INVISIBLE to this process: the table is built
+# from windows observed since then, so a question about earlier activity must answer UNKNOWN rather than
+# "none". Without this floor a fresh producer would report every persona as inactive for one tick.
+_OBSERVED_SINCE = None
+
+# Per-inbox coverage: {persona: the lowest id ever seen in THAT inbox's window}. A persona's outbound can
+# land in ANY inbox, so a claim that they have authored nothing is only as good as the WORST-covered inbox.
+_INBOX_FLOORS = {}
+
+
+def note_observation_floor(persona, items):
+    ids = [m["id"] for m in (items or []) if isinstance(m.get("id"), int)]
+    if not ids:
+        return
+    low = min(ids)
+    cur = _INBOX_FLOORS.get(persona)
+    if cur is None or low < cur:
+        _INBOX_FLOORS[persona] = low
+
+
+def observation_floor_id():
+    """The id below which "nobody authored anything" CANNOT be asserted. MAXIMUM, deliberately.
+
+    The tempting version is the minimum - the oldest message we have laid eyes on anywhere - and it is
+    WRONG in the dangerous direction. Each inbox window reaches back only as far as its own floor, so
+    between the lowest and highest floor there are inboxes we have NOT seen into. A message authored in
+    that span, addressed to a poorly-covered inbox, is invisible to us; reporting "no activity" there is
+    a silence we did not observe.
+    Seen on live data: the watcher had seen ids down to 1160 (in one inbox) while another inbox's window
+    only reached 1179, so a question about id 1165 looked answerable and was not.
+    Taking the maximum can only make us answer NOT-OBSERVABLE more often, which is the safe direction.
+    """
+    return max(_INBOX_FLOORS.values()) if _INBOX_FLOORS else None
+
+
+def evaluate_activity(report, persona, floor_id):
+    """Answer the question from a PUBLISHED report. True / False / None (NOT OBSERVABLE).
+
+    Takes the report rather than reading module state, so the identical logic serves the running watcher
+    and a one-shot `--check-activity` in a separate process. A second implementation of a tri-state this
+    subtle is a second chance to get it wrong.
+
+    The tri-state is the whole point, and it is the same discipline as the unread-not-shown alarm:
+    absence of evidence is evidence of absence only if you were actually watching.
+    """
+    if not isinstance(report, dict) or not report.get("observed_since"):
+        return None                       # nothing has been observed at all
+    seen = (report.get("last_authored") or {}).get(persona)
+    if isinstance(seen, dict) and isinstance(seen.get("id"), int) and seen["id"] > floor_id:
+        return True                       # positive evidence, and positive evidence needs no floor
+    floor = report.get("observation_floor_id")
+    if not isinstance(floor, int) or floor_id < floor:
+        return None                       # the question predates what this report can speak for
+    return False
+
+
+def current_activity_report():
+    """The in-process view, in the same shape write_activity_file() publishes."""
+    return {
+        "observed_since": _OBSERVED_SINCE,
+        "observation_floor_id": observation_floor_id(),
+        "last_authored": {p: {"id": i, "created": c} for p, (i, c) in _LAST_AUTHORED.items()},
+    }
+
+
+def activity_since(persona, floor_id):
+    """Has `persona` authored anything after `floor_id`? True / False / None (NOT OBSERVABLE)."""
+    return evaluate_activity(current_activity_report(), persona, floor_id)
+
+
+# Words that assert a CAUSE this data cannot distinguish. Deadlocked, unreachable and thinking-hard all look
+# identical here and need opposite remedies - a deadlock wants a ping, an unreachable member wants a human to
+# restart its bridge. Enforced by a test, not just documented, because a rule that lives only in prose does
+# not run.
+FORBIDDEN_DIAGNOSES = ("deadlock", "stuck", "wedged", "dead", "down", "offline", "crashed", "hung")
+
+
+def activity_observation(persona, floor_id, waits, last_evidence=None, report=None):
+    """The exact text a waiter emits about the member it is waiting on. OBSERVATION ONLY.
+
+    Carries the wait count and the last-evidence stamp alongside the finding, so a reader can judge
+    magnitude without a second query - a bare "no activity" invites the reader to supply the diagnosis
+    themselves, which is the failure this wording exists to prevent.
+    """
+    rep = report if report is not None else current_activity_report()
+    row = (rep.get("last_authored") or {}).get(persona)
+    seen = (row.get("id"), row.get("created")) if isinstance(row, dict) else None
+    evidence = last_evidence if last_evidence is not None else (seen[1] if seen else None)
+    tail = ("; %s's last observed message was %s" % (persona, evidence)) if evidence else (
+        "; no message from %s has been observed at all" % persona)
+    return ("no activity from %s since your message at id %s; you have waited %d heartbeat(s)%s "
+            "(checked: authored mail. This states what was OBSERVED, not why: not-yet-read, unable to "
+            "receive, and still working are indistinguishable from here and need different responses.)"
+            % (persona, floor_id, waits, tail))
+
+
+def check_activity(path, persona, floor_id, waits):
+    """One-shot `--check-activity`: read a published report and answer for ONE persona.
+
+    Exit codes are the contract, because this is meant to be called from a shell heartbeat:
+        0  evidence of activity        (nothing to report)
+        1  no activity in a span we actually covered   -> the observation is printed
+        2  NOT OBSERVABLE / unusable report            -> print why; assert nothing
+    2 is deliberately distinct from 1. Collapsing them would turn "I was not watching" into "they were
+    silent", which is the false assertion this whole signal is built to refuse.
+    """
+    try:
+        with open(path) as f:
+            report = json.load(f)
+    except (OSError, ValueError) as e:
+        sys.stderr.write("kijito-inbox-monitor: activity report unreadable (%s): %s\n" % (path, e))
+        return 2
+    verdict = evaluate_activity(report, persona, floor_id)
+    if verdict is True:
+        row = (report.get("last_authored") or {}).get(persona) or {}
+        sys.stdout.write("active: %s authored id %s at %s\n"
+                         % (persona, row.get("id"), row.get("created")))
+        return 0
+    if verdict is None:
+        sys.stdout.write("not observable: this report cannot speak about id %s for %s "
+                         "(observed since %s, floor id %s). No claim either way.\n"
+                         % (floor_id, persona, report.get("observed_since"),
+                            report.get("observation_floor_id")))
+        return 2
+    sys.stdout.write(activity_observation(persona, floor_id, waits, report=report) + "\n")
+    return 1
+
+
+def write_activity_file(path, now_iso=None):
+    """Publish the authorship table so any harness can evaluate the predicate without inventing a scan.
+
+    This exists to keep consumers OUT of the dangerous shape. Answering "has B sent anything" from a client
+    otherwise means polling every persona's inbox on a timer, where one missing `mark_read=false` destroys
+    read-state account-wide. The watcher already holds the answer, gathered safely.
+    """
+    d = {
+        "observed_since": _OBSERVED_SINCE,
+        "observation_floor_id": observation_floor_id(),
+        "updated": now_iso or _now_iso(),
+        # A question about anything at or below observation_floor_id is NOT ANSWERABLE from this file.
+        "last_authored": {p: {"id": i, "created": c} for p, (i, c) in sorted(_LAST_AUTHORED.items())},
+        # Personas with mail a SENDER escalated. Published alongside authorship because the pair is what
+        # separates "idle by design" from "nobody is coming": urgency is an expectation someone declared,
+        # and silence only means something once something was expected. A persona absent here was not
+        # reported on, which is not the same as zero.
+        "urgent_unread": {p: n for p, n in sorted(_URGENT_UNREAD.items()) if n},
+    }
+    dirn = os.path.dirname(os.path.abspath(path)) or "."
+    try:
+        os.makedirs(dirn, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=dirn, prefix=".kijmon-act-", suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, path)             # atomic: a reader never sees a half-written table
+    except OSError as e:
+        sys.stderr.write("kijito-inbox-monitor: WARNING activity-file write failed (non-fatal): %s\n" % e)
+
+
+def has_consumer_evidence(persona):
+    """POSITIVE evidence that a real agent stands behind this persona name.
+
+    Deliberately the SAME shape as the stranded-mail ownership predicate and the server's broadcast eligibility
+    rule, because the three answer one question - "is anyone actually there?" - and two predicates for one
+    question drift apart and then disagree about the same inbox.
+
+    Evidence is positive: authorship we OBSERVED, or memories the directory says they own. A count of NONE
+    is not reported rather than reported-zero, and no data is not evidence of absence, so an unreported
+    count leaves the persona eligible. Only a positively-stated zero with no observed authorship excludes.
+    """
+    if persona in _LAST_AUTHORED:
+        return True                                  # we watched them write something
+    n = _PERSONA_MEMORY_COUNTS.get(persona)
+    if n is None:
+        return True                                  # the server said nothing; do not infer absence
+    return n > 0
+
+
+def deliverable_watchers(directory, targets):
+    """Which watchers should receive an account-level alarm.
+
+    Directory membership alone routes alarms into the streams of long-dead test personas - the same defect
+    as a broadcast amplifying phantoms - so eligibility needs evidence of a consumer, not just a name.
+
+    FAILS OPEN, and that matters more than the filtering: if the predicate would leave NOBODY, every
+    directory watcher is used instead. An alarm delivered to a stream nobody reads costs one line; an alarm
+    delivered to NOBODY is the silent failure this tool exists to prevent, and a filter that can silence
+    every recipient at once is a worse bug than the noise it removes.
+    """
+    known = {p for p in (directory or ()) if p}
+    candidates = sorted({t.persona for t in targets if t.persona and t.persona in known})
+    live = [p for p in candidates if has_consumer_evidence(p)]
+    return live or candidates
+
+
+_REPORTED_URGENT_QUIET = set()
+
+# write_only members holding urgent unread, surfaced QUIETLY this process (a stderr NOTICE, and an
+# informational `urgent_unanswered_write_only` field on any loud urgent alert), never firing the loud
+# alarm on their own. Kept SEPARATE from _REPORTED_URGENT_QUIET so the loud and quiet tiers cannot gag
+# one another, and re-armed by intersection_update so a member re-entering the tier is surfaced again.
+# Same once-per-member, EXACT-keyed discipline as _REPORTED_STRANDED / _REPORTED_DORMANT.
+_REPORTED_URGENT_WO = set()
+
+# DEBRIS rows (declared retired, or the reserved broadcast-name row) holding urgent unread.
+# Surfaced QUIETLY (a stderr NOTICE) once per member, never the loud alarm: "nobody is answering
+# escalated mail" presumes a member who could answer, and debris by declaration has none. Its own set so
+# no tier can gag another; re-armed by intersection_update like the others.
+_REPORTED_URGENT_DEBRIS = set()
+
+
+def urgent_unanswered(directory):
+    """Directory personas holding SENDER-ESCALATED mail while showing no observed activity.
+
+    THE PREDICATE, and the reason this alarm is buildable at all:
+        unread_urgent > 0   AND   activity_since(persona) is False
+    An "is this agent stuck" alarm normally cannot exist, because an agent idle BY DESIGN and an agent that
+    is wedged look identical from outside - so it fires on every dormant persona and rots into noise. What
+    breaks the tie is a declared EXPECTATION, and `unread_urgent` is one: not the recipient declaring
+    liveness, but a SENDER declaring that this needs attention now. Silence only means something once
+    something was expected.
+
+    Both halves must be POSITIVE. `activity_since` is a tri-state and only `False` counts - a NOT-OBSERVABLE
+    answer means the watcher was not running for the span in question, and reporting that as silence is the
+    fabrication this whole signal exists to refuse.
+
+    Restricted to DIRECTORY personas on purpose, which keeps this disjoint from the stranded-mail alarm:
+    that one is for inboxes nobody OWNS, this one is for real members who are not responding. Two alarms
+    with two philosophies drift apart and then disagree about the same inbox.
+    """
+    out = []
+    floor = observation_floor_id()
+    if floor is None:
+        return out            # nothing observed at all: assert nothing
+    known = {p for p in (directory or ()) if p}
+    for persona, n in sorted(_URGENT_UNREAD.items()):
+        if n and persona in known and activity_since(persona, floor) is False:
+            out.append((persona, n))
+    return out
+
+
+def _urgent_writeonly_detail(persona, n):
+    """Name a write_only member holding urgent unread, for the QUIET (non-waking) channel.
+
+    A write_only inbox is undrained BY DESIGN - drained via ANOTHER surface (for the owner's inbox, largely the
+    digest) - so a sender's URGENT flag on it does not mean the member is unresponsive HERE, and firing
+    the loud "nobody is answering escalated mail" alarm on it is the same false-positive class write_only
+    exists to kill. But the COUNT must stay visible so the surface that actually
+    drains the box can still act on it - QUIET, never INVISIBLE. Mirrors _dormant_detail.
+    """
+    return ("%s (%d urgent unread; held by write_only member - drained via another surface, "
+            "not unanswered here)" % (persona, n))
+
+
+def report_urgent_unanswered(directory, targets, emitter):
+    """Emit the urgent-unanswered observation. Self-clears when EITHER half of the predicate clears; never an ack.
+
+    An ack would let someone silence "nobody is answering escalated mail" while it stayed true, which is
+    how a dead-letter surface rots. Releasing the suppression the moment the condition lifts means a
+    recurrence is announced again without anyone having to remember to reset anything.
+
+    write_only members are partitioned OUT of the loud tier and surfaced QUIETLY (a stderr NOTICE + an
+    informational `urgent_unanswered_write_only` field), mirroring the stranded/dormant split: their inbox
+    is undrained BY DESIGN (drained via another surface), so a sender's URGENT flag does not make THEM
+    unresponsive here - it is the same false-positive class write_only exists to kill, in the sibling
+    alarm. The count stays NAMED on the quiet channel so the draining surface (the digest) can still read
+    it - quiet, not invisible.
+    """
+    directory = directory or ()
+    current = urgent_unanswered(directory)
+    # Partition by the DECLARED write_only fact, exactly as _partition_stranded does. `is True` is strict:
+    # an undeclared or False flag leaves the member in the LOUD tier unchanged (graceful degradation, the
+    # same tri-state _row_write_only guarantees).
+    # DEBRIS FIRST: a declared-retired row or the reserved broadcast-name row has no member to
+    # be unresponsive, so it leaves the loud tier whatever its other flags say; named quietly below.
+    debris_quiet = [(p, n) for p, n in current if _is_debris(p)]
+    current = [(p, n) for p, n in current if not _is_debris(p)]
+    wo_quiet = [(p, n) for p, n in current if _PERSONA_WRITE_ONLY.get(p) is True]
+    alerting = [(p, n) for p, n in current if _PERSONA_WRITE_ONLY.get(p) is not True]
+    _REPORTED_URGENT_QUIET.intersection_update({p for p, _ in alerting})  # release: leaving re-arms alarm
+    _REPORTED_URGENT_WO.intersection_update({p for p, _ in wo_quiet})
+    _REPORTED_URGENT_DEBRIS.intersection_update({p for p, _ in debris_quiet})
+    for persona, n in debris_quiet:
+        if persona in _REPORTED_URGENT_DEBRIS:
+            continue
+        _REPORTED_URGENT_DEBRIS.add(persona)
+        sys.stderr.write(
+            "kijito-inbox-monitor: NOTICE urgent-unanswered on debris (quiet, not alarmed) - %s (%d urgent "
+            "unread; declared %s, so nobody works as it - its mail is still readable; retire or clear it) "
+            "(further notices for %r suppressed)\n"
+            % (persona, n, "reserved (the broadcast name)" if _PERSONA_RESERVED.get(persona) is True
+               else "retired", persona))
+    fresh = [(p, n) for p, n in alerting if p not in _REPORTED_URGENT_QUIET]
+    fresh_wo = [(p, n) for p, n in wo_quiet if p not in _REPORTED_URGENT_WO]
+    # QUIET-BUT-NAMED tier: a stderr NOTICE is a non-waking channel (the event-stream grep filters
+    # new|alert|recovered, which stderr is not), so a write_only member's urgent count goes on the record
+    # without ever waking an agent - and independently of whether any loud member exists this tick. Once
+    # per member, exactly like the dormant tier.
+    for persona, n in fresh_wo:
+        _REPORTED_URGENT_WO.add(persona)
+        sys.stderr.write(
+            "kijito-inbox-monitor: NOTICE urgent-unanswered write_only (quiet, not alarmed) - %s "
+            "(further notices for %r suppressed)\n" % (_urgent_writeonly_detail(persona, n), persona))
+    if not fresh:
+        # The write_only tier NEVER fires the loud alert on its own - the whole point of the split. It has
+        # already been recorded on stderr above; there is no unanswered non-write_only member to announce.
+        return []
+    detail = []
+    for persona, n in fresh:
+        _REPORTED_URGENT_QUIET.add(persona)
+        seen = _LAST_AUTHORED.get(persona)
+        detail.append("%s (%d urgent unread; %s)" % (
+            persona, n,
+            ("last observed message %s" % seen[1]) if seen else "no message from them observed at all"))
+    # One summarising event per watcher, exactly as the stranded alarm does - discovering several at once
+    # must not become a wake storm. Routed by evidence of a consumer, not by directory membership
+    # alone, so the alert does not land in long-dead test personas' streams. The freshly-surfaced
+    # write_only members ride along as an INFORMATIONAL `urgent_unanswered_write_only` field (mirroring
+    # `dormant_inboxes`): a digest consumer already filtering `alert` sees the held count without the alarm
+    # having fired on their account. Attached ONLY when non-empty - an absent field means "no statement",
+    # the same tri-state discipline the exec layer relies on.
+    extra = {"urgent_unanswered_write_only": [p for p, _ in fresh_wo]} if fresh_wo else {}
+    for watcher in deliverable_watchers(directory, targets):
+        emitter.lifecycle(
+            "alert", persona=watcher,
+            reason=("urgent-unanswered: %d member(s) hold mail a sender marked URGENT while no activity "
+                    "from them has been observed: %s. OBSERVATION, NOT A DIAGNOSIS: not-yet-read, unable "
+                    "to receive, and still working are indistinguishable from here and need different "
+                    "responses. Checked: authored mail." % (len(fresh), ", ".join(detail))),
+            urgent_unanswered=[p for p, _ in fresh],
+            **extra)
+    return [p for p, _ in fresh]
+
+
+_REPORTED_STRANDED = set()
+
+# Dormant inboxes already surfaced (quietly) this process. Same once-per-inbox discipline and the same
+# EXACT (never casefolded) keying as _REPORTED_STRANDED, re-armed by intersection_update so a re-dormancy
+# after a rescue is surfaced again. Kept separate from _REPORTED_STRANDED so the loud and quiet tiers
+# never gag one another.
+_REPORTED_DORMANT = set()
+
+
+def stranded_inboxes(directory, counts):
+    """Inboxes holding unread mail that the persona DIRECTORY does not know about.
+
+    Two namespaces exist and are populated by different paths: the DIRECTORY (who exists) and the INBOX
+    (who can receive). When they diverge, mail lands in an inbox that nobody owns and nothing watches -
+    it is never delivered, and nothing reports it, so the sender sees success and the recipient sees
+    nothing. Two typical shapes: a case-variant of a live persona, and a group-looking name ('all')
+    with no broadcast semantics behind it.
+
+    Compared EXACTLY, deliberately NOT casefolded. The SERVER's inbox namespace is case-SENSITIVE -
+    'Cobalt-chat' and 'cobalt-chat' hold different message sets - so a case-variant is a real, DISTINCT
+    inbox holding real mail, and casefolding here would hide exactly the case this check exists to catch.
+
+    Note the deliberate asymmetry with _state_safe_persona(), which DOES casefold: the local filesystem
+    is case-INSENSITIVE and cannot hold two state files for the two names, so the watcher can never adopt
+    the variant. The rules are complementary rather than contradictory - the variant is unwatchable
+    locally AND unwatched remotely, which is exactly why it has to be alarmed on instead of adopted.
+
+    TWO SIGNALS, because directory membership alone stopped being sufficient. A server may build its
+    directory as a UNION that includes every registered RECIPIENT - and a recipient is registered the
+    moment anyone sends to that name, typo included. On such a server every future phantom is "in the
+    directory" instantly and absence can never fire again. So an in-directory inbox also counts as
+    stranded when it holds mail while NEVER HAVING BEEN CONSUMED - read == mail_total - unread == 0.
+
+    read==0 REPLACES the older "owns ZERO memories" proxy for the in-directory case, because that proxy
+    was MONOTONIC: authoring a single memory immunised an inbox forever, so a typo-variant that ever
+    received one memory (a misspelled persona name, say) would go invisible while its mail
+    piled up unread. read count is not monotonic - it tracks whether anyone is ACTUALLY consuming the
+    inbox now. Where the server reports no read data at all this degrades to the original memory-count
+    proxy rather than guessing, and an unknown read is never read as zero.
+
+    stranded_inboxes() returns only the LOUD tier: names the directory doesn't know, plus in-directory
+    inboxes never consumed that are DECLARED `retired` (clearable debris). In-directory inboxes never
+    consumed that are NOT declared retired are real-but-dormant; they are returned by dormant_inboxes()
+    and surfaced quietly instead, so a live member who simply never reads a broadcast inbox does not ride
+    the loud alarm. The partition is exact on both axes (read==0 and the boolean `retired`); no threshold.
+    """
+    return _partition_stranded(directory, counts)[0]
+
+
+def _partition_stranded(directory, counts):
+    """Split inboxes-holding-unread into (loud, dormant). Single classifier so the two tiers cannot drift.
+
+    For each inbox with unread mail (checked in this order):
+      - name not in the directory                         -> LOUD  (signal 1, unchanged)
+      - in directory, write_only is True                  -> DORMANT (undrained by design; always quiet)
+      - in directory, read data UNKNOWN, memory_count==0  -> LOUD  (degrade to the original proxy)
+      - in directory, read > 0                            -> not stranded (actively consumed)
+      - in directory, read == 0, retired is True          -> LOUD  (declared clearable debris)
+      - in directory, read == 0, retired False/undeclared -> DORMANT (real-but-idle; quiet)
+    read = mail_total - unread, both from the /api/personas row via _PERSONA_READ_COUNTS. Compared and
+    classified EXACTLY, never casefolded - the same case-sensitivity invariant as the rest of this check.
+    write_only is checked BEFORE read, because an undrained-by-design inbox is quiet regardless of its
+    read count - its read==0 (or unknown read) is the EXPECTED steady state, not evidence of a fault.
+    Without it the proxy would flag a live member's box LOUD: a human's own inbox, in the directory
+    with unknown read and zero memories, would ride the loud alarm every tick. FACT declared by the
+    API, policy derived here.
+    """
+    known = {p for p in directory if p}
+    loud, dormant = [], []
+    for p in sorted(counts):
+        if not p or not counts.get(p):
+            continue
+        if p not in known:
+            loud.append(p)                       # signal 1: no owner in the directory
+            continue
+        if _PERSONA_WRITE_ONLY.get(p) is True:
+            dormant.append(p)                    # undrained BY DESIGN (the human's box) -> always quiet, any read
+            continue
+        read = _PERSONA_READ_COUNTS.get(p)
+        if read is None:
+            # No read data for this persona: degrade to the original ownership proxy. An UNKNOWN read
+            # count must never be treated as zero, so we consult memory_count exactly as before.
+            if _PERSONA_MEMORY_COUNTS.get(p) == 0:
+                loud.append(p)
+            continue
+        if read > 0:
+            continue                             # someone is consuming it - not stranded at all
+        # read == 0: this inbox has never been consumed. Partition by the DECLARED retired flag.
+        if _is_debris(p):
+            loud.append(p)                       # declared clearable debris (retired or reserved) -> loud
+        else:
+            dormant.append(p)                    # real-but-dormant -> quiet, must NOT ride the loud alarm
+    return loud, dormant
+
+
+def dormant_inboxes(directory, counts):
+    """In-directory inboxes never consumed (read==0) but NOT declared `retired` - the QUIET tier.
+
+    Separated from stranded_inboxes() on purpose: these are real members who simply do not read a
+    broadcast inbox (measured live: four personas on one account held hundreds of memories with
+    read==0). Alarming on them loudly would flood the very alert consumers rely on, so they are surfaced
+    quietly (a stderr NOTICE, and an informational `dormant_inboxes` field on any loud alert) and never
+    fire an alert on their own.
+    """
+    return _partition_stranded(directory, counts)[1]
+
+
+def _stranded_detail(persona, directory, counts):
+    """Describe one stranded inbox, naming its twin when it is a case-variant.
+
+    'case-variant of known persona X' is a far more actionable diagnosis than 'unknown inbox': it tells
+    the operator the mail was meant for a real person and how it went astray.
+    """
+    twin = next((d for d in sorted(directory)
+                 if d and d != persona and d.casefold() == persona.casefold()), None)
+    if twin is not None:
+        return "%s (%s unread; case-variant of known persona %r)" % (persona, counts.get(persona), twin)
+    in_dir = persona in set(directory)
+    if in_dir and _PERSONA_READ_COUNTS.get(persona) == 0 and _is_debris(persona):
+        return ("%s (%s unread; never consumed (read 0) and declared %s, so it is clearable debris)"
+                % (persona, counts.get(persona),
+                   "reserved (the broadcast name, not an identity)" if _PERSONA_RESERVED.get(persona) is True
+                   else "retired"))
+    if in_dir and _PERSONA_MEMORY_COUNTS.get(persona) == 0:
+        return "%s (%s unread; registered as a recipient but owns no memories, so nobody works as it)" % (
+            persona, counts.get(persona))
+    return "%s (%s unread)" % (persona, counts.get(persona))
+
+
+def _dormant_detail(persona, counts):
+    """Describe one DORMANT inbox: a real member never observed reading it. Quiet, not an alarm.
+
+    Deliberately does NOT diagnose it as clearable - a dormant inbox is a live persona that simply is not
+    reading here, the opposite of debris, and mislabelling it would invite deleting a real member's mail.
+    A write_only member is named as such: its read==0 is by design, not merely unobserved.
+    """
+    if _PERSONA_WRITE_ONLY.get(persona) is True:
+        return "%s (%s unread; in the directory and declared write_only - undrained BY DESIGN (drained via another surface), never debris)" % (
+            persona, counts.get(persona))
+    return "%s (%s unread; in the directory but never consumed (read 0), not declared retired)" % (
+        persona, counts.get(persona))
+
+
+def report_stranded_inboxes(directory, counts, targets, emitter):
+    """Alarm on undelivered mail: an inbox RECEIVING while nobody owns or watches it.
+
+    Reported at most once per inbox per process, and summarised into ONE event per watcher rather than
+    one per (watcher, inbox), so discovering a backlog cannot turn into a wake storm.
+
+    Routed ONLY to watchers backed by a real DIRECTORY persona. This is not a formality: a stranded inbox
+    holds mail, so discover_from_counts() gives it a watch target and an event stream of its own - and
+    routing the alarm to every target would therefore write it straight into the unconsumed stream whose
+    unconsumed-ness is the fault being reported. Producing an event there is not delivering it.
+
+    The event is an `alert` (not a new event name) so consumers already filtering `alert` surface it
+    without being rearmed; a fresh event name would itself have gone unwatched, because a running
+    `grep` never re-reads its argv. That is not hypothetical: the diagnostics this module emits
+    (state_corrupt, baseline_skipped, seed_ahead, replay_capped, persona_added) ARE fresh names, and
+    each of them is invisible to a consumer until its filter is widened by hand.
+    """
+    if not directory:
+        return []   # unknown directory: alarming would flag EVERY persona. No data is not evidence of a fault.
+    loud, dormant = _partition_stranded(directory, counts)
+    # RELEASE the suppression for anything no longer in its tier, so the signal can fire AGAIN if that inbox
+    # is later re-stranded / re-dormant. Suppressing for the process lifetime made "reported once" mean
+    # "reported once ever", which silently contradicted the documented self-clearing behaviour: an inbox
+    # that was rescued and then stranded a second time would never be announced.
+    #
+    # Keyed EXACTLY, not casefolded - the same asymmetry as stranded_inboxes() itself. The server's inbox
+    # namespace is case-sensitive, so 'Cobalt-chat' and 'cobalt-chat' are DIFFERENT inboxes; sharing one
+    # suppression key between them lets either one hold the other's alarm down.
+    _REPORTED_STRANDED.intersection_update(loud)
+    _REPORTED_DORMANT.intersection_update(dormant)
+    fresh = [p for p in loud if p not in _REPORTED_STRANDED]
+    fresh_dormant = [p for p in dormant if p not in _REPORTED_DORMANT]
+
+    # DORMANT tier (real-but-idle members, not declared retired): recorded QUIETLY and independently of the
+    # loud alarm. A stderr NOTICE is a non-waking channel (the event-stream grep filters new|alert|recovered,
+    # which stderr is not), so a dormant inbox is put on the record without ever waking an agent - and this
+    # happens whether or not any loud inbox exists this tick. Once per inbox, exactly like the loud tier.
+    for persona in fresh_dormant:
+        _REPORTED_DORMANT.add(persona)
+        sys.stderr.write(
+            "kijito-inbox-monitor: NOTICE dormant inbox (quiet, not alarmed) - %s (further notices for %r "
+            "suppressed)\n" % (_dormant_detail(persona, counts), persona))
+
+    if not fresh:
+        # The DORMANT tier NEVER fires the loud alert on its own - that is the whole point of the split.
+        # It has already been recorded on stderr above; there is no loud debris/unknown inbox to announce.
+        return []
+    for persona in fresh:
+        _REPORTED_STRANDED.add(persona)
+        sys.stderr.write(
+            "kijito-inbox-monitor: ALERT stranded mail - %s is not a known persona, so no agent consumes its "
+            "mail (further reports for %r suppressed)\n" % (_stranded_detail(persona, directory, counts), persona))
+    detail = ", ".join(_stranded_detail(p, directory, counts) for p in fresh)
+    # Same routing rule as the urgent-unanswered alarm - one predicate for "is anyone there",
+    # because two would drift apart and disagree about the same inbox. The freshly-detected dormant inboxes
+    # ride along as an INFORMATIONAL `dormant_inboxes` field: consumers already filtering `alert` see them
+    # without being rearmed, but they never caused this alert to fire (only `fresh` loud did).
+    # Attach the informational field ONLY when there is something to say - an absent field means "no
+    # statement", the same tri-state discipline the exec layer relies on ("absent fields are simply
+    # omitted, not defaulted"), so an empty dormant list is left off rather than shipped as [].
+    extra = {"dormant_inboxes": list(fresh_dormant)} if fresh_dormant else {}
+    for watcher in deliverable_watchers(directory, targets):
+        emitter.lifecycle("alert", persona=watcher,
+                          reason="stranded-mail: %d inbox(es) receiving mail nobody watches: %s" % (len(fresh), detail),
+                          stranded_inboxes=list(fresh),
+                          **extra)
+    return fresh
+
+
+def run(args):
+    # FIRST, before the token or any request: every URL below is derived from the base set here.
+    base, base_source = resolve_api_base(getattr(args, "api_base", None))
+    set_api_base(base)
+    if base != DEFAULT_API_BASE:
+        sys.stderr.write("kijito-inbox-monitor: NOTICE watching the Kijito API at %s (from %s)\n" % (base, base_source))
+    headers = build_headers(args)
+    sink = None
+    sink_template = None
+    if not args.self_test and args.emit == "stdout-jsonl":
+        if args.events_file_template:
+            sink_template = args.events_file_template  # one sink per persona (lazily created on first event)
+        elif args.events_file:
+            sink = RotatingFileSink(args.events_file, args.max_bytes, args.keep_logs)
+    emitter = Emitter(args.emit, args.exec, args.content_chars, args.no_content, sink=sink,
+                      suppress_authors=args.suppress_author, sink_template=sink_template,
+                      max_bytes=args.max_bytes, keep=args.keep_logs)
+    opener_by_origin = {}
+
+    directory_opener = make_opener_for(PERSONAS_URL)
+    personas = requested_personas(args, directory_opener, headers)
+    if not personas:
+        raise FatalConfig("at least one persona is required")
+    # ★ THE STARTUP PATH NEEDS THE SAME CONTAINMENT AS THE LATE-ADD PATHS. An
+    # arm in main() only converts the traceback into a clean exit: the producer STILL dies, so one
+    # persona's hostile lock sidecar still stops every other persona's mail. That is precisely the
+    # property this fix exists to deny, so containment belongs HERE, per-persona, exactly like
+    # discover_persona_targets. This used to be a bare list comprehension with no try at all.
+    targets = []
+    for p in personas:
+        try:
+            targets.append(build_persona_target(p, opener_by_origin, headers, args, emitter))
+        except (FatalConfig, OSError) as e:
+            _warn_persona_once(p, "cannot watch persona %r: %s" % (p, e))
+    if not targets:
+        # FAIL CLOSED. Skipping a persona is a real degradation, and skipping ALL of them would leave a
+        # process that is up, heartbeat-less and watching nothing - the silent-success shape.
+        # A watcher with no targets must not look like a running watcher.
+        raise FatalConfig("no persona could be watched: every one of %d target(s) failed to initialise "
+                          "(see the warnings above)" % len(personas))
+    # The DIRECTORY namespace, kept separate from `targets` on purpose: targets also accumulate personas
+    # discovered from the inbox counts, so diffing against targets would silently absorb the very phantom
+    # inboxes the stranded-mail check exists to find.
+    directory_personas = list(personas) if watches_all_personas(args) else []
+
+    # ---- self-test: run once, exit -------------------------------------------------------------------------
+    if args.self_test:
+        ok = True
+        for target in targets:
+            ok = target.self_test() and ok
+        return 0 if ok else 1
+
+    seam = WakeSeam()
+    seam.install()
+    global _OBSERVED_SINCE
+    _OBSERVED_SINCE = _now_iso()   # nothing before this instant is observable to this process
+    rediscover_at = _monotonic() + args.rediscover_every
+    cursor = None    # opaque long-poll cursor (the server's max-message-id token) echoed on each call
+    lp_backoff = 0   # exponential backoff (s) between FAILED long-poll attempts; 0 while healthy
+
+    while not seam.stop:
+        seam.drain()  # read-and-clear at START of poll
+        if watches_all_personas(args) and directory_opener is not None and _monotonic() >= rediscover_at:
+            try:
+                _, discovered = discover_persona_targets(
+                    args, headers, emitter, targets, opener_by_origin, directory_opener)
+                if discovered:
+                    directory_personas = discovered
+            except FatalConfig as e:
+                sys.stderr.write("kijito-inbox-monitor: WARNING persona rediscovery failed: %s\n" % e)
+            rediscover_at = _monotonic() + args.rediscover_every
+
+        counts_available = False
+        unread_counts = {}
+        held = False  # True iff this iteration was a real server-HELD long-poll (it already provided the wait)
+        count_target = next((t for t in targets if t.unread_persona), None)
+        if count_target is not None and not args.no_fast_path:
+            if args.wait > 0:
+                _RETRY_HINT["seconds"] = None
+                counts_available, unread_counts, new_cursor = fetch_unread_counts_longpoll(
+                    count_target.opener, headers, args.wait, cursor)
+                if counts_available:
+                    lp_backoff = 0
+                    if new_cursor is not None:
+                        cursor = new_cursor   # real long-poll: advance the cursor; the hold WAS the wait
+                        held = True
+                    # new_cursor is None → server doesn't long-poll (yet) → interval-poll via the sleep below
+                else:
+                    # drop / blip / outage: back off, resume the SAME cursor next time (lossless), and this tick
+                    # falls through to per-target full inbox polls (the by-message-id correctness backstop).
+                    lp_backoff = next_longpoll_backoff(lp_backoff, _RETRY_HINT["seconds"])
+            else:
+                counts_available, unread_counts = fetch_unread_counts(
+                    count_target.opener, count_target.count_url, headers)
+
+        if counts_available:
+            discover_from_counts(args, unread_counts, targets, opener_by_origin, headers, emitter)
+            if not args.no_stranded_alerts:
+                report_stranded_inboxes(directory_personas, unread_counts, targets, emitter)
+        refresh_directory_backing(args, directory_personas, targets)
+        for target in targets:
+            target.poll_once(counts_available, unread_counts)
+        # AFTER the polls, so this tick's authorship is already recorded - evaluating before them would
+        # judge a member silent using a view that predates the very message proving they are not.
+        # ITS OWN FLAG, NOT THE STRANDED ONE: these are different severities
+        # with different audiences, and the stranded flag's own documented advice is "set this if you keep
+        # deliberate test inboxes" - following that must not silently disable the higher-severity alarm
+        # about real members. Coupling them made the safe-sounding instruction the dangerous one.
+        if counts_available and not args.no_urgent_alerts:
+            report_urgent_unanswered(directory_personas, targets, emitter)
+        if args.activity_file:
+            write_activity_file(args.activity_file)
+        if seam.stop:
+            break
+        if held:
+            continue  # the server-held long-poll already supplied the inter-poll wait - loop straight back
+        seam.wait(lp_backoff if lp_backoff else args.poll_seconds)
+
+    emitter.close()
+    for target in targets:
+        if target.state_file is not None:
+            target.state_file.unlock()
+    return 0
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# One-time key pickup: --redeem-key
+# --------------------------------------------------------------------------------------------------------------------
+# A key minted with delivery="pickup" is never shown to the agent. The reply carries a single-use pickup code
+# (kpc_<32>@host[:port], dead after one redeem or 10 minutes); this mode collects the key over TLS and writes it
+# straight to the key file, so the key never passes through a conversation, an argv, a prompt or any output.
+#
+# What it refuses, and why (each is a test in RedeemKey*):
+#   * any API base but https://api.kijito.ai, unless the human wrote that exact base into an owner-only
+#     ~/.config/kijito-inbox-monitor/api_base. A flag or an environment value alone is never enough: under prompt
+#     injection both the code's host and --api-base are attacker-written, and a fake server would hand back the
+#     attacker's key. Loopback is not exempt (an injected command can start a local fake server too).
+#   * a code whose host is not the base's host[:port] (exit 3), before anything is sent.
+#   * any target but the canonical key files (or a per-persona watcher file), so a key cannot be routed into a
+#     workspace; a wider (rest) key never goes into the read-only watcher file.
+#   * an occupied target without --replace, or --replace-prefix naming a key that is not there.
+# What it sends: the code, the kind, the optional expected account, and the SHA-256 of every key already on this
+# machine that it can find (KEY_LOCATIONS, MCP client configs, key-shaped environment values) - never a key, and
+# never an Authorization header, so even a server that should not have been reached receives nothing usable.
+# The server refuses (and burns) a code of another account than those keys belong to.
+
+REDEEM_TIMEOUT = 60                       # one redeem round trip; no automatic retry, ever
+REDEEM_PATH = "/api/auth/key-pickup"
+VERIFY_PATH = "/api/auth/me?probe=1"      # a read with no write path
+PICKUP_CODE_ENV = "KIJITO_PICKUP_CODE"    # fallback when stdin carries no code
+WATCHER_KEY_FILE = ".config/kijito-inbox-monitor/token"   # read-only (memory.read) keys; relative to home
+REST_KEY_FILE = ".config/kijito/api_token"                 # every other key
+API_BASE_FILE = ".config/kijito-inbox-monitor/api_base"    # a non-default base the HUMAN allowed
+# THE ONE PLACE this helper learns where keys live. Ordered: the current files first, so the
+# hashes that survive the cap are the ones most likely to matter. Each pattern's matches are sorted by name.
+# The helper's own temps are `.<name>.<rand>.tmp` dot-files and match none of these.
+KEY_LOCATIONS = (
+    ".config/kijito-inbox-monitor/token",
+    ".config/kijito/api_token",
+    ".config/kijito-inbox-monitor/token.*",
+    ".config/kijito/api_token*",
+    ".claude/.kijito_api_token*",   # the bare file, per-persona `.<name>` files and any backup or rename of them
+)
+# MCP client configs, regex-scanned (never parsed) for key-shaped header or env values. Best effort: a config
+# that cannot be read safely is skipped with a warning, never a refusal. Home first, then the working directory.
+MCP_CONFIGS_HOME = (".claude.json", ".claude/settings.json", ".codex/config.toml",
+                    ".config/opencode/opencode.json", ".config/opencode/opencode.jsonc")
+MCP_CONFIGS_CWD = (".mcp.json", ".claude/settings.json", ".claude/settings.local.json", ".codex/config.toml")
+MAX_PRESENTED_KEY_HASHES = 32             # the server's own cap; one indexed lookup each
+MCP_CONFIG_MAX_BYTES = 1 << 20
+PRIVATE_READ_MAX_BYTES = 1 << 20          # a key or api_base file larger than this is not one
+REDEEM_BODY_MAX_BYTES = 1 << 20
+
+_KEY_IN_TEXT = re.compile(r"kjt_[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])")
+_KEY_WHOLE = re.compile(r"kjt_[A-Za-z0-9_-]{43}")
+_SERVED_KEY = re.compile(r"kjt_[A-Za-z0-9_-]{20,256}")   # what a 200 may carry (shape-checked, never printed)
+_PICKUP_CODE = re.compile(r"kpc_[0-9A-HJKMNP-TV-Z]{32}@(?:[a-z0-9.\-]{1,253}|\[[0-9a-f:.]{2,45}\])(?::[0-9]{1,5})?")
+_ACCOUNT_FP = re.compile(r"acct_[0-9a-f]{16}")
+# Exactly the prefix a renewal reply renders (kjt_ + 8). A longer one would let a whole key into argv.
+_REPLACE_PREFIX = re.compile(r"kjt_[A-Za-z0-9_-]{8}")
+_SAFE_FIELD = re.compile(r"[A-Za-z0-9_.:@-]{1,64}")
+# The stat module defines these only on Windows builds; the values are the documented Windows constants.
+IO_REPARSE_TAG_SYMLINK = getattr(stat, "IO_REPARSE_TAG_SYMLINK", 0xA000000C)
+IO_REPARSE_TAG_MOUNT_POINT = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
+
+REDEEM_EXIT_SAVED = 0
+REDEEM_EXIT_USAGE = 2       # usage / config / base not allowed / target / insecure key file / 400; nothing sent
+REDEEM_EXIT_WRONG_HOST = 3  # the code is for another server; nothing sent
+REDEEM_EXIT_REFUSED = 4     # a definite refusal (PICKUP_*)
+REDEEM_EXIT_LOST = 5        # collected, could not be saved: revoke it
+REDEEM_EXIT_RETRY = 6       # nothing was consumed: rerun the same command
+REDEEM_EXIT_AMBIGUOUS = 7   # sent, no usable answer: the key may be collected; revoke and mint again
+REDEEM_EXIT_PARKED = 8      # saved, but at the temp path it prints (the target changed under us)
+
+# Body `code` -> the definite refusals (exit 4). Branch on the code, never on the status or on JSON-ness.
+_PICKUP_REFUSALS = {
+    "not_found": "PICKUP_NOT_FOUND",
+    "pickup_expired": "PICKUP_EXPIRED",
+    "pickup_used": "PICKUP_USED",
+    "pickup_wrong_account": "PICKUP_WRONG_ACCOUNT",
+    "pickup_wrong_kind": "PICKUP_WRONG_KIND",
+    "pickup_unsealable": "PICKUP_FAILED",
+}
+# Answered before the daemon saw the request (or a quota): nothing was consumed, the same command can be rerun.
+# edge_gateway_timeout is connect-only (Cloudflare's 524 fires first for a slow daemon). edge_bad_gateway is NOT
+# here: an nginx 502 also covers an upstream that closed after receiving the request, i.e. maybe after a commit.
+_PICKUP_RETRY_CODES = frozenset({"rate_limited", "edge_request_too_large", "edge_rate_limited",
+                                 "edge_internal_error", "edge_unavailable", "edge_gateway_timeout"})
+_LINK_FALLBACK_ERRNOS = frozenset(e for e in (getattr(errno, "EPERM", None), getattr(errno, "ENOTSUP", None),
+                                              getattr(errno, "EOPNOTSUPP", None), getattr(errno, "EXDEV", None))
+                                  if e is not None)
+
+_REVOKE_HINT = 'kijito_api_key(action="revoke", token_id="<the key id in the reply>")'
+_MESSAGES = {
+    "PICKUP_NOT_FOUND": "no such pickup code. Retry with the exact code from the reply; otherwise revoke the key "
+                        "(%s) and create a new one." % _REVOKE_HINT,
+    "PICKUP_EXPIRED": "the code expired or was cancelled, and its key is already revoked. Create a new key.",
+    "PICKUP_USED": "this code was already collected. If you did not collect it, someone else did: revoke the key "
+                   "now (%s) and tell the user. If an earlier run printed PICKUP_RETRY_LATER, revoke it and "
+                   "create a new key." % _REVOKE_HINT,
+    "PICKUP_WRONG_ACCOUNT": "the code belongs to a different Kijito account than the keys already on this machine "
+                            "(or than --expect-account); the server revoked that key. Tell the user which "
+                            "sources are listed below. For a key of a second account use the web account page "
+                            "or delivery=\"inline\".",
+    "PICKUP_WRONG_KIND": "the server expects this key in the other key file. Nothing was used up: rerun the exact "
+                         "command from the reply unchanged; if it repeats, tell the user.",
+    "PICKUP_FAILED": "the server could not recover the key and revoked it. Create a new key.",
+    "PICKUP_RETRY_LATER": "nothing was collected. Rerun the same command before the code expires.",
+    "PICKUP_UNAVAILABLE": "this server does not hand out keys by pickup. Nothing was collected, but the key it "
+                          "minted is waiting unclaimed: revoke it (%s), then ask for the key with "
+                          "delivery=\"inline\" or create it on the web account page." % _REVOKE_HINT,
+    "PICKUP_AMBIGUOUS": "the request was sent but no usable answer came back, so the key may have been collected. "
+                        "Do not retry: revoke the key (%s) and create a new one." % _REVOKE_HINT,
+}
+
+
+class RedeemExit(Exception):
+    """A terminal outcome of --redeem-key: an exit code, a machine token (first word of the stdout line), a human
+    explanation for stderr, and key=value fields. Nothing in here may ever carry a key, a code or a body."""
+
+    def __init__(self, code, token, message, **fields):
+        super().__init__(token)
+        self.code = code
+        self.token = token
+        self.message = message
+        self.fields = fields
+
+
+def _redeem_environ():
+    """The environment --redeem-key reads ($HOME, $KIJITO_BASE, the code fallback, the key scan). A seam."""
+    return os.environ
+
+
+def _redeem_cwd():
+    """The working directory whose project-level MCP configs are scanned. A seam."""
+    return os.getcwd()
+
+
+def _redeem_stdin():
+    return sys.stdin
+
+
+def _lstat(path):
+    return os.lstat(path)
+
+
+def _is_link(st):
+    """A symlink, or on Windows a symlink or junction reparse point (not every reparse point: a OneDrive
+    placeholder is a reparse point too and must still read). Checked with lstat BEFORE every open, because
+    Windows has no O_NOFOLLOW; where O_NOFOLLOW exists it stays as the race-free second check."""
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    return getattr(st, "st_reparse_tag", 0) in (IO_REPARSE_TAG_SYMLINK, IO_REPARSE_TAG_MOUNT_POINT)
+
+
+def _ro_flags():
+    return (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_BINARY", 0))
+
+
+def _check_private_fd(fd, path):
+    """CHECK-ONLY twin of _assert_private_fd: a regular file, owned by us, mode exactly 0600, else InsecureFile.
+
+    It never fchmods. _assert_private_fd TIGHTENS a wrong mode, which is right for a file we are about to write
+    mail into and wrong for a key file we are only reading: a 0644 key has already been readable by other users,
+    and quietly fixing it would hide that from the person who has to rotate it. Off POSIX only the regular-file
+    check applies (Windows has no owner or mode bits; access there is the profile's ACL)."""
+    pst = os.fstat(fd)
+    if not stat.S_ISREG(pst.st_mode):
+        raise InsecureFile("%s is not a regular file" % path)
+    if not IS_POSIX:
+        return pst
+    if pst.st_uid != os.geteuid():
+        raise InsecureFile("%s is owned by uid %d, not by you (uid %d)" % (path, pst.st_uid, os.geteuid()))
+    if pst.st_mode & 0o777 != PRIVATE_FILE_MODE:
+        raise InsecureFile("%s has mode %o, not 0600 - run: chmod 600 %s" % (path, pst.st_mode & 0o777, path))
+    return pst
+
+
+def _read_private(path, limit=PRIVATE_READ_MAX_BYTES):
+    """Read an owner-only file without changing it. FileNotFoundError when absent; InsecureFile for a symlink,
+    anything not a regular file (a FIFO cannot hang us: O_NONBLOCK), another owner, a mode other than 0600, or
+    more than `limit` bytes."""
+    st = _lstat(path)
+    if _is_link(st):
+        raise InsecureFile("%s is a symbolic link - replace the symlink with the file itself" % path)
+    try:
+        fd = os.open(path, _ro_flags())
+    except FileNotFoundError:
+        raise
+    except OSError as e:
+        raise InsecureFile("cannot open %s: %s" % (path, e.strerror or type(e).__name__))
+    try:
+        _check_private_fd(fd, path)
+        chunks, size = [], 0
+        while size <= limit:
+            b = os.read(fd, 65536)
+            if not b:
+                break
+            chunks.append(b)
+            size += len(b)
+    finally:
+        os.close(fd)
+    if size > limit:
+        raise InsecureFile("%s is larger than %d bytes" % (path, limit))
+    return b"".join(chunks)
+
+
+def _write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        view = view[n:]
+
+
+def _passwd_home():
+    return pwd.getpwuid(os.geteuid()).pw_dir
+
+
+def _windows_home():
+    import pathlib
+    return str(pathlib.Path.home())
+
+
+def _windows_profile_dir():
+    """The profile folder from SHGetKnownFolderPath(FOLDERID_Profile): what Windows itself says the account's
+    home is, independent of %USERPROFILE% and %HOME%, which an injected command prefix can set."""
+    import ctypes
+    import uuid
+    from ctypes import wintypes
+    guid = (ctypes.c_ubyte * 16).from_buffer_copy(uuid.UUID("5E6C858F-0E22-4760-9AFE-EA3317B67173").bytes_le)
+    out = ctypes.c_wchar_p()
+    fn = ctypes.windll.shell32.SHGetKnownFolderPath
+    fn.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.HANDLE, ctypes.POINTER(ctypes.c_wchar_p)]
+    hr = fn(ctypes.byref(guid), 0, None, ctypes.byref(out))
+    try:
+        if hr != 0 or not out.value:
+            raise OSError("SHGetKnownFolderPath failed (0x%08x)" % (hr & 0xFFFFFFFF))
+        return out.value
+    finally:
+        ctypes.windll.ole32.CoTaskMemFree(ctypes.cast(out, ctypes.c_void_p))
+
+
+def _same_dir(a, b):
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
+def _resolved(path):
+    """`path` with its PARENT resolved (symlinks followed) and its last component kept as written."""
+    return os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
+
+
+def _redeem_home(environ):
+    """The account's home directory, which every path under --redeem-key is relative to.
+
+    POSIX: the passwd entry, NOT $HOME - an injected `HOME=/workspace ...` prefix must not move the canonical key
+    files or the api_base file. But the watcher and its start script find the key through $HOME, so a $HOME that
+    disagrees would save the key where nothing looks: refuse, naming both. (An unset HOME counts as agreeing.)
+    Windows: Path.home() must equal the profile folder Windows reports."""
+    if IS_POSIX:
+        try:
+            if pwd is None:
+                raise KeyError("no pwd module")
+            home = _passwd_home()
+        except KeyError:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED",
+                             "this account has no passwd entry (uid %d), so its home directory is unknown - "
+                             "run the helper as a user with a home directory" % os.geteuid(), reason="no_home")
+        if "HOME" in environ and not (environ["HOME"] and _same_dir(environ["HOME"], home)):
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED",
+                             "$HOME is %r but your account's home is %s - fix one, then rerun (the key must land "
+                             "where the watcher looks)" % (environ["HOME"], home), reason="home_mismatch")
+        return home
+    try:
+        home, profile = _windows_home(), _windows_profile_dir()
+    except Exception as e:
+        raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED",
+                         "cannot determine your profile folder (%s)" % type(e).__name__, reason="no_home")
+    if os.path.normcase(os.path.realpath(home)).casefold() != os.path.normcase(os.path.realpath(profile)).casefold():
+        raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED",
+                         "your home resolves to %s but your Windows profile folder is %s - fix USERPROFILE/HOME, "
+                         "then rerun" % (home, profile), reason="home_mismatch")
+    return home
+
+
+def _redeem_base_refusal(base, home):
+    """None when --redeem-key may talk to `base`, else why not. The default base is always allowed. Any other -
+    loopback included - only when it equals the normalised contents of the human-written, owner-only
+    ~/.config/kijito-inbox-monitor/api_base. Windows cannot check that file's owner or mode, so there only the
+    default base is allowed."""
+    if base == DEFAULT_API_BASE:
+        return None
+    if not IS_POSIX:
+        return ("a non-default server is not supported by --redeem-key on Windows; ask for the key with "
+                "delivery=\"inline\" instead")
+    path = os.path.join(home, API_BASE_FILE)
+    try:
+        raw = _read_private(path, 4096)
+    except FileNotFoundError:
+        return ("%s is not the default API base, and %s does not exist. If this is your own server, write its base "
+                "into that file yourself (one line, chmod 600) and rerun; an agent must not create it"
+                % (base, path))
+    except OSError as e:
+        return "%s cannot be trusted: %s" % (path, e)
+    try:
+        allowed = normalize_api_base(raw.decode("utf-8"), path)
+    except (FatalConfig, UnicodeDecodeError) as e:
+        return "%s does not hold a valid API base (%s)" % (path, type(e).__name__)
+    if allowed != base:
+        return "%s allows %s, not %s" % (path, allowed, base)
+    return None
+
+
+class _Redeem:
+    """One --redeem-key run. `phase` decides what an interrupt or an unexpected error means:
+    pre (nothing sent: exit 6) -> sent (no parsed answer: exit 7) -> parsed (key in memory: exit 5, or 8 once the
+    temp holds it) -> saved (the key is in place)."""
+
+    def __init__(self, args, environ, stdin):
+        self.args = args
+        self.environ = environ
+        self.cwd = None             # looked up inside run(), under the catch-all
+        self.stdin = stdin
+        self.phase = "pre"
+        self.tmp = None
+        self.tmp_fd = None
+        self.tmp_holds_key = False
+        self.parked = False
+        self.key_id = None
+        self.secret = None          # bytearray, zeroed when done
+        self.pinned = None
+        self.target = None
+        self.sources = []
+        self.project_only = False
+
+    # ---- steps --------------------------------------------------------------------------------------------
+    def run(self):
+        try:
+            self.cwd = _redeem_cwd()
+        except OSError as e:
+            _redeem_say("WARNING the working directory is unreadable (%s); its MCP configs are not checked"
+                        % type(e).__name__)
+            self.cwd = None
+        self._check_args()
+        self.home = _redeem_home(self.environ)
+        base = self._allowed_base()
+        code = self._read_code()
+        self._check_code(code, base)
+        if base != DEFAULT_API_BASE:
+            _redeem_say("redeeming against NON-DEFAULT API base %s" % base)
+        target, mode = self._preflight()
+        self.target = target
+        hashes = self._scan()
+        self._open_temp(target)
+        meta = self._post(base, code, hashes)
+        code = None
+        self._install(target, mode)
+        self.phase = "saved"
+        shown_mode = self._confirm_private(target)
+        verified, reason = self._verify(base, meta)
+        fields = [("file", target), ("mode", shown_mode), ("prefix", meta["prefix"]),
+                  ("scopes", ",".join(meta["scopes"]) or "none"), ("account", meta["account"] or "none"),
+                  ("verified", verified)]
+        if reason:
+            fields.append(("reason", reason))
+        _redeem_line("KEY_SAVED", fields)
+        if verified == "no":
+            _redeem_say("the key was saved, but checking it against %s failed (%s). The file is kept; if the "
+                        "reason is 'revoked', create a new key." % (base, reason))
+        return REDEEM_EXIT_SAVED
+
+    def _check_args(self):
+        a = self.args
+        if not a.kind:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "--redeem-key needs --kind watcher|rest (the "
+                             "command in the reply carries it)", reason="usage")
+        others = [f for f, on in (("--print-api-base", a.print_api_base), ("--safe-persona", a.safe_persona),
+                                  ("--check-activity", a.check_activity), ("--self-test", a.self_test),
+                                  ("--token-file-template", a.token_file_template)) if on]
+        if others:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "--redeem-key cannot be combined with %s"
+                             % ", ".join(others), reason="usage")
+        if a.replace and a.replace_prefix:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "--replace and --replace-prefix are mutually "
+                             "exclusive", reason="usage")
+        if a.replace_prefix is not None and not _REPLACE_PREFIX.fullmatch(a.replace_prefix):
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "--replace-prefix must be the key prefix the "
+                             "reply shows: kjt_ and 8 characters, such as kjt_AbCd1234", reason="usage")
+        if a.expect_account and not _ACCOUNT_FP.fullmatch(a.expect_account):
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "--expect-account must look like "
+                             "acct_<16 hex>", reason="usage")
+
+    def _allowed_base(self):
+        try:
+            base, _ = resolve_api_base(self.args.api_base, self.environ)
+        except FatalConfig as e:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "PICKUP_BASE_NOT_ALLOWED", str(e))
+        why = _redeem_base_refusal(base, self.home)
+        if why is not None:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "PICKUP_BASE_NOT_ALLOWED",
+                             "%s. Nothing was sent. Stop and tell the user." % why)
+        return base
+
+    def _read_code(self):
+        """stdin (first line) when it is not a terminal; a no-echo prompt on a terminal; $KIJITO_PICKUP_CODE as
+        the fallback. Never argv: a positional is a usage error, so the code is not in this process's argv."""
+        raw = ""
+        s = self.stdin
+        if s is not None:
+            try:
+                if s.isatty():
+                    raw = getpass.getpass("Kijito pickup code: ")
+                else:
+                    raw = s.readline(4096)
+            except (OSError, ValueError, EOFError):
+                raw = ""
+        if not (raw or "").strip():
+            raw = self.environ.get(PICKUP_CODE_ENV, "")
+        code = (raw or "").strip()
+        if not code:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "no pickup code: pipe it on stdin, e.g. "
+                             "printf '%%s\\n' 'kpc_...@host' | kijito-inbox-monitor --redeem-key --kind watcher",
+                             reason="no_code")
+        return code
+
+    def _check_code(self, code, base):
+        if not _PICKUP_CODE.fullmatch(code):
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "that is not a pickup code (kpc_<32 "
+                             "characters>@host); copy it exactly from the reply", reason="bad_code")
+        host = code.split("@", 1)[1]
+        want = urllib.parse.urlsplit(base).netloc.lower()
+        if host != want:
+            raise RedeemExit(REDEEM_EXIT_WRONG_HOST, "PICKUP_WRONG_HOST",
+                             "the code was issued by %s, but this helper talks to %s. Nothing was sent. Stop and "
+                             "tell the user." % (host, base), code_host=host)
+
+    def _preflight(self):
+        """Exactly one target, checked before anything is sent, so no later failure can lose the key."""
+        a = self.args
+        home = self.home
+        # Every path is RESOLVED ONCE here, and only the resolved strings are checked and used afterwards: a
+        # second resolution later would let a directory link swapped in between move the key somewhere the
+        # checks never saw.
+        watcher = _resolved(os.path.join(home, WATCHER_KEY_FILE))
+        rest = _resolved(os.path.join(home, REST_KEY_FILE))
+        if a.token_file:
+            target = self._canonical_target(a.token_file, watcher, rest)
+        else:
+            target = watcher if a.kind == "watcher" else rest
+        if a.kind == "rest" and os.path.normcase(target) == os.path.normcase(watcher):
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "--kind rest never writes the read-only watcher "
+                             "file %s (a wider key does not go there)" % watcher, reason="target")
+        parent = os.path.dirname(target)
+        _makedirs_private(parent)
+        if os.path.normcase(os.path.realpath(parent)) != os.path.normcase(parent):
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "%s changed (a link was swapped in) while it was "
+                             "being checked. Nothing was sent; rerun." % parent, reason="target_moved", file=parent)
+        if IS_POSIX:
+            st = os.stat(parent)
+            if (st.st_mode & 0o022) and not (st.st_mode & stat.S_ISVTX):
+                raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED",
+                                 "%s is writable by other users (mode %o); another user could swap the key file "
+                                 "- run: chmod 700 %s" % (parent, st.st_mode & 0o777, parent),
+                                 reason="unsafe_dir", file=parent)
+        content = None
+        try:
+            content = _read_private(target).strip()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "%s. Nothing was sent." % e,
+                             reason="insecure_target", file=target)
+        if a.replace_prefix:
+            if not content or not content.startswith(a.replace_prefix.encode("ascii")):
+                raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED",
+                                 "%s no longer holds key %s - tell the user. Nothing was sent."
+                                 % (target, a.replace_prefix), reason="prefix_mismatch", file=target)
+            return target, "prefix"
+        if content:
+            if not a.replace:
+                hint = ""
+                if a.kind == "watcher" and os.path.normcase(target) == os.path.normcase(watcher):
+                    hint = (" If it holds a different persona's key, pass --token-file "
+                            "~/.config/kijito-inbox-monitor/token.<persona> instead - never --replace.")
+                raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED",
+                                 "%s already holds a key. Nothing was sent; the code is still live.%s Replacing it "
+                                 "needs the user's OK and --replace." % (target, hint),
+                                 reason="target_exists", file=target)
+            return target, "replace"
+        if content is not None:
+            return target, ("replace" if a.replace else "empty")
+        return target, "absent"
+
+    def _canonical_target(self, given, watcher, rest):
+        home = self.home
+        p = given
+        if p == "~" or p.startswith("~/") or p.startswith("~" + os.sep):
+            p = home + p[1:]
+        else:
+            for prefix in ("$HOME", "${HOME}"):
+                if p == prefix or p.startswith(prefix + "/") or p.startswith(prefix + os.sep):
+                    p = home + p[len(prefix):]
+                    break
+        if not os.path.isabs(p):
+            if self.cwd is None:
+                raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "--token-file %s is relative and the working "
+                                 "directory is unreadable. Nothing was sent." % given, reason="target")
+            p = os.path.join(self.cwd, p)
+        cand = _resolved(p)
+        if os.path.normcase(cand) in (os.path.normcase(watcher), os.path.normcase(rest)):
+            return cand
+        name = os.path.basename(cand)
+        if self.args.kind == "watcher" and \
+                os.path.normcase(os.path.dirname(cand)) == os.path.normcase(os.path.dirname(watcher)) \
+                and name.startswith("token."):
+            persona = name[len("token."):]
+            if persona and _state_safe_persona(persona) == persona:
+                return cand
+        raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED",
+                         "--token-file must be %s or %s (or, for --kind watcher, %s.<persona> with the name "
+                         "--safe-persona prints); %s is none of these. Nothing was sent."
+                         % (watcher, rest, watcher, given), reason="target")
+
+    def _scan(self):
+        """Every key already on this machine that we can find, as sha256 hex (the server's own lookup form).
+        A KEY_LOCATIONS file that is a symlink, not 0600, someone else's or unreadable stops the run (exit 2):
+        those are key files, and silently skipping one would silently weaken the account check."""
+        home = self.home
+        hashes = {}          # hash -> [source label, ...] in discovery order
+        project = set()      # labels that are working-directory files
+        seen = set()
+
+        def add(raw, label):
+            h = hashlib.sha256(raw).hexdigest()
+            hashes.setdefault(h, [])
+            if label not in hashes[h]:
+                hashes[h].append(label)
+
+        for pattern in KEY_LOCATIONS:
+            for path in sorted(glob.glob(os.path.join(glob.escape(home), pattern))):
+                ident = os.path.normcase(os.path.abspath(path))
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                try:
+                    raw = _read_private(path).strip()
+                except FileNotFoundError:
+                    continue
+                except OSError as e:
+                    raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "key file %s. Fix it and rerun; nothing "
+                                     "was sent." % e, reason="insecure_key_file", file=path)
+                if raw:
+                    add(raw, path)
+        configs = [(os.path.join(home, rel), False) for rel in MCP_CONFIGS_HOME]
+        if self.cwd is not None:
+            configs += [(os.path.join(self.cwd, rel), True) for rel in MCP_CONFIGS_CWD]
+        seen_cfg = set()
+        for path, is_project in configs:
+            ident = os.path.normcase(os.path.realpath(path))
+            if ident in seen_cfg:
+                continue
+            seen_cfg.add(ident)
+            for raw in _scan_mcp_config(path):
+                add(raw, path)
+                if is_project:
+                    project.add(path)
+        for name in sorted(self.environ):
+            value = (self.environ.get(name) or "").strip()
+            if _KEY_WHOLE.fullmatch(value):
+                add(value.encode("ascii"), "$" + name)
+        found = list(hashes)
+        sent = found[:MAX_PRESENTED_KEY_HASHES]
+        if len(found) > len(sent):
+            _redeem_say("KEY_SCAN_TRUNCATED found=%d sent=%d" % (len(found), len(sent)))
+        labels = []
+        for h in sent:
+            for label in hashes[h]:
+                if label not in labels:
+                    labels.append(label)
+        self.sources = labels
+        self.project_only = bool(labels) and all(lb in project for lb in labels)
+        return sent
+
+    def _open_temp(self, target):
+        d, name = os.path.split(target)
+        tmp = os.path.join(d, ".%s.%s.tmp" % (name, os.urandom(8).hex()))
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                 | getattr(os, "O_BINARY", 0))
+        try:
+            fd = os.open(tmp, flags, PRIVATE_FILE_MODE)
+        except OSError as e:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "cannot create a temp file in %s: %s. Nothing "
+                             "was sent." % (d, e.strerror or type(e).__name__), reason="temp")
+        self.tmp, self.tmp_fd = tmp, fd
+        try:
+            _assert_private_fd(fd, tmp)
+        except OSError as e:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "%s. Nothing was sent." % e, reason="temp")
+
+    def _post(self, base, code, hashes):
+        """POST the redeem. Exactly one request, no retry, no Authorization header. The connection is opened
+        EXPLICITLY first, so a refusal, a TLS failure or a timeout before anything was written is known to have
+        consumed nothing (exit 6), and anything that goes wrong after the request was written is ambiguous
+        (exit 7). http.client follows no redirect and uses no proxy."""
+        a = self.args
+        body = {"code": code, "kind": a.kind}
+        if a.expect_account:
+            body["expect_account"] = a.expect_account
+        if hashes:
+            body["presented_key_sha256s"] = hashes
+        data = json.dumps(body).encode("ascii")
+        body = None
+        url = base + REDEEM_PATH
+        try:
+            self.pinned = pin_for(url)
+        except ResolveFailed as e:
+            raise RedeemExit(REDEEM_EXIT_RETRY, "PICKUP_RETRY_LATER", "%s. %s" % (e, _MESSAGES["PICKUP_RETRY_LATER"]),
+                             reason="resolve")
+        except FatalConfig as e:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "PICKUP_BASE_NOT_ALLOWED", "%s. Nothing was sent." % e)
+        parts = urllib.parse.urlsplit(url)
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        cls = _PinnedHTTPSConnection if parts.scheme == "https" else _PinnedHTTPConnection
+        conn = cls(parts.hostname, port=port, pinned_ip=self.pinned, timeout=REDEEM_TIMEOUT)
+        try:
+            try:
+                conn.connect()
+            except (OSError, http.client.HTTPException) as e:
+                raise RedeemExit(REDEEM_EXIT_RETRY, "PICKUP_RETRY_LATER", "could not connect to %s (%s). %s"
+                                 % (base, type(e).__name__, _MESSAGES["PICKUP_RETRY_LATER"]), reason="connect")
+            self.phase = "sent"
+            try:
+                conn.request("POST", parts.path, body=data, headers={
+                    "User-Agent": USER_AGENT, "Content-Type": "application/json", "Accept": "application/json"})
+                resp = conn.getresponse()
+                status = resp.status
+                raw = resp.read(REDEEM_BODY_MAX_BYTES + 1)
+            except (OSError, http.client.HTTPException) as e:
+                raise RedeemExit(REDEEM_EXIT_AMBIGUOUS, "PICKUP_AMBIGUOUS", "%s (%s)"
+                                 % (_MESSAGES["PICKUP_AMBIGUOUS"], type(e).__name__), reason="no_answer")
+        finally:
+            conn.close()
+        try:
+            payload = json.loads(raw.decode("utf-8")) if len(raw) <= REDEEM_BODY_MAX_BYTES else None
+        except (ValueError, UnicodeDecodeError):
+            payload = None
+        raw = None
+        if status == 200:
+            result = payload.get("result") if isinstance(payload, dict) else None
+            token = result.get("token") if isinstance(result, dict) else None
+            if not (isinstance(token, str) and _SERVED_KEY.fullmatch(token)):
+                raise RedeemExit(REDEEM_EXIT_AMBIGUOUS, "PICKUP_AMBIGUOUS", "the server answered 200 without a "
+                                 "usable key. " + _MESSAGES["PICKUP_AMBIGUOUS"], reason="unparseable_200")
+            self.secret = bytearray(token.encode("ascii"))
+            prefix = token[:12]
+            result["token"] = None
+            token = None
+            self.phase = "parsed"
+            self.key_id = _redeem_field(result.get("id"))
+            scopes = result.get("scopes") if isinstance(result.get("scopes"), list) else []
+            account = result.get("account")
+            return {"prefix": prefix, "scopes": [_redeem_field(x) for x in scopes],
+                    "account": account if isinstance(account, str) and _ACCOUNT_FP.fullmatch(account) else None}
+        err_code = payload.get("code") if isinstance(payload, dict) else None
+        err_code = err_code if isinstance(err_code, str) else None
+        if status == 400:
+            raise RedeemExit(REDEEM_EXIT_USAGE, "REDEEM_REFUSED", "the server rejected the request as malformed "
+                             "(this helper and the server disagree). Nothing was used up.", reason="bad_request")
+        if err_code in _PICKUP_REFUSALS:
+            token_name = _PICKUP_REFUSALS[err_code]
+            message = _MESSAGES[token_name]
+            if token_name == "PICKUP_WRONG_ACCOUNT":
+                message = self._wrong_account_message(message)
+            raise RedeemExit(REDEEM_EXIT_REFUSED, token_name, message)
+        if err_code in _PICKUP_RETRY_CODES:
+            raise RedeemExit(REDEEM_EXIT_RETRY, "PICKUP_RETRY_LATER", _MESSAGES["PICKUP_RETRY_LATER"],
+                             reason=err_code)
+        if err_code == "pickup_unavailable":
+            # Answered before any lookup, so nothing was consumed; but this server cannot hand out keys by
+            # pickup at all, so retrying cannot help, and the minted key would sit live and unclaimed.
+            raise RedeemExit(REDEEM_EXIT_AMBIGUOUS, "PICKUP_UNAVAILABLE", _MESSAGES["PICKUP_UNAVAILABLE"])
+        raise RedeemExit(REDEEM_EXIT_AMBIGUOUS, "PICKUP_AMBIGUOUS", _MESSAGES["PICKUP_AMBIGUOUS"],
+                         reason=_redeem_field(err_code) if err_code else "http_%d" % status)
+
+    def _wrong_account_message(self, message):
+        if not self.sources:
+            return message + " No existing key was found on this machine, so the mismatch is --expect-account."
+        lines = [message, "The hashes sent came from:"]
+        lines += ["  " + ("environment variable %s" % s if s.startswith("$") else s) for s in self.sources]
+        if self.project_only:
+            lines.append("These came only from the project's own files - if you did not put a key there, use "
+                         "the web account page instead.")
+        return "\n".join(lines)
+
+    def _install(self, target, mode):
+        """Write the key to the temp, then move it into place without ever clobbering something that appeared
+        or changed after pre-flight. Once the temp holds the key, any failure parks it there (exit 8)."""
+        try:
+            _write_all(self.tmp_fd, self.secret)
+            _write_all(self.tmp_fd, b"\n")
+            os.fsync(self.tmp_fd)
+        except OSError as e:
+            raise RedeemExit(REDEEM_EXIT_LOST, "KEY_LOST", "the key was collected but could not be written (%s). "
+                             "Revoke it now: kijito_api_key(action=\"revoke\", token_id=\"%s\") and create a new "
+                             "one." % (e.strerror or type(e).__name__, self.key_id), id=self.key_id)
+        finally:
+            fd, self.tmp_fd = self.tmp_fd, None
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.tmp_holds_key = True
+        try:
+            if mode == "prefix":
+                try:
+                    current = _read_private(target).strip()
+                except FileNotFoundError:
+                    self._park("%s vanished while the key was being collected" % target)
+                if not current.startswith(self.args.replace_prefix.encode("ascii")):
+                    self._park("%s no longer holds key %s" % (target, self.args.replace_prefix))
+                os.replace(self.tmp, target)
+            elif mode in ("empty", "replace"):
+                try:
+                    current = _read_private(target).strip()
+                except FileNotFoundError:
+                    self._install_new(target)
+                    return
+                if mode == "empty" and current:
+                    self._park("%s was filled while the key was being collected" % target)
+                os.replace(self.tmp, target)
+            else:
+                self._install_new(target)
+                return
+        except RedeemExit:
+            raise
+        except OSError as e:
+            self._park("%s could not be installed (%s)" % (target, e.strerror or e))
+
+    def _install_new(self, target):
+        """Target absent at pre-flight: link (atomic, never clobbers), with an O_EXCL copy where the filesystem
+        has no hard links. Windows: rename, which fails if the target exists."""
+        if not IS_POSIX:
+            try:
+                os.rename(self.tmp, target)
+            except OSError as e:
+                self._park("%s could not be created (%s)" % (target, e.strerror or type(e).__name__))
+            return
+        try:
+            os.link(self.tmp, target)
+        except FileExistsError:
+            self._park("%s appeared while the key was being collected" % target)
+        except OSError as e:
+            if e.errno not in _LINK_FALLBACK_ERRNOS:
+                self._park("%s could not be created (%s)" % (target, e.strerror or type(e).__name__))
+            self._copy_new(target)
+        # The temp (now a second name for the key) is removed by cleanup(), which runs on every exit.
+
+    def _copy_new(self, target):
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                 | getattr(os, "O_BINARY", 0))
+        try:
+            fd = os.open(target, flags, PRIVATE_FILE_MODE)
+        except FileExistsError:
+            self._park("%s appeared while the key was being collected" % target)
+        except OSError as e:
+            self._park("%s could not be created (%s)" % (target, e.strerror or type(e).__name__))
+        try:
+            _assert_private_fd(fd, target)
+            _write_all(fd, self.secret)
+            _write_all(fd, b"\n")
+            os.fsync(fd)
+        except OSError as e:
+            os.close(fd)
+            try:
+                os.unlink(target)        # ours (O_EXCL), and incomplete
+            except OSError:
+                pass
+            self._park("%s could not be written (%s)" % (target, e.strerror or type(e).__name__))
+        os.close(fd)
+
+    def _park(self, why):
+        self.parked = True
+        raise RedeemExit(REDEEM_EXIT_PARKED, "KEY_PARKED", "%s, so the key was left in %s (owner-only). Tell the "
+                         "user; do not open it." % (why, self.tmp), file=self.tmp)
+
+    def _confirm_private(self, target):
+        if not _fsync_dir(os.path.dirname(target)):
+            _redeem_say("WARNING the key file's directory could not be synced to disk")
+        try:
+            if _is_link(_lstat(target)):
+                raise InsecureFile("%s is now a symbolic link" % target)
+            fd = os.open(target, _ro_flags())
+        except OSError as e:
+            raise RedeemExit(REDEEM_EXIT_LOST, "KEY_LOST", "the key was written to %s but cannot be confirmed "
+                             "(%s). Revoke it now: kijito_api_key(action=\"revoke\", token_id=\"%s\") and create a "
+                             "new one." % (target, e.strerror or type(e).__name__, self.key_id), id=self.key_id)
+        try:
+            _assert_private_fd(fd, target)
+            st = os.fstat(fd)
+        except OSError as e:
+            raise RedeemExit(REDEEM_EXIT_LOST, "KEY_LOST", "the key was written to %s but it is not private (%s). "
+                             "Revoke it now: kijito_api_key(action=\"revoke\", token_id=\"%s\") and create a new "
+                             "one." % (target, e, self.key_id), id=self.key_id)
+        finally:
+            os.close(fd)
+        return "%04o" % (st.st_mode & 0o777) if IS_POSIX else "acl"
+
+    def _verify(self, base, meta):
+        """GET /api/auth/me?probe=1 with the new key over the same pinned addresses: the key works, and it
+        belongs to the account the redeem said. Never changes the exit code; the file is kept either way."""
+        if self.args.no_verify:
+            return "skipped", None
+        url = base + VERIFY_PATH
+        headers = {"User-Agent": USER_AGENT, "Accept": "application/json",
+                   "Authorization": "Bearer " + self.secret.decode("ascii")}
+        try:
+            opener = build_opener(self.pinned)
+            req = urllib.request.Request(url, headers=headers, method="GET")
+            with opener.open(req, timeout=REDEEM_TIMEOUT) as resp:
+                status, raw = resp.status, resp.read(REDEEM_BODY_MAX_BYTES)
+        except urllib.error.HTTPError as e:
+            e.close()
+            return "no", ("revoked" if e.code == 401 else "http_%d" % e.code)
+        except Exception as e:  # noqa: BLE001 - a failed check must never turn a saved key into an error
+            return "no", "unreachable_%s" % type(e).__name__
+        finally:
+            headers = None
+        if status != 200:
+            return "no", "http_%d" % status
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return "no", "bad_response"
+        if not isinstance(data, dict) or data.get("probe") is not True:
+            return "no", "probe_not_honoured"
+        if meta["account"] and data.get("account") != meta["account"]:
+            return "no", "account_mismatch"
+        return "yes", None
+
+    # ---- the end of a run -------------------------------------------------------------------------------------
+    def abort(self, why):
+        """An interrupt or an unexpected exception. Its meaning depends only on how far we got."""
+        if self.phase == "pre":
+            return RedeemExit(REDEEM_EXIT_RETRY, "PICKUP_RETRY_LATER", "%s before anything was sent. %s"
+                              % (why, _MESSAGES["PICKUP_RETRY_LATER"]), reason="interrupted")
+        if self.phase == "sent":
+            return RedeemExit(REDEEM_EXIT_AMBIGUOUS, "PICKUP_AMBIGUOUS", "%s after the request was sent. %s"
+                              % (why, _MESSAGES["PICKUP_AMBIGUOUS"]), reason="interrupted")
+        if self.phase == "parsed":
+            # DECIDED FROM THE DISK, not from flags: the move into place and the bookkeeping after it are two
+            # steps, and an interrupt between them must neither report a saved key as lost nor park a temp
+            # that is already gone.
+            if self.tmp_holds_key and self._target_holds_key():
+                return None
+            if self.tmp_holds_key and self.tmp and os.path.lexists(self.tmp):
+                self.parked = True
+                return RedeemExit(REDEEM_EXIT_PARKED, "KEY_PARKED", "%s; the key was left in %s (owner-only). "
+                                  "Tell the user; do not open it." % (why, self.tmp), file=self.tmp)
+            return RedeemExit(REDEEM_EXIT_LOST, "KEY_LOST", "%s after the key was collected. Revoke it now: "
+                              "kijito_api_key(action=\"revoke\", token_id=\"%s\") and create a new one."
+                              % (why, self.key_id), id=self.key_id)
+        return None   # saved: the key is in place
+
+    def _target_holds_key(self):
+        try:
+            return bool(self.target) and _read_private(self.target).strip() == bytes(self.secret or b"")
+        except OSError:
+            return False
+
+    def cleanup(self):
+        if self.tmp_fd is not None:
+            try:
+                os.close(self.tmp_fd)
+            except OSError:
+                pass
+            self.tmp_fd = None
+        if self.tmp and not self.parked:
+            try:
+                os.unlink(self.tmp)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                _redeem_say("WARNING could not remove the temp file %s (%s) - delete it"
+                            % (self.tmp, e.strerror or type(e).__name__))
+        if self.secret is not None:
+            for i in range(len(self.secret)):      # best effort: Python may hold other copies
+                self.secret[i] = 0
+            self.secret = None
+
+
+def _scan_mcp_config(path):
+    """Key-shaped tokens inside one MCP client config, as bytes. Never a refusal: these files belong to the
+    clients and are often 0644, so a loose mode is only a warning, and a symlink, anything not a regular file,
+    another owner's file or one over 1 MiB is skipped with a warning (best effort)."""
+    def skip(why):
+        _redeem_say("WARNING not checking %s for keys: %s" % (path, why))
+        return []
+    try:
+        st = _lstat(path)
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        return skip(e.strerror or type(e).__name__)
+    if _is_link(st):
+        return skip("it is a symbolic link")
+    try:
+        fd = os.open(path, _ro_flags())
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        return skip(e.strerror or type(e).__name__)
+    try:
+        fst = os.fstat(fd)
+        if not stat.S_ISREG(fst.st_mode):
+            return skip("it is not a regular file")
+        if IS_POSIX and fst.st_uid != os.geteuid():
+            return skip("it is owned by uid %d, not by you" % fst.st_uid)
+        if fst.st_size > MCP_CONFIG_MAX_BYTES:
+            return skip("it is larger than %d bytes" % MCP_CONFIG_MAX_BYTES)
+        if IS_POSIX and fst.st_mode & 0o077:
+            _redeem_say("WARNING %s is readable by other users (mode %o) and may hold an API key - consider "
+                        "chmod 600 %s" % (path, fst.st_mode & 0o777, path))
+        chunks, size = [], 0
+        while size <= MCP_CONFIG_MAX_BYTES:
+            b = os.read(fd, 65536)
+            if not b:
+                break
+            chunks.append(b)
+            size += len(b)
+    except OSError as e:
+        return skip(e.strerror or type(e).__name__)
+    finally:
+        os.close(fd)
+    if size > MCP_CONFIG_MAX_BYTES:
+        return skip("it is larger than %d bytes" % MCP_CONFIG_MAX_BYTES)
+    text = b"".join(chunks).decode("utf-8", "replace")
+    return [m.group(0).encode("ascii") for m in _KEY_IN_TEXT.finditer(text)]
+
+
+def _redeem_field(v):
+    s = str(v) if isinstance(v, (str, int)) and not isinstance(v, bool) else ""
+    return s if _SAFE_FIELD.fullmatch(s) else "unknown"
+
+
+def _redeem_say(text):
+    sys.stderr.write("kijito-inbox-monitor: %s\n" % text)
+
+
+def _redeem_line(token, fields):
+    sys.stdout.write(" ".join([token] + ["%s=%s" % kv for kv in fields if kv[1] is not None]) + "\n")
+    sys.stdout.flush()
+
+
+class _RedeemTerminated(KeyboardInterrupt):
+    """SIGTERM/SIGHUP/SIGINT (and Ctrl-Break on Windows) during --redeem-key: a harness timeout kill takes the SAME
+    path as Ctrl-C, so the run still prints its outcome and cleans up instead of dying with a half-collected key and
+    no instruction."""
+
+
+# The signals that end a redeem through the interrupt path. SIGBREAK exists only on Windows (Ctrl-Break), where
+# it would otherwise end the process without an outcome line.
+_REDEEM_SIGNALS = ("SIGTERM", "SIGHUP", "SIGINT", "SIGBREAK")
+
+
+def _redeem_mask_signals():
+    """Ignore every redeem signal from now on. The FIRST one already chose the outcome; a second (a process-group
+    kill that also reaches a launcher which relays it, a second Ctrl-C, a harness that repeats its TERM) must not
+    fire inside abort(), cleanup() or the outcome line and leave a temp file or no instruction behind. redeem_key
+    restores the caller's handlers after the outcome is printed, unless a signal ended the run (then they stay
+    ignored until the process exits; see _REDEEM_SIGNALLED)."""
+    for name in _REDEEM_SIGNALS:
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, signal.SIG_IGN)
+        except (ValueError, OSError):
+            pass
+
+
+# Set by the first redeem signal of a run. A run that a signal ended leaves the redeem signals IGNORED on return:
+# the process is about to exit with the outcome code, and a duplicate that arrives after the outcome line (a
+# launcher's relay of the same group kill lands a few milliseconds late) must not turn exit 6 into a death by
+# SIGTERM (143) that the caller would read as "unknown".
+_REDEEM_SIGNALLED = []
+
+
+def _redeem_on_signal(signum, frame):
+    _redeem_mask_signals()
+    _REDEEM_SIGNALLED.append(signum)
+    raise _RedeemTerminated()
+
+
+def _redeem_trap_signals():
+    """Route each redeem signal to the interrupt path; returns what to restore. A signal already IGNORED on entry
+    (nohup's SIGHUP, a background job's SIGINT) stays ignored, as Python itself leaves an ignored SIGINT alone.
+    Only the main thread may set handlers, so elsewhere this is a no-op."""
+    restore = []
+    for name in _REDEEM_SIGNALS:
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            if signal.getsignal(sig) == signal.SIG_IGN:
+                continue
+            restore.append((sig, signal.signal(sig, _redeem_on_signal)))
+        except (ValueError, OSError):
+            pass
+    return restore
+
+
+def redeem_key(args):
+    """--redeem-key: collect a key minted with delivery="pickup" and save it. Returns the exit code.
+
+    Routed from main() BEFORE validate_args/run, inside its own catch-all, so the watcher's KeyboardInterrupt -> 0
+    and OSError -> 2 arms never apply: an interrupt means 6, 7, 5 or 8 depending on how far the run got."""
+    r = _Redeem(args, _redeem_environ(), _redeem_stdin())
+    outcome = None
+    del _REDEEM_SIGNALLED[:]
+    restore = _redeem_trap_signals()
+    try:
+        try:
+            return r.run()
+        except RedeemExit as e:
+            _redeem_mask_signals()
+            outcome = e
+        except KeyboardInterrupt:
+            _redeem_mask_signals()
+            outcome, why = r.abort("interrupted"), "interrupted"
+        except Exception as e:  # noqa: BLE001 - the type only: an exception's text could carry a response body
+            _redeem_mask_signals()
+            outcome, why = r.abort("unexpected %s" % type(e).__name__), "error_%s" % type(e).__name__
+        finally:
+            # The run is ending: no signal may cut the clean-up or the outcome line short. Masked until the
+            # caller's handlers are restored, AFTER the outcome is printed.
+            _redeem_mask_signals()
+            r.cleanup()
+        if outcome is None:
+            # The key was already in place when the run stopped: say where, and that it was not checked.
+            _redeem_line("KEY_SAVED", [("file", r.target), ("verified", "no"), ("reason", why)])
+            return REDEEM_EXIT_SAVED
+        _redeem_line(outcome.token, [(k, v) for k, v in outcome.fields.items()])
+        _redeem_say("%s: %s" % (outcome.token, outcome.message))
+        return outcome.code
+    finally:
+        if not _REDEEM_SIGNALLED:
+            for sig, handler in restore:
+                signal.signal(sig, handler)
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------------------------------------------------
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="kijito-inbox-monitor",
+        description="Watch your Kijito inbox and emit one event per new message. NOTE: emitting is not waking - a "
+                    "bare `tail` of the events file captures but does NOT wake your agent. To actually wake on new "
+                    "mail, use --emit exec-per-event with a command that pokes your agent loop, or run the tail "
+                    "under your harness's streaming/notification consumer. See the README 'Waking your agent'.")
+    p.add_argument("--persona", action="append",
+                   help="Kijito persona whose inbox to watch. Repeat for multi-persona mode.")
+    p.add_argument("--personas", action="append",
+                   help="Comma-separated personas to watch, e.g. alice,bob,carol.")
+    p.add_argument("--all-personas", action="store_true",
+                   help="Watch every persona in your Kijito account (default).")
+    p.add_argument("--no-stranded-alerts", action="store_true",
+                   help="do not alarm on mail sitting in an inbox that is not a known persona. The alarm is "
+                        "ON by default because such mail is UNDELIVERABLE and nothing else reports it; set "
+                        "this only if you keep deliberate test inboxes and expect the alarm. It silences "
+                        "ONLY this alarm - urgent-unanswered has its own flag (--no-urgent-alerts).")
+    p.add_argument("--no-urgent-alerts", action="store_true",
+                   help="do not alarm on escalated (URGENT) mail that a known member is not answering. The "
+                        "alarm is ON by default. Deliberately a SEPARATE flag from --no-stranded-alerts: "
+                        "silencing a low-severity alarm about inboxes nobody owns must not also silence a "
+                        "higher-severity one about real members who are not responding.")
+    p.add_argument("--rediscover-every", type=int, default=600,
+                   help="In all-persona mode, re-scan your account every N seconds and add newly-created personas "
+                        "(default 600, min 1). Explicit persona subsets are not expanded.")
+    p.add_argument("--poll-seconds", type=int, default=60,
+                   help="Interval (s) between polls when long-poll is off/unsupported (default 60).")
+    p.add_argument("--wait", type=int, default=50,
+                   help="Long-poll hold (s) requested from /api/notify/pending so new mail wakes the watcher "
+                        "near-instantly at ~the same request rate (default 50; the server clamps to its own max). "
+                        "0 disables long-poll -> plain interval polling at --poll-seconds. If the server doesn't "
+                        "support long-poll, the client auto-falls back to interval polling (no redeploy needed). "
+                        "Clean shutdown during a held poll can take up to --wait seconds (a supervisor's SIGKILL "
+                        "mid-hold is safe - state is persisted every cycle).")
+    p.add_argument("--alert-after", type=int, default=3, help="Consecutive failures before an alert (min 1).")
+    p.add_argument("--alert-floor-seconds", type=int, default=None,
+                   help="Measured seconds the source must have been failing before an `alert` fires, in addition "
+                        "to --alert-after failures (min 0). Default: (--alert-after - 1) * --poll-seconds - what "
+                        "N consecutive failed polls take at the configured interval - so long-poll's fast retries "
+                        "cannot alert on an 11 s restart. 0 restores the count-only edge.")
+    p.add_argument("--emit", choices=("stdout-jsonl", "exec-per-event"), default="stdout-jsonl")
+    p.add_argument("--exec", help="Command to run per event (required iff --emit exec-per-event).")
+    p.add_argument("--suppress-author", action="append",
+                   help="Do not emit 'new' events authored by this persona (repeatable) - drops the self-echo you "
+                        "get when watching all personas AND sending mail. Liveness events are unaffected.")
+    p.add_argument("--content-chars", type=int, default=220)
+    p.add_argument("--no-content", action="store_true", help="Omit message content entirely (opaque mode).")
+    p.add_argument("--events-file",
+                   help="Write NDJSON events to this file (an OWNED, size-rotated fd) instead of stdout - the "
+                        "supervised-producer mode that survives log rotation. Consumers tail -F it. "
+                        "Only applies to --emit stdout-jsonl.")
+    p.add_argument("--events-file-template",
+                   help="Per-persona supervised mode: write EACH persona's events to its OWN owned, size-rotated "
+                        "file, e.g. ~/.cache/kijito-inbox-monitor/events.{persona}.ndjson - a session then subscribes "
+                        "to only its own mail with `tail -F events.<persona>.ndjson`, no filtering. Must contain "
+                        "'{persona}'. Mutually exclusive with --events-file.")
+    p.add_argument("--max-bytes", type=int, default=5_000_000,
+                   help="Rotate the events file(s) once one reaches N bytes (default 5000000; <=0 disables).")
+    p.add_argument("--keep-logs", type=int, default=5,
+                   help="How many rotated --events-file archives to keep (default 5, min 1).")
+    p.add_argument("--seed-at", type=int, help="Cursor seed = last-handled id (overrides a state-file cursor).")
+    p.add_argument("--max-replay", type=int, default=50, help="Cap on a re-arm backlog before fast-forwarding.")
+    p.add_argument("--state-file",
+                   help="Persist+resume cursor/FSM; single-writer locked. Kijito persona targets derive one "
+                        "file per persona from this base path. Recommended w/ a supervisor.")
+    p.add_argument("--state-file-template",
+                   help="Per-persona state file named by the PRODUCER, e.g. ~/.local/state/kijito-inbox-monitor/"
+                        "{persona}.state; '{persona}' is replaced by the same filename component --safe-persona "
+                        "prints. Use it in a supervisor unit instead of spelling the persona into --state-file. "
+                        "Mutually exclusive with --state-file.")
+    p.add_argument("--heartbeat", type=int, help="Emit a heartbeat event every N seconds (external dead-man's-switch).")
+    p.add_argument("--activity-file",
+                   help="Publish who AUTHORED mail most recently, as JSON, refreshed each tick. Lets a "
+                        "harness answer 'has X been active since my message?' from data this watcher "
+                        "already collects, instead of polling every inbox itself. Off by default.")
+    p.add_argument("--safe-persona", metavar="PERSONA",
+                   help="Print the FILENAME COMPONENT this producer derives from PERSONA, then exit 0. "
+                        "This is the ONE place the persona->filename rule lives: any other program that "
+                        "needs to name a persona's events/state file (a session-start hook, "
+                        "a health check, docs) must ask HERE rather than re-implement it. "
+                        "Re-implementations drift: the "
+                        "rule CASEFOLDS and accepts any UNICODE alphanumeric, so 'Maple' and 'Omega' are "
+                        "exactly the names a hand-written [^A-Za-z0-9._-] filter gets wrong -- and it gets "
+                        "them wrong INVISIBLY on a case-insensitive filesystem. A pure string function: no "
+                        "token, no network, no state file.")
+    p.add_argument("--check-activity", metavar="PERSONA",
+                   help="One-shot: read --activity-file and report whether PERSONA has authored anything "
+                        "since --since-id. Exits 0 active, 1 no activity in a covered span (prints the "
+                        "observation), 2 NOT OBSERVABLE. Reads only; no token or network needed.")
+    p.add_argument("--since-id", type=int,
+                   help="With --check-activity: the message id you are awaiting a reply to.")
+    p.add_argument("--waits", type=int, default=1,
+                   help="With --check-activity: how many of your own heartbeats you have waited "
+                        "(reported verbatim, so a reader can judge magnitude). Default 1.")
+    p.add_argument("--api-base", metavar="URL",
+                   help="The Kijito API to watch (default %s; $%s when this flag is absent). Use it for a "
+                        "local stack or a self-hosted server, e.g. http://127.0.0.1:7474. https is required "
+                        "except for localhost, 127.0.0.1 and [::1], because every request carries your token."
+                        % (DEFAULT_API_BASE, API_BASE_ENV))
+    p.add_argument("--print-api-base", action="store_true",
+                   help="Print the API base this producer would use (--api-base, else $%s, else the default) "
+                        "after validating it, then exit 0. No token, no network." % API_BASE_ENV)
+    p.add_argument("--auth-header", help="Header NAME for the token (default Authorization: Bearer).")
+    p.add_argument("--token-file", help="File holding the auth token (wins over $KIJITOMON_TOKEN).")
+    p.add_argument("--token-file-template",
+                   help="Like --token-file, with '{persona}' replaced by the producer's filename component for the "
+                        "ONE --persona target, e.g. ~/.config/kijito-inbox-monitor/token.{persona}. "
+                        "Mutually exclusive with --token-file.")
+    p.add_argument("--no-fast-path", action="store_true",
+                   help="Disable the /api/notify/pending unread pre-check; always full-poll the inbox list.")
+    p.add_argument("--still-unread-after", type=int, default=7200, metavar="SECONDS",
+                   help="Emit ONE `still_unread` event per poll for mail that was already notified and "
+                        "is still unread this many seconds after it was sent (default 7200; 0 disables). At most "
+                        "once per message per window, capped by --still-unread-max; never for retired/reserved or "
+                        "write_only inboxes.")
+    p.add_argument("--still-unread-max", type=int, default=3, metavar="N",
+                   help="How many times one message may be re-surfaced as still_unread per process (default 3).")
+    p.add_argument("--resync-every", type=int, default=10,
+                   help="Fast-path safety floor: force a full inbox poll after at most N consecutive cheap "
+                        "skips, so a stale/wrong unread count can never blind the watcher (default 10, min 1).")
+    p.add_argument("--self-test", action="store_true", help="Probe + synthetic emit, then exit (run before trusting).")
+    # One-time key pickup. Only with --redeem-key; the code itself is read from stdin, never argv.
+    p.add_argument("--redeem-key", action="store_true",
+                   help="Collect an API key minted with delivery=\"pickup\" and save it to its key file, so the "
+                        "key never passes through a conversation. The pickup code is read from stdin (first "
+                        "line), else a no-echo prompt on a terminal, else $%s. Talks only to %s, or to the base "
+                        "written in the owner-only file ~/%s. Prints one KEY_SAVED line (file, mode, prefix), "
+                        "never the key. Exits 0 saved, 2 refused before sending, 3 code for another server, "
+                        "4 refused by the server, 5 collected but not saved, 6 nothing consumed (rerun), "
+                        "7 outcome unknown (revoke and mint again), 8 saved at the temp path it prints."
+                        % (PICKUP_CODE_ENV, DEFAULT_API_BASE, API_BASE_FILE))
+    p.add_argument("--kind", choices=("watcher", "rest"),
+                   help="With --redeem-key (required): watcher saves to ~/%s, rest to ~/%s. The reply that "
+                        "carries the code names it." % (WATCHER_KEY_FILE, REST_KEY_FILE))
+    p.add_argument("--replace", action="store_true",
+                   help="With --redeem-key: replace a key already in the target file (ask the user first).")
+    p.add_argument("--replace-prefix", metavar="PREFIX",
+                   help="With --redeem-key: replace the target's key only if it starts with PREFIX (a renewal "
+                        "replaces the key it renews). Mutually exclusive with --replace.")
+    p.add_argument("--expect-account", metavar="ACCT",
+                   help="With --redeem-key: the account fingerprint (acct_...) the code must belong to.")
+    p.add_argument("--no-verify", action="store_true",
+                   help="With --redeem-key: skip checking the saved key against /api/auth/me?probe=1.")
+    return p
+
+
+def validate_args(args):
+    stray = [f for f, on in (("--kind", args.kind), ("--replace", args.replace),
+                             ("--replace-prefix", args.replace_prefix), ("--expect-account", args.expect_account),
+                             ("--no-verify", args.no_verify)) if on]
+    if stray:
+        raise FatalConfig("%s only apply with --redeem-key" % ", ".join(stray))
+    if args.alert_after < 1:
+        raise FatalConfig("--alert-after must be >= 1")
+    if args.alert_floor_seconds is not None and args.alert_floor_seconds < 0:
+        raise FatalConfig("--alert-floor-seconds must be >= 0")
+    if args.resync_every < 1:
+        raise FatalConfig("--resync-every must be >= 1")
+    if args.rediscover_every < 1:
+        raise FatalConfig("--rediscover-every must be >= 1")
+    if args.emit == "exec-per-event" and not args.exec:
+        raise FatalConfig("--exec is required when --emit exec-per-event")
+    if args.emit != "exec-per-event" and args.exec:
+        sys.stderr.write("kijito-inbox-monitor: WARNING --exec ignored (emit mode is %s)\n" % args.emit)
+    if args.poll_seconds < 1:
+        raise FatalConfig("--poll-seconds must be >= 1")  # 0 → a select(timeout=0) busy-loop hammering the source
+    if args.wait < 0:
+        raise FatalConfig("--wait must be >= 0 (0 disables long-poll)")
+    if args.wait > 0 and args.no_fast_path:
+        sys.stderr.write("kijito-inbox-monitor: WARNING --wait ignored with --no-fast-path (long-poll is part of "
+                         "the fast-path)\n")
+    if args.heartbeat is not None and args.heartbeat < 1:
+        raise FatalConfig("--heartbeat must be >= 1")
+    if args.content_chars < 0:
+        raise FatalConfig("--content-chars must be >= 0")
+    if args.max_replay < 0:
+        raise FatalConfig("--max-replay must be >= 0")
+    if args.keep_logs < 1:
+        raise FatalConfig("--keep-logs must be >= 1")
+    if args.still_unread_after < 0:
+        raise FatalConfig("--still-unread-after must be >= 0 (0 disables)")
+    if args.still_unread_max < 1:
+        raise FatalConfig("--still-unread-max must be >= 1")
+    if args.events_file and args.events_file_template:
+        raise FatalConfig("--events-file and --events-file-template are mutually exclusive")
+    if args.events_file_template and "{persona}" not in args.events_file_template:
+        raise FatalConfig("--events-file-template must contain the '{persona}' placeholder")
+    if (args.events_file or args.events_file_template) and args.emit != "stdout-jsonl":
+        sys.stderr.write("kijito-inbox-monitor: WARNING --events-file/-template ignored (emit mode is %s)\n" % args.emit)
+    # The persona-named paths come from the producer's rule, never from the supervisor.
+    if args.state_file and args.state_file_template:
+        raise FatalConfig("--state-file and --state-file-template are mutually exclusive")
+    if args.state_file_template and "{persona}" not in args.state_file_template:
+        raise FatalConfig("--state-file-template must contain the '{persona}' placeholder")
+    if args.token_file and args.token_file_template:
+        raise FatalConfig("--token-file and --token-file-template are mutually exclusive")
+    if args.token_file_template:
+        if "{persona}" not in args.token_file_template:
+            raise FatalConfig("--token-file-template must contain the '{persona}' placeholder")
+        if len(args.persona or []) != 1 or args.personas or args.all_personas:
+            raise FatalConfig("--token-file-template needs exactly one --persona target (one token file per unit)")
+        args.token_file = _persona_path(args.token_file_template, args.persona[0])
+    if args.seed_at is not None:
+        single = len(args.persona or []) == 1 and not args.personas and not args.all_personas
+        if not single:
+            raise FatalConfig("--seed-at requires a single --persona target, "
+                              "not multi-persona/all-personas - each persona has its own cursor")
+
+
+def _utf8_stdout():
+    """Write stdout as UTF-8 whatever the locale says.
+
+    A Windows console or a Git Bash pipe reports cp1252, so `--help` (a non-ASCII character) and, far worse,
+    any EVENT carrying a message body outside cp1252 (an emoji, CJK) would raise UnicodeEncodeError - a
+    ValueError, which the stdout sink's OSError guard does not catch, so it would kill the producer mid-delivery.
+    JSON Lines is UTF-8 by definition, so that is the right encoding for every consumer. No-op where stdout
+    is already UTF-8 or cannot be reconfigured.
+    """
+    enc = (getattr(sys.stdout, "encoding", None) or "").lower().replace("-", "").replace("_", "")
+    if enc != "utf8" and hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (ValueError, OSError):
+            pass
+
+
+def main(argv=None):
+    _utf8_stdout()
+    args = build_parser().parse_args(argv)
+    # --redeem-key has its own exit contract (0/2-8) and its own catch-all, so it is routed before
+    # everything else - in particular before validate_args/run, whose KeyboardInterrupt -> 0 and OSError -> 2
+    # arms would misreport a half-collected key.
+    if args.redeem_key:
+        return redeem_key(args)
+    # A pure read of an existing report: no token, no network, no state file, no watch loop. Placed
+    # before validate_args so a heartbeat can call it without satisfying the watcher's own config.
+    # A pure string transform, deliberately reachable with NO other configuration: every caller that
+    # needs the filename rule must be able to ask for it, or it will guess.
+    if args.safe_persona is not None:
+        if not args.safe_persona:
+            sys.stderr.write("kijito-inbox-monitor: FATAL --safe-persona needs a non-empty PERSONA\n")
+            return 2
+        sys.stdout.write(_state_safe_persona(args.safe_persona) + "\n")
+        return 0
+    if args.print_api_base:
+        try:
+            base, _ = resolve_api_base(args.api_base)
+        except FatalConfig as e:
+            sys.stderr.write("kijito-inbox-monitor: FATAL %s\n" % e)
+            return 2
+        sys.stdout.write(base + "\n")
+        return 0
+    if args.check_activity:
+        if not args.activity_file:
+            sys.stderr.write("kijito-inbox-monitor: FATAL --check-activity requires --activity-file\n")
+            return 2
+        if args.since_id is None:
+            sys.stderr.write("kijito-inbox-monitor: FATAL --check-activity requires --since-id "
+                             "(the message id you are waiting on a reply to)\n")
+            return 2
+        return check_activity(args.activity_file, args.check_activity, args.since_id, args.waits)
+    try:
+        validate_args(args)
+        return run(args)
+    except FatalConfig as e:
+        sys.stderr.write("kijito-inbox-monitor: FATAL %s\n" % e)
+        return 2
+    except OSError as e:
+        # THE BACKSTOP, and deliberately only that. `InsecureFile` is an OSError, so before
+        # this arm an escaping one exited via a TRACEBACK - which under launchd KeepAlive means a crash
+        # loop with the cause buried in monitor.err rather than a stated fatal condition. Containment
+        # that keeps the OTHER personas running lives at the three per-persona sites; this arm exists so
+        # that ANY OSError that still reaches the top exits with a diagnosis instead of a stack trace.
+        # It must stay LAST-RESORT: if this is what caught your fault, a per-persona guard was missing.
+        sys.stderr.write("kijito-inbox-monitor: FATAL unhandled file/OS error: %s\n" % e)
+        return 2
+    except KeyboardInterrupt:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

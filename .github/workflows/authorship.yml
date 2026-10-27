@@ -1,0 +1,43 @@
+name: authorship
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Authors, committers and co-authors are on the allowed list (sha256 of the lowercased email)
+        env:
+          BASE: ${{ github.event.before }}
+          HEAD: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          allowed_digests="e6e787c7c5da431cf1a4d3acdff65714302cbf6ab07a0f4529f42e68525099c2 3a8bc52326f8d01a65870588d8414e1b0315f8685146cc756412ecb912d90470 3c205d8fc749f72977b9331e3179773c315bb1f4860c366de2abe9ec9337730b 4d9b9052621f2961d242e965046ff9815b561bbd0c5b30d87ea9c285a83d286f"
+          ok() { local d; d=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sha256sum | cut -c1-64); case " $allowed_digests " in *" $d "*) return 0;; esac; return 1; }
+          if [ -z "${BASE:-}" ] || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null || [ "$BASE" = 0000000000000000000000000000000000000000 ]; then
+            range="$HEAD"
+          else
+            range="$BASE..$HEAD"
+          fi
+          bad=0
+          while IFS='|' read -r sha ae ce; do
+            for e in "$ae" "$ce"; do
+              if ! ok "$e"; then
+                echo "::error::$sha has author/committer <$e>, which is not on the allowed list"; bad=1
+              fi
+            done
+          done < <(git log --format='%H|%ae|%ce' "$range")
+          for sha in $(git log --format=%H "$range"); do
+            while read -r line; do
+              email=$(printf '%s' "$line" | sed -nE 's/.*<([^>]+)>.*/\1/p')
+              if [ -z "$email" ] || ! ok "$email"; then
+                echo "::error::$sha has a co-author line for someone not on the allowed list: $line"; bad=1
+              fi
+            done < <(git log -1 --format=%B "$sha" | grep -Ei '^co-authored-by:' || true)
+          done
+          exit $bad

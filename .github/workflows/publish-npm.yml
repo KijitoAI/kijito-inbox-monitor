@@ -1,0 +1,38 @@
+name: publish-npm
+
+# Publishes the kijito-inbox-monitor npm SIGNPOST package on a version tag, using Trusted
+# Publishing (OIDC). The npm package is not a real installer: it points users at the Python
+# package on PyPI (see bin/cli.js). No NPM_TOKEN is stored; npm exchanges a short-lived
+# workflow credential and attaches provenance automatically.
+#
+# Canonical form per docs.npmjs.com/trusted-publishers: Node 24 (bundles npm >= 11.5.1, which
+# trusted publishing requires) + registry-url + `npm publish` with NO NODE_AUTH_TOKEN. There
+# are zero deps and no lockfile, so we skip `npm ci`.
+#
+# Trusted Publisher config on npmjs.com (package -> Settings -> Trusted Publisher) must match
+# EXACTLY (case-sensitive): Organization/user "KijitoAI", Repository "kijito-inbox-monitor",
+# Workflow filename "publish-npm.yml" (filename only, WITH .yml, not a path), Environment blank,
+# and Allowed actions must include "npm publish". A mismatch on any field fails with E404
+# "could not be found or you do not have permission".
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # required for Trusted Publishing
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"        # bundles npm >= 11.5.1, required for OIDC trusted publishing
+          registry-url: "https://registry.npmjs.org"
+      - run: npm --version
+      # Zero runtime deps and no lockfile, so no `npm ci`. There is no postinstall hook
+      # (npm v12 disables install lifecycle scripts by default, and that pattern is the worm).
+      - run: npm publish --access public
